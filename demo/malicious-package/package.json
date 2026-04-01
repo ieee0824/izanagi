@@ -1,0 +1,9 @@
+{
+  "name": "izanagi-demo-target",
+  "version": "1.0.0",
+  "description": "Izanagi デモ: サプライチェーン攻撃の検知",
+  "private": true,
+  "dependencies": {
+    "izanagi-demo-malicious": "file:./malicious-dep"
+  }
+}

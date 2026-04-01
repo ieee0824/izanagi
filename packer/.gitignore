@@ -1,0 +1,4 @@
+output/
+output-debian/
+packer_cache/
+packer.log

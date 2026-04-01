@@ -1,0 +1,24 @@
+[package]
+name = "izanagi-dns-proxy"
+version = "0.1.0"
+edition = "2024"
+
+# allowed_hosts フィルタ付き DNS プロキシ。
+# サンドボックス内の名前解決を仲介し、許可リスト外のドメインにはダミー IP を返す。
+# workspace には含めない（izanagi-agent と同じパターン）。
+#
+# ビルド方法:
+#   cd izanagi-dns-proxy && cargo build --release
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+hickory-proto = "0.25"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "time", "signal"] }
+
+# izanagi 本体から Config 型を参照する
+izanagi = { path = ".." }
+
+[[bin]]
+name = "izanagi-dns-proxy"
+path = "src/main.rs"

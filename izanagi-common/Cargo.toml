@@ -1,0 +1,11 @@
+[package]
+name = "izanagi-common"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+# ユーザー空間側で使用する場合に有効化。no_std 環境 (eBPF) では無効のまま。
+user = []
+
+[dependencies]

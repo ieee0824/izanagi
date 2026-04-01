@@ -1,0 +1,21 @@
+[package]
+name = "izanagi-ebpf"
+version = "0.1.0"
+edition = "2021"
+
+# eBPF プログラムは nightly + bpf-linker が必要。
+# workspace には含めず、Linux 環境で個別にビルドする。
+#
+# ビルド方法:
+#   rustup install nightly
+#   cargo +nightly install bpf-linker
+#   cargo +nightly build --target bpfel-unknown-none -Z build-std=core
+
+[dependencies]
+aya-ebpf = "0.1"
+aya-log-ebpf = "0.1"
+izanagi-common = { path = "../izanagi-common" }
+
+[[bin]]
+name = "izanagi-ebpf"
+path = "src/main.rs"

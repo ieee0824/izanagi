@@ -1,0 +1,48 @@
+# ダイジェストで固定してサプライチェーン攻撃を防止
+# 更新手順: docker pull debian:trixie-slim && docker inspect --format='{{index .RepoDigests 0}}' debian:trixie-slim
+FROM debian:trixie-slim@sha256:26f98ccd92fd0a44d6928ce8ff8f4921b4d2f535bfa07555ee5d18f61429cf0c
+
+# 基本パッケージ + Homebrew の依存
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       bash curl ca-certificates \
+       git build-essential procps file \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# 非特権ユーザーを作成（コマンド実行はこのユーザーで行う）
+RUN useradd -m -d /home/izanagi -s /bin/bash izanagi
+
+# ワークスペースディレクトリを作成（izanagi ユーザー所有）
+RUN mkdir -p /workspace && chown izanagi:izanagi /workspace
+
+# Homebrew (Linuxbrew) を izanagi ユーザーでインストール
+RUN mkdir -p /home/linuxbrew/.linuxbrew && chown -R izanagi:izanagi /home/linuxbrew
+RUN su - izanagi -c 'NONINTERACTIVE=1 bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"'
+RUN echo 'eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"' >> /home/izanagi/.bashrc \
+    && echo 'eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"' >> /home/izanagi/.profile
+
+# anyenv をインストール (タグ固定で再現性を確保)
+RUN su - izanagi -c 'git clone --branch v1.1.5 --depth 1 https://github.com/anyenv/anyenv ~/.anyenv'
+RUN echo 'export PATH="$HOME/.anyenv/bin:$PATH"' >> /home/izanagi/.bashrc \
+    && echo 'eval "$(anyenv init -)"' >> /home/izanagi/.bashrc \
+    && echo 'export PATH="$HOME/.anyenv/bin:$PATH"' >> /home/izanagi/.profile \
+    && echo 'eval "$(anyenv init -)"' >> /home/izanagi/.profile
+RUN su - izanagi -c 'export PATH="$HOME/.anyenv/bin:$PATH" && yes | anyenv install --init'
+RUN su - izanagi -c 'export PATH="$HOME/.anyenv/bin:$PATH" && eval "$(anyenv init -)" && anyenv install nodenv'
+RUN su - izanagi -c 'export PATH="$HOME/.anyenv/bin:$PATH" && eval "$(anyenv init -)" && nodenv install 24.14.1 && nodenv global 24.14.1'
+# agent の固定 PATH (/usr/local/bin) から node/npm を使えるように symlink を作成
+RUN ln -sf /home/izanagi/.anyenv/envs/nodenv/shims/node /usr/local/bin/node \
+    && ln -sf /home/izanagi/.anyenv/envs/nodenv/shims/npm /usr/local/bin/npm
+
+# izanagi-agent をコピー（root で実行 — eBPF に必要）
+COPY izanagi-agent /usr/local/bin/izanagi-agent
+RUN chmod +x /usr/local/bin/izanagi-agent
+
+# エントリポイント: izanagi-agent をフォアグラウンドで直接実行
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+EXPOSE 9001
+
+ENTRYPOINT ["/entrypoint.sh"]

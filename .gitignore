@@ -1,0 +1,20 @@
+/target
+
+# macOS
+.DS_Store
+._*
+
+# Linux
+*~
+.directory
+/izanagi-agent/target/
+/izanagi-agent/Cargo.lock
+/izanagi-dns-proxy/target/
+/izanagi-dns-proxy/Cargo.lock
+/izanagi-http-capture/target/
+/izanagi-http-capture/Cargo.lock
+/izanagi-ebpf/target/
+/izanagi-ebpf/Cargo.lock
+
+# ユーザーローカル設定
+izanagi.toml

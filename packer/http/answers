@@ -1,0 +1,16 @@
+KEYMAPOPTS="none"
+HOSTNAMEOPTS="-n izanagi"
+USEROPTS="none"
+INTERFACESOPTS="auto lo
+iface lo inet loopback
+
+auto eth0
+iface eth0 inet dhcp
+"
+DNSOPTS="-d izanagi.local"
+TIMEZONEOPTS="-z UTC"
+PROXYOPTS="none"
+APKREPOSOPTS="-1"
+SSHDOPTS="-c openssh"
+NTPOPTS="-c busybox"
+DISKOPTS="-m sys -s 0 /dev/vda"

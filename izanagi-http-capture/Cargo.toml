@@ -1,0 +1,28 @@
+[package]
+name = "izanagi-http-capture"
+version = "0.1.0"
+edition = "2024"
+
+# ダミー HTTP/HTTPS キャプチャサーバー。
+# DNS プロキシがブロックしたドメインへの通信をキャプチャし、
+# リクエスト内容をログに記録する。
+#
+# ビルド方法:
+#   cd izanagi-http-capture && cargo build --release
+
+[dependencies]
+anyhow = "1"
+chrono = "0.4"
+clap = { version = "4", features = ["derive"] }
+rcgen = { version = "0.13", features = ["pem"] }
+rustls = "0.23"
+rustls-pemfile = "2"
+rustls-pki-types = "1"
+time = "0.3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "time", "signal", "sync"] }
+tokio-rustls = "0.26"
+webpki-roots = "0.26"
+
+[[bin]]
+name = "izanagi-http-capture"
+path = "src/main.rs"

@@ -1,0 +1,35 @@
+[package]
+name = "izanagi-agent"
+version = "0.1.0"
+edition = "2024"
+
+# ゲスト VM 内で動作するエージェントバイナリ。
+# Linux + QEMU 環境でのみビルド・実行する。
+# workspace には含めない（nightly + Linux が必要）。
+#
+# ビルド方法:
+#   cargo build --release --features ebpf (Linux 環境で)
+
+[features]
+default = []
+ebpf = ["izanagi/ebpf"]
+
+[dependencies]
+anyhow = "1"
+bincode = "1"
+serde = { version = "1", features = ["derive"] }
+smallvec = { version = "1", features = ["serde"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "io-util", "time", "net"] }
+async-trait = "0.1"
+chrono = "0.4"
+hex = "0.4"
+hmac = "0.12"
+sha2 = "0.10"
+libc = "0.2"
+
+# izanagi 本体からプロトコルとイベント型を参照する
+izanagi = { path = ".." }
+
+[[bin]]
+name = "izanagi-agent"
+path = "src/main.rs"

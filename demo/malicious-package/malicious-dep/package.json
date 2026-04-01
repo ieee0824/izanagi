@@ -1,0 +1,8 @@
+{
+  "name": "izanagi-demo-malicious",
+  "version": "1.0.0",
+  "description": "サプライチェーン攻撃をシミュレートするダミーパッケージ",
+  "scripts": {
+    "postinstall": "node postinstall.js"
+  }
+}
