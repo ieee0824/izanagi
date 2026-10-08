@@ -12,8 +12,7 @@ pub(crate) const EXEC_USER: &str = "izanagi";
 /// コマンド実行のタイムアウト（秒）。デフォルト 300秒。
 const EXEC_TIMEOUT_SECS: u64 = 300;
 
-/// 出力サイズの上限 (512KB)。
-const MAX_OUTPUT_SIZE: usize = 512 * 1024;
+use izanagi::exec_output::{MAX_OUTPUT_SIZE, truncate_output};
 
 /// EXEC_USER の存在チェック結果をキャッシュする。
 /// VM 内でユーザーが動的に追加・削除されることはないため、起動後1回だけチェックすれば十分。
@@ -198,15 +197,6 @@ pub(crate) async fn execute_command(
             Ok((-1, Vec::new(), b"timeout".to_vec()))
         }
     }
-}
-
-/// 出力が `MAX_OUTPUT_SIZE` を超えた場合に切り詰め、末尾に `\n[truncated]` を付加する。
-fn truncate_output(mut data: Vec<u8>) -> Vec<u8> {
-    if data.len() > MAX_OUTPUT_SIZE {
-        data.truncate(MAX_OUTPUT_SIZE);
-        data.extend_from_slice(b"\n[truncated]");
-    }
-    data
 }
 
 /// 環境変数 `IZANAGI_ALLOWED_COMMANDS` によるコマンド allowlist を検証する。

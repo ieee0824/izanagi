@@ -5,8 +5,7 @@ use anyhow::Context;
 use izanagi::session;
 use tokio::io::AsyncReadExt;
 
-/// 出力サイズの上限 (512 KB)。izanagi-agent 側と同じ制限。
-const MAX_OUTPUT_SIZE: usize = 512 * 1024;
+use izanagi::exec_output::{MAX_OUTPUT_SIZE, truncate_output};
 
 /// drain の上限 (64 MB)。超過分は読み捨てず子プロセスをブロックさせる。
 const MAX_DRAIN_SIZE: u64 = 64 * 1024 * 1024;
@@ -140,15 +139,6 @@ async fn exec_on_qemu_session_capture(
         stdout: String::from_utf8_lossy(&truncate_output(stdout)).into_owned(),
         stderr: String::from_utf8_lossy(&truncate_output(stderr)).into_owned(),
     })
-}
-
-/// 出力が `MAX_OUTPUT_SIZE` を超えた場合に切り詰め、末尾に `\n[truncated]` を付加する。
-fn truncate_output(mut data: Vec<u8>) -> Vec<u8> {
-    if data.len() > MAX_OUTPUT_SIZE {
-        data.truncate(MAX_OUTPUT_SIZE);
-        data.extend_from_slice(b"\n[truncated]");
-    }
-    data
 }
 
 #[cfg(test)]

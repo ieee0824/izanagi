@@ -11,6 +11,7 @@ edition = "2024"
 #   cd izanagi-dns-proxy && cargo build --release
 
 [dependencies]
+izanagi-common = { path = "../izanagi-common", features = ["user"] }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 hickory-proto = "0.26.1"

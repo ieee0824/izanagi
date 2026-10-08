@@ -695,6 +695,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "izanagi-common"
+version = "0.1.0"
+
+[[package]]
 name = "izanagi-dns-proxy"
 version = "0.1.0"
 dependencies = [
@@ -702,6 +706,7 @@ dependencies = [
  "clap",
  "hickory-proto",
  "izanagi",
+ "izanagi-common",
  "tokio",
 ]
 

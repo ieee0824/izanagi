@@ -23,6 +23,15 @@ pub fn expand_tilde(path: &str) -> anyhow::Result<String> {
     }
 }
 
+/// ループバックの空きポート番号を取得する。
+///
+/// リスナーを閉じて返すため、呼び出し元の bind までの間にポートが
+/// 他プロセスに取得される可能性がある。起動・接続失敗は呼び出し元で扱う。
+pub(crate) async fn find_available_port() -> anyhow::Result<u16> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    Ok(listener.local_addr()?.port())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

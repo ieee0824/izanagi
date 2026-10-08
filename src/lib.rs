@@ -11,6 +11,7 @@ pub mod dtrace_tracer;
 pub mod ebpf_tracer;
 pub mod engine;
 pub mod event;
+pub mod exec_output;
 pub mod landlock_sandbox;
 pub mod log_formatter;
 pub mod log_storage;

@@ -66,10 +66,35 @@ jobs:
         shell: bash
         run: |
           if [[ "${{ matrix.manifest }}" == "izanagi-common/Cargo.toml" ]]; then
-            cargo test --all-targets --manifest-path "${{ matrix.manifest }}"
+            cargo check --manifest-path "${{ matrix.manifest }}" --no-default-features
+            cargo test --all-targets --manifest-path "${{ matrix.manifest }}" --features user
           else
             cargo test --locked --all-targets --manifest-path "${{ matrix.manifest }}"
           fi
+
+  agent-ebpf:
+    name: Check agent eBPF feature
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - run: cargo check --locked --manifest-path izanagi-agent/Cargo.toml --features ebpf
+
+  ebpf-build:
+    name: Build no_std eBPF program
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: nightly
+          components: rust-src
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - run: cargo install bpf-linker --locked
+      - run: cargo build --manifest-path izanagi-ebpf/Cargo.toml --target bpfel-unknown-none -Z build-std=core
 
   quality:
     name: Format and Clippy
