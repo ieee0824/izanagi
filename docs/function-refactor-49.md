@@ -73,10 +73,45 @@ plus empty/escaped MITM mapping arrays. The new initialization commit still need
 Linux/macOS CI verification. All-feature builds require Linux because aya and
 landlock depend on Linux libc interfaces.
 
+### Host eBPF tracing
+
+All four original host tracer candidates and their new helpers are below 50
+lines. Linux probe attachment, ABI/ELF section validation, kernel map acquisition,
+ring-buffer forwarding, observation conversion and loss reporting now have
+separate responsibilities. Required/optional probe error handling, legacy
+channel backpressure, agent-event filtering and accumulated loss delivery are
+preserved. Added tests cover malformed ELF offsets/duplicate metadata, channel
+closure during backpressure, loss retention during queue saturation and filtering
+of agent telemetry. Linux cross-target check and all-feature/all-target Clippy
+pass; execution of Linux-specific tests remains a CI gate.
+
+### Behavior runtime, classifier, CLI and evaluation
+
+All twelve original candidates in these four modules are split, with every new
+production helper below 50 lines. Responsibilities include bounded replay,
+fixture/path/digest validation, paired evaluation and metrics, session-authorized
+retention/export, MCP negotiation and response validation, ingestion state,
+freshness checks, cancellable invocation and closed-schema audit persistence.
+The same validation/error priority, process kill/reap order, shutdown behavior,
+classifier timing and evaluation denominators are retained.
+
+The root macOS all-target test suite passes: 395 library tests, 72 binary tests
+and 49 integration tests. Two additional evaluation regressions pass (11 total),
+proving digest mismatches and canonical symlink escapes prevent classification.
+Linux cross-target all-feature/all-target Clippy also passes.
+
+### Stop validation and log following
+
+PID timestamp validation and tail-line discard/rendering have separate helpers;
+both original candidates and their helpers are below 50 lines. Partial lines
+still rewind, overlong incomplete lines are discarded, severity filtering and
+truncation text are unchanged. Two new log regressions verify the partial-line
+retry/filter path and the overlong discard cursor. Binary tests now total 74.
+
 ## Outstanding work
 
 The remaining inventory is work to complete, except explicitly documented
-declarative exceptions. Tracer, CLI, sandbox, behavior evaluation and
+declarative exceptions. Other tracer, MCP/CLI, sandbox and
 proxy candidates still require decomposition and appropriate boundary tests.
 Full fmt/check/test and Linux/feature CI gates, final inventory, PR and merge
 remain required before closing #49.

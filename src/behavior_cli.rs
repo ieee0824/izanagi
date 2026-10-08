@@ -121,142 +121,163 @@ pub async fn run(action: BehaviorAction, default_audit_root: &Path) -> Result<u8
             input,
             output,
             provider,
-        } => {
-            let classifier = build_classifier(&provider, None)?;
-            let snapshots = replay_file(&input)?;
-            let mut assessments = Vec::new();
-            for snapshot in snapshots {
-                let projection = snapshot.projection(FeatureMode::Correlated);
-                let projection_digest = projection.digest()?;
-                let outcome = classifier.classify(&projection).await;
-                assessments.push(ReplayAssessment {
-                    deterministic_class: deterministic_rule(&snapshot),
-                    snapshot,
-                    projection_digest,
-                    classifier: outcome,
-                });
-            }
-            let mut bytes = Vec::new();
-            for assessment in assessments {
-                serde_json::to_writer(&mut bytes, &assessment)?;
-                bytes.push(b'\n');
-            }
-            write_output(output.as_deref(), &bytes)?;
-        }
+        } => replay_command(&input, output.as_deref(), &provider).await?,
         BehaviorAction::Evaluate {
-            manifest: path,
+            manifest,
             output,
             provider,
-        } => {
-            let manifest = load_manifest(&path)?;
-            let classifier = build_classifier(&provider, Some(&manifest))?;
-            let base = path
-                .parent()
-                .filter(|path| !path.as_os_str().is_empty())
-                .unwrap_or(Path::new("."));
-            let report = evaluate_manifest(
-                &manifest,
-                base,
-                classifier.as_ref(),
-                provider.classifier.name(),
-            )
-            .await?;
-            let mut bytes = serde_json::to_vec_pretty(&report)?;
-            bytes.push(b'\n');
-            write_output(output.as_deref(), &bytes)?;
-        }
+        } => evaluate_command(&manifest, output.as_deref(), &provider).await?,
         BehaviorAction::Clear { session, directory } => {
-            validate_session(&session)?;
-            let directory = directory.unwrap_or_else(|| default_audit_root.join(&session));
-            if !directory.is_dir() {
-                bail!("behavior session audit directory does not exist");
-            }
-            let mut store = AuditStore::new(directory, StoreConfig::default())?;
-            for record in store.read_records()? {
-                let id = match record.payload {
-                    AuditPayload::Event(e) => e.session_id,
-                    AuditPayload::Assessment { snapshot, .. } => snapshot.session_id,
-                    AuditPayload::Classification(c) => c.session_id,
-                };
-                if id != session {
-                    bail!("audit directory does not match requested session");
-                }
-            }
+            let mut store = open_session_store(&session, directory, default_audit_root)?;
             store.clear()?;
         }
         BehaviorAction::Show { session, directory } => {
-            if session.is_empty()
-                || session.len() > 160
-                || !session
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b':'))
-            {
-                bail!("invalid behavior session ID");
-            }
-            let directory = directory.unwrap_or_else(|| default_audit_root.join(&session));
-            if !directory.is_dir() {
-                bail!("behavior session audit directory does not exist");
-            }
-            let mut store = AuditStore::new(directory, StoreConfig::default())?;
-            // Verify the requested identity before applying retention to the
-            // selected directory, including when every record is already old.
-            for record in store.read_records()? {
-                let id = match record.payload {
-                    AuditPayload::Event(e) => e.session_id,
-                    AuditPayload::Assessment { snapshot, .. } => snapshot.session_id,
-                    AuditPayload::Classification(c) => c.session_id,
-                };
-                if id != session {
-                    bail!("audit directory does not match requested session");
-                }
-            }
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_secs();
-            store.expire(now)?;
-            let records = store.read_records()?;
-            let mut events = BTreeSet::new();
-            for record in &records {
-                let id = match &record.payload {
-                    AuditPayload::Event(event) => {
-                        events.insert(event.event_id.clone());
-                        &event.session_id
-                    }
-                    AuditPayload::Assessment { snapshot, .. } => &snapshot.session_id,
-                    AuditPayload::Classification(classification) => &classification.session_id,
-                };
-                if id != &session {
-                    bail!("audit directory does not match requested session");
-                }
-            }
-            let mut stdout = std::io::stdout().lock();
-            for record in &records {
-                let refs = match &record.payload {
-                    AuditPayload::Assessment { snapshot, .. } => Some(&snapshot.evidence_event_ids),
-                    AuditPayload::Classification(classification) => {
-                        Some(&classification.evidence_event_ids)
-                    }
-                    _ => None,
-                };
-                let evidence_availability = refs.map(|refs| {
-                    if refs.iter().all(|id| events.contains(id)) {
-                        EvidenceAvailability::Available
-                    } else {
-                        EvidenceAvailability::EvidenceExpired
-                    }
-                });
-                serde_json::to_writer(
-                    &mut stdout,
-                    &ShownRecord {
-                        record,
-                        evidence_availability,
-                    },
-                )?;
-                stdout.write_all(b"\n")?;
-            }
+            show_command(&session, directory, default_audit_root)?
         }
     }
     Ok(0)
+}
+
+async fn replay_command(
+    input: &Path,
+    output: Option<&Path>,
+    provider: &ProviderOptions,
+) -> Result<()> {
+    let classifier = build_classifier(provider, None)?;
+    let snapshots = replay_file(input)?;
+    let mut assessments = Vec::new();
+    for snapshot in snapshots {
+        let projection = snapshot.projection(FeatureMode::Correlated);
+        let projection_digest = projection.digest()?;
+        let outcome = classifier.classify(&projection).await;
+        assessments.push(ReplayAssessment {
+            deterministic_class: deterministic_rule(&snapshot),
+            snapshot,
+            projection_digest,
+            classifier: outcome,
+        });
+    }
+    let mut bytes = Vec::new();
+    for assessment in assessments {
+        serde_json::to_writer(&mut bytes, &assessment)?;
+        bytes.push(b'\n');
+    }
+    write_output(output, &bytes)?;
+    Ok(())
+}
+
+async fn evaluate_command(
+    path: &Path,
+    output: Option<&Path>,
+    provider: &ProviderOptions,
+) -> Result<()> {
+    let manifest = load_manifest(path)?;
+    let classifier = build_classifier(provider, Some(&manifest))?;
+    let base = path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let report = evaluate_manifest(
+        &manifest,
+        base,
+        classifier.as_ref(),
+        provider.classifier.name(),
+    )
+    .await?;
+    let mut bytes = serde_json::to_vec_pretty(&report)?;
+    bytes.push(b'\n');
+    write_output(output, &bytes)?;
+    Ok(())
+}
+
+fn open_session_store(
+    session: &str,
+    directory: Option<PathBuf>,
+    default_audit_root: &Path,
+) -> Result<AuditStore> {
+    validate_session(session)?;
+    let directory = directory.unwrap_or_else(|| default_audit_root.join(session));
+    if !directory.is_dir() {
+        bail!("behavior session audit directory does not exist");
+    }
+    let store = AuditStore::new(directory, StoreConfig::default())?;
+    // Check identity before applying retention or clearing, including expired records.
+    for record in store.read_records()? {
+        if audit_session_id(&record) != session {
+            bail!("audit directory does not match requested session");
+        }
+    }
+    Ok(store)
+}
+
+fn audit_session_id(record: &AuditRecord) -> &str {
+    match &record.payload {
+        AuditPayload::Event(event) => &event.session_id,
+        AuditPayload::Assessment { snapshot, .. } => &snapshot.session_id,
+        AuditPayload::Classification(classification) => &classification.session_id,
+    }
+}
+
+fn show_command(
+    session: &str,
+    directory: Option<PathBuf>,
+    default_audit_root: &Path,
+) -> Result<()> {
+    let mut store = open_session_store(session, directory, default_audit_root)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    store.expire(now)?;
+    let records = store.read_records()?;
+    let events = retained_evidence(&records, session)?;
+    show_records(&records, &events)
+}
+
+fn retained_evidence(records: &[AuditRecord], session: &str) -> Result<BTreeSet<String>> {
+    let mut events = BTreeSet::new();
+    for record in records {
+        let id = match &record.payload {
+            AuditPayload::Event(event) => {
+                events.insert(event.event_id.clone());
+                &event.session_id
+            }
+            AuditPayload::Assessment { snapshot, .. } => &snapshot.session_id,
+            AuditPayload::Classification(classification) => &classification.session_id,
+        };
+        if id != session {
+            bail!("audit directory does not match requested session");
+        }
+    }
+    Ok(events)
+}
+
+fn show_records(records: &[AuditRecord], events: &BTreeSet<String>) -> Result<()> {
+    let mut stdout = std::io::stdout().lock();
+    for record in records {
+        let refs = match &record.payload {
+            AuditPayload::Assessment { snapshot, .. } => Some(&snapshot.evidence_event_ids),
+            AuditPayload::Classification(classification) => {
+                Some(&classification.evidence_event_ids)
+            }
+            _ => None,
+        };
+        let evidence_availability = refs.map(|refs| {
+            if refs.iter().all(|id| events.contains(id)) {
+                EvidenceAvailability::Available
+            } else {
+                EvidenceAvailability::EvidenceExpired
+            }
+        });
+        serde_json::to_writer(
+            &mut stdout,
+            &ShownRecord {
+                record,
+                evidence_availability,
+            },
+        )?;
+        stdout.write_all(b"\n")?;
+    }
+    Ok(())
 }
 
 fn validate_session(session: &str) -> Result<()> {
@@ -281,6 +302,39 @@ fn build_classifier(
     if options.model != PINNED_MODEL {
         bail!("behavior evaluation requires pinned model jev-1.13.0");
     }
+    let config = classifier_config(options, manifest)?;
+    match options.classifier {
+        Provider::Mock => {
+            reject_recorded_responses(options)?;
+            Ok(Box::new(MockClassifier))
+        }
+        Provider::Recorded => {
+            let path = options.recorded_responses.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("recorded classifier requires --recorded-responses")
+            })?;
+            Ok(Box::new(RecordedClassifier {
+                responses: load_recorded_responses(path)?,
+                config,
+            }))
+        }
+        Provider::JevMcp => {
+            reject_recorded_responses(options)?;
+            Ok(Box::new(JevMcpClassifier::new(config)?))
+        }
+    }
+}
+
+fn reject_recorded_responses(options: &ProviderOptions) -> Result<()> {
+    if options.recorded_responses.is_some() {
+        bail!("recorded responses require recorded classifier");
+    }
+    Ok(())
+}
+
+fn classifier_config(
+    options: &ProviderOptions,
+    manifest: Option<&EvaluationManifest>,
+) -> Result<ClassifierConfig> {
     let mut config = ClassifierConfig {
         command: options.mcp_command.clone(),
         args: options.mcp_arg.clone(),
@@ -304,44 +358,29 @@ fn build_classifier(
         config.confidence_tolerance = manifest.confidence_tolerance;
     }
     config.validate()?;
-    match options.classifier {
-        Provider::Mock => {
-            if options.recorded_responses.is_some() {
-                bail!("recorded responses require recorded classifier");
-            }
-            Ok(Box::new(MockClassifier))
-        }
-        Provider::Recorded => {
-            let path = options.recorded_responses.as_deref().ok_or_else(|| {
-                anyhow::anyhow!("recorded classifier requires --recorded-responses")
-            })?;
-            let file = std::fs::File::open(path)
-                .map_err(|_| anyhow::anyhow!("cannot read recorded classifier responses"))?;
-            let mut bytes = Vec::new();
-            file.take(8 * 1024 * 1024 + 1)
-                .read_to_end(&mut bytes)
-                .map_err(|_| anyhow::anyhow!("cannot read recorded classifier responses"))?;
-            if bytes.len() > 8 * 1024 * 1024 {
-                bail!("recorded classifier response file size limit exceeded");
-            }
-            let responses: BTreeMap<String, Value> = serde_json::from_slice(&bytes)
-                .map_err(|_| anyhow::anyhow!("invalid recorded classifier response JSON"))?;
-            if responses.len() > 4096
-                || responses
-                    .keys()
-                    .any(|key| key.len() != 64 || !key.bytes().all(|b| b.is_ascii_hexdigit()))
-            {
-                bail!("invalid recorded classifier projection digests");
-            }
-            Ok(Box::new(RecordedClassifier { responses, config }))
-        }
-        Provider::JevMcp => {
-            if options.recorded_responses.is_some() {
-                bail!("recorded responses require recorded classifier");
-            }
-            Ok(Box::new(JevMcpClassifier::new(config)?))
-        }
+    Ok(config)
+}
+
+fn load_recorded_responses(path: &Path) -> Result<BTreeMap<String, Value>> {
+    let file = std::fs::File::open(path)
+        .map_err(|_| anyhow::anyhow!("cannot read recorded classifier responses"))?;
+    let mut bytes = Vec::new();
+    file.take(8 * 1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| anyhow::anyhow!("cannot read recorded classifier responses"))?;
+    if bytes.len() > 8 * 1024 * 1024 {
+        bail!("recorded classifier response file size limit exceeded");
     }
+    let responses: BTreeMap<String, Value> = serde_json::from_slice(&bytes)
+        .map_err(|_| anyhow::anyhow!("invalid recorded classifier response JSON"))?;
+    if responses.len() > 4096
+        || responses
+            .keys()
+            .any(|key| key.len() != 64 || !key.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
+        bail!("invalid recorded classifier projection digests");
+    }
+    Ok(responses)
 }
 
 fn write_output(path: Option<&Path>, bytes: &[u8]) -> Result<()> {

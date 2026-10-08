@@ -289,3 +289,45 @@ async fn confident_wrong_answers_are_counted_against_independent_labels() {
         1.0
     );
 }
+
+struct NoInvocation;
+#[async_trait]
+impl Classifier for NoInvocation {
+    async fn classify(&self, _: &FeatureProjection) -> ClassificationOutcome {
+        panic!("invalid fixture must be rejected before classification")
+    }
+}
+
+#[tokio::test]
+async fn fixture_digest_mismatch_prevents_classification() {
+    let dir = fixtures();
+    let mut manifest = load_manifest(&dir.join("manifest.json")).unwrap();
+    manifest.scenarios[0].events_sha256 = "0".repeat(64);
+    let error = evaluate_manifest(&manifest, &dir, &NoInvocation, "mock")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "evaluation fixture does not match manifest digest"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn canonical_fixture_symlink_escape_prevents_classification() {
+    let dir = fixtures();
+    let manifest = load_manifest(&dir.join("manifest.json")).unwrap();
+    let base = std::env::temp_dir().join(format!("izanagi-eval-{}", rand::random::<u64>()));
+    std::fs::create_dir(&base).unwrap();
+    std::os::unix::fs::symlink(
+        dir.join(&manifest.scenarios[0].events),
+        base.join(&manifest.scenarios[0].events),
+    )
+    .unwrap();
+    let result = evaluate_manifest(&manifest, &base, &NoInvocation, "mock").await;
+    std::fs::remove_dir_all(base).unwrap();
+    assert_eq!(
+        result.unwrap_err().to_string(),
+        "evaluation fixture escapes manifest directory"
+    );
+}

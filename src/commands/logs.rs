@@ -195,14 +195,7 @@ fn tail_lines(reader: &mut BufReader<std::fs::File>, suspicious: bool) -> anyhow
                 break;
             }
             // 上限超過の長大行 → 次の改行まで読み捨てる
-            let mut discard = Vec::new();
-            loop {
-                discard.clear();
-                let n = reader.read_until(b'\n', &mut discard)?;
-                if n == 0 || discard.ends_with(b"\n") {
-                    break;
-                }
-            }
+            discard_incomplete_line(reader)?;
             continue;
         }
         // 改行を除いた表示用バイト列
@@ -213,25 +206,32 @@ fn tail_lines(reader: &mut BufReader<std::fs::File>, suspicious: bool) -> anyhow
             continue;
         }
         let overlong = buf.len() - 1 > MAX_LINE_LEN;
-        if suspicious {
-            if is_suspicious_line(trimmed) {
-                print!("{}", trimmed);
-                if overlong {
-                    print!("...[truncated]");
-                }
-                println!();
-                count += 1;
-            }
-        } else {
-            print!("{}", trimmed);
-            if overlong {
-                print!("...[truncated]");
-            }
-            println!();
+        if !suspicious || is_suspicious_line(trimmed) {
+            print_log_line(trimmed, overlong);
             count += 1;
         }
     }
     Ok(count)
+}
+
+fn discard_incomplete_line(reader: &mut BufReader<std::fs::File>) -> std::io::Result<()> {
+    let mut discard = Vec::new();
+    loop {
+        discard.clear();
+        let n = reader.read_until(b'\n', &mut discard)?;
+        if n == 0 || discard.ends_with(b"\n") {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn print_log_line(line: &str, overlong: bool) {
+    print!("{}", line);
+    if overlong {
+        print!("...[truncated]");
+    }
+    println!();
 }
 
 /// ログ行が WARN または CRITICAL レベルかどうかを構造的に判定する。
@@ -241,5 +241,39 @@ fn is_suspicious_line(line: &str) -> bool {
         matches!(level, "WARN" | "CRITICAL")
     } else {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn partial_line_is_revisited_and_filtered_after_completion() {
+        let path = std::env::temp_dir().join(format!("izanagi-tail-{}", rand::random::<u64>()));
+        std::fs::write(&path, b"[time] WARN partial").unwrap();
+        let mut reader = BufReader::new(std::fs::File::open(&path).unwrap());
+        assert_eq!(tail_lines(&mut reader, true).unwrap(), 0);
+        assert_eq!(reader.stream_position().unwrap(), 0);
+        let mut writer = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writer
+            .write_all(b" complete\n[time] INFO ignored\n")
+            .unwrap();
+        assert_eq!(tail_lines(&mut reader, true).unwrap(), 1);
+        assert_eq!(tail_lines(&mut reader, false).unwrap(), 0);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn oversized_unterminated_line_is_discarded_without_rewind() {
+        let path = std::env::temp_dir().join(format!("izanagi-tail-{}", rand::random::<u64>()));
+        std::fs::write(&path, vec![b'x'; MAX_LINE_LEN + 1]).unwrap();
+        let mut reader = BufReader::new(std::fs::File::open(&path).unwrap());
+        assert_eq!(tail_lines(&mut reader, false).unwrap(), 0);
+        assert_eq!(reader.stream_position().unwrap(), (MAX_LINE_LEN + 1) as u64);
+        std::fs::remove_file(path).unwrap();
     }
 }
