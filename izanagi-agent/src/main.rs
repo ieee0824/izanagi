@@ -39,36 +39,8 @@ const DEFAULT_PORT: u32 = 9001;
 async fn main() -> anyhow::Result<()> {
     eprintln!("izanagi-agent starting on vsock port {}...", DEFAULT_PORT);
 
-    // fw_cfg からシークレットを読み取る (#161)
-    // fw_cfg の値が取得できた場合、環境変数より優先する
-    let secret = match config::read_fw_cfg_secret() {
-        Some(s) => Some(s),
-        None => protocol::load_shared_secret_from_env()?,
-    };
-    if secret.is_some() {
-        eprintln!("HMAC authentication enabled");
-    } else {
-        eprintln!("WARNING: HMAC authentication disabled (IZANAGI_SHARED_SECRET not set)");
-    }
-
-    // fw_cfg からセッショントークンを読み取る (#115)
-    // Linux ゲストでは /sys/firmware/qemu_fw_cfg/by_name/opt/izanagi.token/raw に配置される
-    // セッショントークン: VM 生存期間中は同じトークンで何度でも接続可能
-    // fw_cfg トークンが読めない場合は fail-closed (#196)
-    // IZANAGI_ALLOW_NO_TOKEN=1 で明示的にオプトアウト可能（開発・テスト用）
-    let expected_token: Arc<Option<String>> = Arc::new(config::read_fw_cfg_token());
-    let require_token = std::env::var("IZANAGI_ALLOW_NO_TOKEN").unwrap_or_default() != "1";
-    if expected_token.is_some() {
-        eprintln!("fw_cfg token authentication enabled");
-    } else if require_token {
-        anyhow::bail!(
-            "fw_cfg token not found. Set IZANAGI_ALLOW_NO_TOKEN=1 to allow (not recommended)."
-        );
-    } else {
-        eprintln!(
-            "WARNING: fw_cfg token not found, running without token authentication (IZANAGI_ALLOW_NO_TOKEN=1)"
-        );
-    }
+    let secret = load_authentication_secret()?;
+    let expected_token = load_session_token()?;
 
     // 環境変数設定のサマリをログ出力
     config::log_env_summary();
@@ -97,4 +69,43 @@ async fn main() -> anyhow::Result<()> {
             }
         });
     }
+}
+
+fn load_authentication_secret() -> anyhow::Result<Option<Vec<u8>>> {
+    // fw_cfg からシークレットを読み取る (#161)
+    // fw_cfg の値が取得できた場合、環境変数より優先する
+    let secret = match config::read_fw_cfg_secret() {
+        Some(s) => Some(s),
+        None => protocol::load_shared_secret_from_env()?,
+    };
+    if secret.is_some() {
+        eprintln!("HMAC authentication enabled");
+    } else {
+        eprintln!("WARNING: HMAC authentication disabled (IZANAGI_SHARED_SECRET not set)");
+    }
+
+    Ok(secret)
+}
+
+fn load_session_token() -> anyhow::Result<Arc<Option<String>>> {
+    // fw_cfg からセッショントークンを読み取る (#115)
+    // Linux ゲストでは /sys/firmware/qemu_fw_cfg/by_name/opt/izanagi.token/raw に配置される
+    // セッショントークン: VM 生存期間中は同じトークンで何度でも接続可能
+    // fw_cfg トークンが読めない場合は fail-closed (#196)
+    // IZANAGI_ALLOW_NO_TOKEN=1 で明示的にオプトアウト可能（開発・テスト用）
+    let expected_token: Arc<Option<String>> = Arc::new(config::read_fw_cfg_token());
+    let require_token = std::env::var("IZANAGI_ALLOW_NO_TOKEN").unwrap_or_default() != "1";
+    if expected_token.is_some() {
+        eprintln!("fw_cfg token authentication enabled");
+    } else if require_token {
+        anyhow::bail!(
+            "fw_cfg token not found. Set IZANAGI_ALLOW_NO_TOKEN=1 to allow (not recommended)."
+        );
+    } else {
+        eprintln!(
+            "WARNING: fw_cfg token not found, running without token authentication (IZANAGI_ALLOW_NO_TOKEN=1)"
+        );
+    }
+
+    Ok(expected_token)
 }

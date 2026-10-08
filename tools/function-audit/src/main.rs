@@ -10,9 +10,30 @@ fn test_only(attrs: &[Attribute]) -> bool {
             .is_some_and(|s| s.ident == "test")
             || (attr.path().is_ident("cfg")
                 && attr
-                    .parse_args::<syn::Path>()
-                    .is_ok_and(|p| p.is_ident("test")))
+                    .parse_args::<syn::Meta>()
+                    .is_ok_and(|meta| requires_test(&meta)))
     })
+}
+
+fn requires_test(meta: &syn::Meta) -> bool {
+    match meta {
+        syn::Meta::Path(path) => path.is_ident("test"),
+        syn::Meta::List(list) => {
+            let Ok(terms) = list.parse_args_with(
+                syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+            ) else {
+                return false;
+            };
+            if list.path.is_ident("all") {
+                terms.iter().any(requires_test)
+            } else if list.path.is_ident("any") {
+                !terms.is_empty() && terms.iter().all(requires_test)
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
 }
 
 struct Inventory<'a> {

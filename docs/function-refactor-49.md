@@ -39,8 +39,29 @@ proving the new cases assert existing behavior. Linux CI verification is pending
 
 ## Outstanding
 
+### Agent
+
+All seven original agent candidates are split, and all new production helpers
+in this component are below 50 lines. Responsibilities now have explicit names:
+Hello/token negotiation, operation authorization, control dispatch, tracer and
+sidecar startup, rate-limited event forwarding, pre-fork shell preparation,
+post-fork privilege/exec calls, bounded command output, timeout/group cleanup,
+PTY input/output, child exit observation/reaping, and root-only proxy metadata.
+Startup messages, authentication sequences, stop/drop order, and the persistent
+message reader across receive cancellation are preserved.
+
+Validation on macOS: component fmt/check, all 42 tests, and Clippy with
+`-D warnings` passed. TCP tests require execution outside the filesystem/network
+sandbox. Added tests cover Hello mode/token rejection, denial of all three
+protected unauthenticated operations, authenticated sequencing, tracer startup
+failure, draining/truncating both output streams, and timeout child reaping.
+Linux-only PTY cleanup/cancellation regressions and eBPF feature checks are
+pending CI.
+
+## Outstanding work
+
 The remaining inventory is work to complete, except explicitly documented
-declarative exceptions. Agent, tracer, CLI, sandbox, behavior evaluation and
+declarative exceptions. Tracer, CLI, sandbox, behavior evaluation and
 proxy candidates still require decomposition and appropriate boundary tests.
 Full fmt/check/test and Linux/feature CI gates, final inventory, PR and merge
 remain required before closing #49.

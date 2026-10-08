@@ -15,8 +15,9 @@ lines and comments, without counting preceding attributes or documentation.
 It includes free functions, inherent/trait implementation methods, and default
 trait methods, including definitions for other platform/feature configurations.
 
-It excludes `#[test]`/`#[tokio::test]`, `#[cfg(test)]` functions, implementations
+It excludes `#[test]`/`#[tokio::test]`, test-only cfg functions, implementations
 and inline modules, inline `mod tests`, and the repository's separately loaded
 `tests.rs` and `*_test_support.rs` files. Integration test directories are not
-among the roots above. Conditional compilation is not evaluated: other cfg
-expressions and macro-generated functions require manual review.
+among the roots above. Test-only `all`/`any` expressions are recognized (for
+example `cfg(all(test, target_os = "linux"))`). Platform/feature cfg expressions
+are included. Macro-generated functions require manual review.

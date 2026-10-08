@@ -65,78 +65,30 @@ impl Sidecar {
     pub(crate) async fn start(
         config: &BehaviorStartConfig,
     ) -> anyhow::Result<(Self, mpsc::Receiver<TelemetryEnvelope>)> {
-        anyhow::ensure!(
-            unsafe { libc::geteuid() } == 0,
-            "behavior sidecar requires root collector"
-        );
-        let listen: std::net::SocketAddr = config.proxy_listen.parse()?;
-        anyhow::ensure!(
-            listen.ip().is_loopback() && listen.port() != 0,
-            "behavior proxy must use a fixed guest loopback port"
-        );
-        let metadata = std::fs::metadata(BINARY)?;
-        anyhow::ensure!(
-            metadata.uid() == 0 && metadata.mode() & 0o022 == 0 && metadata.is_file(),
-            "sidecar binary must be a root-owned regular file without group/world write permission"
-        );
-        let id = format!("{:032x}", rand::random::<u128>());
-        let directory = PathBuf::from(format!("/run/izanagi-behavior-{id}"));
-        std::fs::DirBuilder::new().mode(0o700).create(&directory)?;
-        let socket = directory.join("telemetry.sock");
-        let listener = match tokio::net::UnixListener::bind(&socket) {
-            Ok(listener) => listener,
-            Err(error) => {
-                let _ = std::fs::remove_dir(&directory);
-                return Err(error.into());
-            }
-        };
-        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
-        let mut command = tokio::process::Command::new(BINARY);
-        command
-            .env_clear()
-            .env("PATH", "/usr/local/bin:/usr/bin:/bin")
-            .args([
-                "--behavior-forward",
-                "--listen-http",
-                &config.proxy_listen,
-                "--telemetry-socket",
-            ])
-            .arg(&socket)
-            .kill_on_drop(true)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        for host in &config.allowed_hosts {
-            command.arg("--allowed-host").arg(host);
-        }
-        if let Some(endpoint) = &config.fixture_endpoint {
-            command.arg("--fixture-endpoint").arg(endpoint);
-        }
-        let child = match command.spawn() {
-            Ok(child) => child,
-            Err(_) => {
-                let _ = std::fs::remove_file(&socket);
-                let _ = std::fs::remove_dir(&directory);
-                anyhow::bail!("behavior proxy could not start");
-            }
-        };
+        validate_start(config)?;
+        let (id, directory, listener) = create_metadata_socket()?;
+        let child = spawn_proxy(config, &directory)?;
         let mut sidecar = Self {
             child,
             tasks: Vec::new(),
             directory,
             id: id.clone(),
         };
-        if let Some(mut stderr) = sidecar.child.stderr.take() {
-            sidecar.tasks.push(tokio::spawn(async move {
-                let mut buffer = [0; 4096];
-                while let Ok(n) = stderr.read(&mut buffer).await {
-                    if n == 0 {
-                        break;
-                    }
-                }
-            }));
+        if let Some(stderr) = sidecar.child.stderr.take() {
+            sidecar.tasks.push(drain_output(stderr));
         }
-        let stdout = sidecar
+        sidecar.wait_ready(&config.proxy_listen).await?;
+        let (tx, rx) = mpsc::channel(256);
+        let source = metadata_source(config, &id)?;
+        sidecar
+            .tasks
+            .push(tokio::spawn(receive_metadata(listener, source, tx)));
+        sidecar.activate(&config.proxy_listen)?;
+        Ok((sidecar, rx))
+    }
+
+    async fn wait_ready(&mut self, listen: &str) -> anyhow::Result<()> {
+        let stdout = self
             .child
             .stdout
             .take()
@@ -156,109 +108,21 @@ impl Sidecar {
             .map_err(|_| anyhow::anyhow!("invalid proxy readiness"))?;
         anyhow::ensure!(
             ready.get("ready").and_then(serde_json::Value::as_bool) == Some(true)
-                && ready.get("listen").and_then(serde_json::Value::as_str)
-                    == Some(config.proxy_listen.as_str()),
+                && ready.get("listen").and_then(serde_json::Value::as_str) == Some(listen),
             "behavior proxy readiness mismatch"
         );
-        sidecar.tasks.push(tokio::spawn(async move {
-            let mut buffer = [0; 4096];
-            while let Ok(n) = stdout.read(&mut buffer).await {
-                if n == 0 {
-                    break;
-                }
-            }
-        }));
-        let (tx, rx) = mpsc::channel(256);
-        let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?
-            .trim()
-            .to_owned();
-        let mut source = Source {
-            session: config.session_id.clone(),
-            boot,
-            instance: format!("http-{id}"),
-            sequence: 0,
-        };
-        sidecar.tasks.push(tokio::spawn(async move {
-            let mut lost = 0u64;
-            loop {
-                let (stream, _) = match listener.accept().await {
-                    Ok(value) => value,
-                    Err(_) => break,
-                };
-                if !stream.peer_cred().is_ok_and(|cred| cred.uid() == 0) {
-                    continue;
-                }
-                let mut reader = BufReader::new(stream);
-                loop {
-                    let mut bytes = Vec::new();
-                    let read = (&mut reader)
-                        .take(MAX_RECORD + 1)
-                        .read_until(b'\n', &mut bytes)
-                        .await;
-                    if !matches!(read,Ok(n) if n>0) {
-                        break;
-                    }
-                    if bytes.len() as u64 > MAX_RECORD || !bytes.ends_with(b"\n") {
-                        lost += 1;
-                        break;
-                    }
-                    let record: SidecarRecord = match serde_json::from_slice(&bytes) {
-                        Ok(value) => value,
-                        Err(_) => {
-                            lost += 1;
-                            continue;
-                        }
-                    };
-                    // The executable can submit only proxy observations, never
-                    // process/PID/envelope/session identities.
-                    if !allowed_payload(&record.payload) {
-                        lost += 1;
-                        continue;
-                    }
-                    if lost > 0 {
-                        let event = source.envelope(
-                            monotonic_ns(),
-                            TelemetryPayload::ObservationGap {
-                                dropped: lost,
-                                reason: QualityIssue::EventLoss,
-                            },
-                            vec![QualityIssue::EventLoss],
-                        );
-                        if tx.try_send(event).is_ok() {
-                            lost = 0;
-                        }
-                    }
-                    let issues = if matches!(record.payload, TelemetryPayload::HttpRequest { .. }) {
-                        vec![QualityIssue::MissingWriter]
-                    } else {
-                        vec![]
-                    };
-                    let event =
-                        source.envelope(record.observed_monotonic_ns, record.payload, issues);
-                    if tx.try_send(event).is_err() {
-                        lost += 1;
-                    }
-                }
-                let event = source.envelope(
-                    monotonic_ns(),
-                    TelemetryPayload::CollectorHealth { healthy: false },
-                    vec![QualityIssue::SourceUnavailable],
-                );
-                if tx.try_send(event).is_err() {
-                    lost += 1;
-                }
-                if tx.is_closed() {
-                    return;
-                }
-            }
-        }));
+        self.tasks.push(drain_output(stdout));
+        Ok(())
+    }
+
+    fn activate(&self, listen: &str) -> anyhow::Result<()> {
         let mut active = ACTIVE
             .get_or_init(|| Mutex::new(None))
             .lock()
             .expect("proxy state poisoned");
         anyhow::ensure!(active.is_none(), "a behavior proxy is already active");
-        *active = Some((id, format!("http://{}", config.proxy_listen)));
-        Ok((sidecar, rx))
+        *active = Some((self.id.clone(), format!("http://{listen}")));
+        Ok(())
     }
 
     pub(crate) fn failed(&mut self) -> bool {
@@ -283,6 +147,196 @@ impl Drop for Sidecar {
         let _ = std::fs::remove_dir(&self.directory);
     }
 }
+fn validate_start(config: &BehaviorStartConfig) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        unsafe { libc::geteuid() } == 0,
+        "behavior sidecar requires root collector"
+    );
+    let listen: std::net::SocketAddr = config.proxy_listen.parse()?;
+    anyhow::ensure!(
+        listen.ip().is_loopback() && listen.port() != 0,
+        "behavior proxy must use a fixed guest loopback port"
+    );
+    let metadata = std::fs::metadata(BINARY)?;
+    anyhow::ensure!(
+        metadata.uid() == 0 && metadata.mode() & 0o022 == 0 && metadata.is_file(),
+        "sidecar binary must be a root-owned regular file without group/world write permission"
+    );
+    Ok(())
+}
+
+fn create_metadata_socket() -> anyhow::Result<(String, PathBuf, tokio::net::UnixListener)> {
+    let id = format!("{:032x}", rand::random::<u128>());
+    let directory = PathBuf::from(format!("/run/izanagi-behavior-{id}"));
+    std::fs::DirBuilder::new().mode(0o700).create(&directory)?;
+    let socket = directory.join("telemetry.sock");
+    let listener = match tokio::net::UnixListener::bind(&socket) {
+        Ok(listener) => listener,
+        Err(error) => {
+            let _ = std::fs::remove_dir(&directory);
+            return Err(error.into());
+        }
+    };
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
+    Ok((id, directory, listener))
+}
+
+fn spawn_proxy(
+    config: &BehaviorStartConfig,
+    directory: &std::path::Path,
+) -> anyhow::Result<tokio::process::Child> {
+    let socket = directory.join("telemetry.sock");
+    let mut command = tokio::process::Command::new(BINARY);
+    command
+        .env_clear()
+        .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+        .args([
+            "--behavior-forward",
+            "--listen-http",
+            &config.proxy_listen,
+            "--telemetry-socket",
+        ])
+        .arg(&socket)
+        .kill_on_drop(true)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    for host in &config.allowed_hosts {
+        command.arg("--allowed-host").arg(host);
+    }
+    if let Some(endpoint) = &config.fixture_endpoint {
+        command.arg("--fixture-endpoint").arg(endpoint);
+    }
+    let child = match command.spawn() {
+        Ok(child) => child,
+        Err(_) => {
+            let _ = std::fs::remove_file(&socket);
+            let _ = std::fs::remove_dir(directory);
+            anyhow::bail!("behavior proxy could not start");
+        }
+    };
+    Ok(child)
+}
+
+fn drain_output<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
+    mut reader: R,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut buffer = [0; 4096];
+        while let Ok(n) = reader.read(&mut buffer).await {
+            if n == 0 {
+                break;
+            }
+        }
+    })
+}
+
+fn metadata_source(config: &BehaviorStartConfig, id: &str) -> anyhow::Result<Source> {
+    let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?
+        .trim()
+        .to_owned();
+    Ok(Source {
+        session: config.session_id.clone(),
+        boot,
+        instance: format!("http-{id}"),
+        sequence: 0,
+    })
+}
+
+async fn receive_metadata(
+    listener: tokio::net::UnixListener,
+    mut source: Source,
+    tx: mpsc::Sender<TelemetryEnvelope>,
+) {
+    let mut lost = 0u64;
+    loop {
+        let (stream, _) = match listener.accept().await {
+            Ok(value) => value,
+            Err(_) => break,
+        };
+        // Root-owned socket and credential check precede all record parsing.
+        if !stream.peer_cred().is_ok_and(|cred| cred.uid() == 0) {
+            continue;
+        }
+        read_metadata_stream(stream, &mut source, &tx, &mut lost).await;
+        let event = source.envelope(
+            monotonic_ns(),
+            TelemetryPayload::CollectorHealth { healthy: false },
+            vec![QualityIssue::SourceUnavailable],
+        );
+        if tx.try_send(event).is_err() {
+            lost += 1;
+        }
+        if tx.is_closed() {
+            return;
+        }
+    }
+}
+
+async fn read_metadata_stream(
+    stream: tokio::net::UnixStream,
+    source: &mut Source,
+    tx: &mpsc::Sender<TelemetryEnvelope>,
+    lost: &mut u64,
+) {
+    let mut reader = BufReader::new(stream);
+    loop {
+        let mut bytes = Vec::new();
+        let read = (&mut reader)
+            .take(MAX_RECORD + 1)
+            .read_until(b'\n', &mut bytes)
+            .await;
+        if !matches!(read, Ok(n) if n > 0) {
+            break;
+        }
+        if bytes.len() as u64 > MAX_RECORD || !bytes.ends_with(b"\n") {
+            *lost += 1;
+            break;
+        }
+        let Some(record) = decode_record(&bytes) else {
+            *lost += 1;
+            continue;
+        };
+        forward_record(record, source, tx, lost);
+    }
+}
+
+fn decode_record(bytes: &[u8]) -> Option<SidecarRecord> {
+    let record: SidecarRecord = serde_json::from_slice(bytes).ok()?;
+    // Proxy records cannot supply process/PID/envelope/session identities.
+    allowed_payload(&record.payload).then_some(record)
+}
+
+fn forward_record(
+    record: SidecarRecord,
+    source: &mut Source,
+    tx: &mpsc::Sender<TelemetryEnvelope>,
+    lost: &mut u64,
+) {
+    if *lost > 0 {
+        let event = source.envelope(
+            monotonic_ns(),
+            TelemetryPayload::ObservationGap {
+                dropped: *lost,
+                reason: QualityIssue::EventLoss,
+            },
+            vec![QualityIssue::EventLoss],
+        );
+        if tx.try_send(event).is_ok() {
+            *lost = 0;
+        }
+    }
+    let issues = if matches!(record.payload, TelemetryPayload::HttpRequest { .. }) {
+        vec![QualityIssue::MissingWriter]
+    } else {
+        vec![]
+    };
+    let event = source.envelope(record.observed_monotonic_ns, record.payload, issues);
+    if tx.try_send(event).is_err() {
+        *lost += 1;
+    }
+}
+
 fn allowed_payload(payload: &TelemetryPayload) -> bool {
     matches!(
         payload,

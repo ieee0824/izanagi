@@ -48,13 +48,6 @@ src/qemu_sandbox.rs	up	650	157
 src/rules/network_allowlist.rs	resolve_hosts_with_timeout	89	81
 src/vm_agent_tracer.rs	receive_events	194	56
 src/vm_agent_tracer.rs	start	311	78
-izanagi-agent/src/connection.rs	handle_connection	60	306
-izanagi-agent/src/connection.rs	handle_shell	368	174
-izanagi-agent/src/exec.rs	execute_command	41	160
-izanagi-agent/src/main.rs	main	39	62
-izanagi-agent/src/shell.rs	try_reap	26	50
-izanagi-agent/src/shell.rs	relay_shell	125	122
-izanagi-agent/src/sidecar.rs	start	65	198
 izanagi-dns-proxy/src/main.rs	main	41	50
 izanagi-dns-proxy/src/proxy.rs	run	30	52
 izanagi-dns-proxy/src/proxy.rs	handle_query	197	102
