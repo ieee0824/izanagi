@@ -1,0 +1,158 @@
+{
+  "provenance": {
+    "source_commit": "3ab9d3fd358e979ae222cfb942399b6c543128af",
+    "collector_commit": "3ab9d3fd358e979ae222cfb942399b6c543128af",
+    "seed": 39,
+    "scenario_version": "vm-explicit-http-load-v2",
+    "model": "mock-v1",
+    "question_version": 1,
+    "feature_version": 1,
+    "host_policy_version": 1,
+    "vm_image_input_sha256": "3fa545ef068767758cb1b88dbcca36981d95bed215b3e4d3962bb2dcedce924a",
+    "binary_sha256": {
+      "host": "33aec74d85d03bf977dcddb20908dc007e791e927255eeba114b32341c48b518",
+      "agent": "aaecb200fb43f6218eab6e43638181b040720e34e98dd37347112e359d952590",
+      "http": "d68725a8a24ea5312687e995ddf184ced2c28a85b6ec76dedee5798b8ace6d99",
+      "ebpf": "37aa1b3871b4fb3e4081ab6b7899a93281bc14002784410d5e81446879e356ad"
+    },
+    "fixture_sha256": {
+      "behavior_vm.py": "fee7c2610bb4e2d7c09c4ec8afbde772bd5c0fbfabdfe70a89b2c157d49ec963",
+      "vm-client.py": "4d1f14e2aa9e82ac11eee0bd5bd4de48c90ae418bfefb9eff1d04f25167d1a1f",
+      "vm-receiver.py": "320e79d170b547bc2f8fdcfebc48fa3f4a20f68f2f0dd32015eed68a3be6df54"
+    },
+    "harness_base_commit": "3ab9d3fd358e979ae222cfb942399b6c543128af",
+    "harness_sha256": "fee7c2610bb4e2d7c09c4ec8afbde772bd5c0fbfabdfe70a89b2c157d49ec963"
+  },
+  "events_sha256": "3bfbb9da7f38556b6ede34f377955b3c7748c5d44990ef7d151ad39f91570478",
+  "host_resource_sampling": "0.5 seconds; ps lifetime CPU percentage; RSS KiB",
+  "host_resources": {
+    "izanagi": {
+      "samples": 150,
+      "peak_rss_kib": 20704,
+      "peak_lifetime_cpu_percent": 32.3
+    },
+    "qemu-system-aarch64": {
+      "samples": 149,
+      "peak_rss_kib": 791984,
+      "peak_lifetime_cpu_percent": 199.8
+    }
+  },
+  "guest_before": [
+    "518 20828  1.5 izanagi-agent",
+    "    554  3860  0.0 izanagi-http-ca"
+  ],
+  "guest_after": [
+    "518 20992  1.8 izanagi-agent",
+    "    554  4112  0.0 izanagi-http-ca"
+  ],
+  "observation_gaps": [
+    {
+      "dropped": 3,
+      "reason": "event_loss"
+    },
+    {
+      "dropped": 48,
+      "reason": "event_loss"
+    },
+    {
+      "dropped": 925,
+      "reason": "event_loss"
+    }
+  ],
+  "drop_count": 976,
+  "http_round_trip_ns": {
+    "routine": [
+      2766666,
+      41667875
+    ],
+    "access": [
+      544497,
+      44460355
+    ]
+  },
+  "canary_absent": true,
+  "windows": [
+    {
+      "credential_access_attempts": 0,
+      "credential_open_succeeded": 0,
+      "credential_open_failed": 0,
+      "upstream_bytes_written": 192,
+      "response_bytes_received": 113,
+      "quality": {
+        "issues": [
+          "missing_writer",
+          "socket_ambiguous"
+        ]
+      }
+    },
+    {
+      "credential_access_attempts": 0,
+      "credential_open_succeeded": 0,
+      "credential_open_failed": 0,
+      "upstream_bytes_written": 192,
+      "response_bytes_received": 113,
+      "quality": {
+        "issues": [
+          "missing_writer",
+          "socket_ambiguous"
+        ]
+      }
+    },
+    {
+      "credential_access_attempts": 2,
+      "credential_open_succeeded": 1,
+      "credential_open_failed": 1,
+      "upstream_bytes_written": 192,
+      "response_bytes_received": 113,
+      "quality": {
+        "issues": [
+          "missing_writer",
+          "socket_ambiguous"
+        ]
+      }
+    },
+    {
+      "credential_access_attempts": 2,
+      "credential_open_succeeded": 1,
+      "credential_open_failed": 1,
+      "upstream_bytes_written": 192,
+      "response_bytes_received": 113,
+      "quality": {
+        "issues": [
+          "missing_writer",
+          "socket_ambiguous"
+        ]
+      }
+    }
+  ],
+  "classification_statuses": [
+    "abstained",
+    "abstained",
+    "abstained",
+    "abstained"
+  ],
+  "lifecycle": [
+    {
+      "case": "behavior-existing-shell",
+      "code": 7,
+      "termios_restored": true,
+      "flags_restored": true,
+      "flags_before": 2,
+      "flags_after": 65538
+    },
+    {
+      "case": "behavior-monitor-loss-shell",
+      "code": 1,
+      "termios_restored": true,
+      "flags_restored": true,
+      "flags_before": 2,
+      "flags_after": 65538
+    },
+    {
+      "case": "behavior-monitor-loss-cleanup",
+      "seconds": 1.2055040000122972,
+      "up_code": 1,
+      "exec_code": 1
+    }
+  ]
+}

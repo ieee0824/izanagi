@@ -1,7 +1,8 @@
 # Izanagi × Jev 行動分析設計
 
 状態: PoC 実装・検証。2026-10-09。
-対象実装: Izanagi `eb14149b5b508c1814ee84a7358d855d63b1dbec`。
+設計時の baseline: Izanagi `eb14149b5b508c1814ee84a7358d855d63b1dbec`。
+実装: [PR #47](https://github.com/ieee0824/izanagi/pull/47)。測定した core source は `3ab9d3fd358e979ae222cfb942399b6c543128af`。
 Jev 接続実装の参考: jev-mcp `4461942c6a07e4814b7591b6b2dde90a12f7e8dc`。
 本設計の issue 一覧は末尾に記載する。実 API と VM の検証結果・制約は [検証記録](jev-behavior-validation.md) に記載する。
 
@@ -17,7 +18,7 @@ Jev の停止は分類を degraded にするが、既存の監視接続の失敗
 第一段階に含めないもの: 自動遮断、攻撃の確定、HTTP 本文解析、TLS 復号の追加、QUIC 解析、任意 PCAP の入力、全 backend 対応、Jev の学習・fine-tuning。
 DNS トンネリング、ビーコニング、ダウンロード後の実行、確認済みファイル読取の系列は第二段階の候補とする。
 
-## 現在の実装との差分
+## 設計開始時の実装との差分
 
 | 現状の事実 | 設計上の対応 |
 | --- | --- |
@@ -150,7 +151,7 @@ UTF-8 の途中切断やフィールド削除で収めず、oversize を記録�
 分類 queue は 32 windows、in-flight は 1、最大待機 15 秒、実行中 request deadline 65 秒、最大結果 age 90 秒、shutdown drain/cancel は 2 秒。
 reliable profile は参考 jev-mcp 実装で全体 60 秒・内部 retry あり。Izanagi から同じ入力を追加 retry せず、失敗を記録する。profile が違う場合も host deadline は必ず適用する。
 旧 session の late response、新しい session への取り違え、二重応答を session/window/input digest で拒否する。
-キューを埋める大量イベントに対して drop と欠損を可視化し、通常のルール検知や通信処理を待たせない。optional telemetry の大量送信が必須 agent 監視チャネルを埋めないよう、送出量を制限する。
+キューを埋める大量イベントに対して drop と欠損を可視化し、通常のルール検知や通信処理を待たせない。optional telemetry は kernel 96 件/秒・HTTP 32 件/秒の独立枠を持ち、syscall/kernel/HTTP の優先順を交替する。Stop と sidecar health は最優先。ホストの定期確定処理も backlog によって先送りしない。遅れて届くイベントはライブ時計の推定を巻き戻さない。
 proxy が動いて emitter だけ停止した場合は分類 degraded、proxy 本体停止は接続失敗とし direct route へ自動 fallback しない。既存 eBPF/認証 transport の失敗は従来どおり監視異常として扱う。
 
 応答は question ID と type、候補集合、全キー、有限値/範囲/分布合計、最高確率候補との一致（同率を許容）、confidence の整合、model を検証する。分布合計の初期許容差は 0.001、confidence の丸め許容差は 0.01 とし、manifest に保存する。
@@ -162,7 +163,7 @@ API の shape は [API reference](https://docs.typesafe.ai/api) に従う。MCP 
 設定例は [configs/default.toml](../configs/default.toml)。機能と外部送信は既定で無効。
 
 - [behavior]: enabled=false、audit only、backend capability と各上限。
-- [behavior.classifier]: provider=mock/jev-mcp、model、profile、command/args、API credential の env 名。秘密値を TOML に書かない。
+- [behavior.classifier]: provider=mock/jev-mcp、model、profile、command/args、API credential の env 名。秘密値を TOML に書かない。MCP commit は operator が別途確認して指定する。未確認の commit は null と保存し、参考実装の commit を実行版と偽らない。質問 digest と feature/question/host policy 版、usage も監査に保存する。
 - [behavior.classifier].allow_export: 外部 TypeSafe API への送信を明示許可。許可する特徴フィールドは型の固定 projection で制限する。
 - `izanagi behavior replay --input EVENTS --classifier mock|jev-mcp`: immutable JSONL から features と assessments を作る。
 - `izanagi behavior show --session ID`: 根拠・相関状態・分類/欠損/失敗・版を表示する。
@@ -205,7 +206,7 @@ Jev の学習を仮定せず、質問/閾値/特徴の調整に使う developmen
 実験環境は seed、collector/source commit、VM image hash、scenario version、baseline、質問/モデル/閾値を固定し、結果を保存する。
 precision/recall/F1、coverage/abstention/error、正常作業 1 回あたり追加誤警告、シナリオ別可否、検知遅延、p50/p95 実行時間、token、drop 数、CPU/メモリを報告する。
 改善原因を B 対 C と C 対 D で切り分ける。高 confidence 誤答、相関誤り、欠損、質問不適合を別に分析する。
-少数成功で本番性能を主張せず、昇格条件は held-out を見る前に評価 manifest に固定する。分類器が適さなければ D を残して Jev の適用を見送れる。
+初期設計の昇格方針は監査・警告のみで、自動遮断への昇格を認めない。manifest では `audit_only_no_automatic_promotion_v1` と固定する。少数成功で本番性能を主張せず、将来の性能昇格基準を結果に合わせて後付けしない。分類器が適さなければ D を残して Jev の適用を見送れる。元の held-out 応答は固定し、追加の境界契約セットは全件 development として別に評価する。
 
 ## 実装順と完了条件
 

@@ -1,10 +1,10 @@
 {
   "schema_version": 1,
   "seed": 39,
-  "source_commit": "614d4861a9e495a97304deae799afc75d93de859",
-  "collector_commit": "614d4861a9e495a97304deae799afc75d93de859",
+  "source_commit": "3ab9d3fd358e979ae222cfb942399b6c543128af",
+  "collector_commit": "3ab9d3fd358e979ae222cfb942399b6c543128af",
   "vm_image_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
-  "scenario_version": "boundary-contract-v1",
+  "scenario_version": "boundary-contract-v2",
   "baseline_version": "fixture-v1",
   "model": "jev-1.13.0",
   "question_version": 1,
@@ -253,6 +253,38 @@
         {
           "window_id": "boundary-clock-jump:proxy:1",
           "expected": "indeterminate"
+        }
+      ]
+    },
+    {
+      "id": "parallel-same-destination",
+      "family": "parallel-same-destination",
+      "split": "development",
+      "events": "parallel-same-destination.jsonl",
+      "events_sha256": "1da8a56cca4204b8094ecb61c53ca9c16c470aa796f79f1b2e1be5e12dabcff4",
+      "routine_workload": false,
+      "labels": [
+        {
+          "window_id": "boundary-parallel-same-destination:proxy:1",
+          "expected": "suspicious"
+        },
+        {
+          "window_id": "boundary-parallel-same-destination:proxy:3",
+          "expected": "normal"
+        }
+      ]
+    },
+    {
+      "id": "instruction-like-input",
+      "family": "instruction-like-input",
+      "split": "development",
+      "events": "instruction-like-input.jsonl",
+      "events_sha256": "bafe3aec555d317b8e0c0f7afb8cd13230eaa5d733faa4674bfd1b35d915afa0",
+      "routine_workload": false,
+      "labels": [
+        {
+          "window_id": "boundary-instruction-like-input:proxy:1",
+          "expected": "suspicious"
         }
       ]
     }

@@ -47,8 +47,8 @@ IZANAGI_SECRET_FILE=/absolute/path/to/test-key \
   --config /absolute/path/to/fixture.toml
 ```
 
-Python 3.11 以上、macOS の PTY と QEMU HVF を使用する。停止した fixture instance から開始し、約 31 秒の startup lookback 除外後に POST を送る。`finally` で shell と VM を停止する。再実行は新しい artifact directory を使用する。
+Python 3.11 以上、macOS の PTY と QEMU HVF を使用する。停止した fixture instance から開始し、通常系列と資格情報参照系列それぞれで約 31 秒の startup lookback 除外後に POST を送る。通常 down に加え、再起動後に専用 QEMU 子プロセスを停止して monitor loss と exec/shell/up の失敗・state 削除も確認する。`finally` で shell と VM を停止する。再実行は新しい artifact directory を使用する。
 
-`observed-events-second.jsonl`、`results-second.json`、`resources.json`、`shell-results.json`、`up-second.log` を保存する。host は 0.5 秒間隔の RSS と `ps` の lifetime `%cpu`、guest は実行前後の RSS/CPU、HTTP は 2 requests の round-trip 時間を記録する。これらを profiler の瞬時 CPU、推論時間、一般性能と呼ばない。overlay/collector/host/fixture の SHA256 と source commit は実行前に別途記録する。
+`observed-events-second.jsonl`、`results-second.json`、`resources.json`、`shell-results.json`、`up-second.log` を保存する。host は 0.5 秒間隔の RSS と `ps` の lifetime `%cpu`、guest は実行前後の RSS/CPU、HTTP は各系列 2 requests の round-trip 時間を記録する。これらを profiler の瞬時 CPU、推論時間、一般性能と呼ばない。overlay/collector/host/fixture の SHA256 と source commit は実行前に別途記録する。
 
-現在の Linux collector は connector を観測するが、writer と namespace の完全な証明はない。試験は open/POST の関連を確認しつつ、ライブ C の結果が `Abstained` であることも確認する。通常 install/build や広い攻撃集合の精度は、この 2 requests から推定しない。
+現在の Linux collector は connector を観測するが、writer と namespace の完全な証明はない。試験は open/POST の関連を確認しつつ、ライブ C の結果が `Abstained` であることも確認する。通常 install/build や広い攻撃集合の精度は、この 4 requests から推定しない。

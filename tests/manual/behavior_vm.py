@@ -40,6 +40,8 @@ def record(name, **fields):
     print(json.dumps(value), flush=True)
     (D / "shell-results.json").write_text(json.dumps(results, indent=2))
 log=open(D/'up-second.log','wb');up=subprocess.Popen(C+['up'],cwd=W,env=E,stdout=log,stderr=log)
+# Reap the child independently: down checks kill(pid, 0), which also sees zombies.
+threading.Thread(target=up.wait,daemon=True).start()
 def run(cmd):
  r=subprocess.run(C+['exec']+cmd,cwd=W,env=E,capture_output=True,timeout=100)
  assert r.returncode==0,(r.stdout,r.stderr)
@@ -63,7 +65,7 @@ p=subprocess.Popen(sys.argv[3:]); Path(sys.argv[2]).write_text(str(p.pid)); code
 Path(sys.argv[1]).write_text(json.dumps(dict(code=code,termios_restored=before==termios.tcgetattr(0),flags_restored=(flags & os.O_NONBLOCK)==(fcntl.fcntl(0,fcntl.F_GETFL) & os.O_NONBLOCK),flags_before=flags,flags_after=fcntl.fcntl(0,fcntl.F_GETFL))))
 """
   def setup(): os.setsid(); fcntl.ioctl(0,termios.TIOCSCTTY,0)
-  self.p=subprocess.Popen([sys.executable,'-c',wrapper,str(self.result),str(self.pidfile)]+CMD+['shell'],cwd=W,env=E,stdin=self.slave,stdout=self.slave,stderr=self.slave,preexec_fn=setup); owned.append(self.p)
+  self.p=subprocess.Popen([sys.executable,'-c',wrapper,str(self.result),str(self.pidfile)]+C+['shell'],cwd=W,env=E,stdin=self.slave,stdout=self.slave,stderr=self.slave,preexec_fn=setup); owned.append(self.p)
  def drain(self,seconds=.1):
   end=time.monotonic()+seconds
   while time.monotonic()<end:
@@ -127,11 +129,12 @@ try:
  shell=Shell('behavior-existing-shell');shell.raw();shell.send("echo PROXY:$http_proxy; id -u\n");shell.expect('PROXY:http://127.0.0.1:18080');shell.resize(47,121);shell.send('stty size\n');shell.expect('47 121');shell.send('exit 7\n');shell.finish(7)
  print('VM_BEHAVIOR_SHELL_LIFECYCLE_OK',flush=True)
  stopped=subprocess.run(C+['down'],cwd=W,env=E,capture_output=True,timeout=30)
- assert stopped.returncode==0
+ assert stopped.returncode==0,(stopped.stdout,stopped.stderr)
  up.wait(timeout=30);assert up.returncode==0
  assert all(not (I/name).exists() for name in ['session.json','izanagi.pid','izanagi.lock'])
  log.close();log=open(D/'up-monitor-loss.log','wb')
  up=subprocess.Popen(C+['up'],cwd=W,env=E,stdout=log,stderr=log)
+ threading.Thread(target=up.wait,daemon=True).start()
  end=time.monotonic()+120
  while not (I/'session.json').exists():
   assert up.poll() is None and time.monotonic()<end

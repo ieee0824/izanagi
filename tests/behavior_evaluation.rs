@@ -171,8 +171,8 @@ async fn boundary_contracts_cover_routine_workloads_and_incomplete_observation()
     let report = evaluate_manifest(&manifest, &dir, &MockClassifier, "mock")
         .await
         .unwrap();
-    assert_eq!(report.methods[&EvaluationMethod::D].total_windows, 18);
-    assert_eq!(report.methods[&EvaluationMethod::D].true_positives, 5);
+    assert_eq!(report.methods[&EvaluationMethod::D].total_windows, 21);
+    assert_eq!(report.methods[&EvaluationMethod::D].true_positives, 7);
     assert_eq!(report.methods[&EvaluationMethod::D].false_positives, 0);
     assert_eq!(report.methods[&EvaluationMethod::D].abstained_windows, 5);
     assert_eq!(report.methods[&EvaluationMethod::D].routine_workloads, 4);
@@ -244,8 +244,48 @@ async fn additional_real_response_does_not_over_alert_on_known_credential_upload
             .input_tokens,
         632
     );
-    assert_eq!(report.methods[&EvaluationMethod::C].total_windows, 18);
+    assert_eq!(report.methods[&EvaluationMethod::C].total_windows, 21);
     // Unmeasured projections stay explicitly skipped, not filled with mock answers.
-    assert_eq!(report.methods[&EvaluationMethod::C].skipped_windows, 12);
+    assert_eq!(report.methods[&EvaluationMethod::C].skipped_windows, 15);
     assert_eq!(report.methods[&EvaluationMethod::C].abstained_windows, 5);
+}
+
+#[tokio::test]
+async fn confident_wrong_answers_are_counted_against_independent_labels() {
+    let dir = fixtures();
+    let manifest = load_manifest(&dir.join("manifest.json")).unwrap();
+    let mut responses: std::collections::BTreeMap<String, serde_json::Value> =
+        serde_json::from_slice(&std::fs::read(dir.join("jev-responses.json")).unwrap()).unwrap();
+    for response in responses.values_mut() {
+        response["answers"]["result"] = serde_json::json!({"type":"choice","choice":"normal","probabilities":{"normal":1.0,"access_post_suspected":0.0,"unknown":0.0},"confidence":1.0});
+    }
+    let classifier = RecordedClassifier {
+        responses,
+        config: Default::default(),
+    };
+    let report = evaluate_manifest(&manifest, &dir, &classifier, "recorded")
+        .await
+        .unwrap();
+    let metrics = &report.methods[&EvaluationMethod::C];
+    assert_eq!(metrics.total_windows, 3);
+    assert_eq!(metrics.false_negatives, 2);
+    assert_eq!(metrics.true_positives, 0);
+    assert_eq!(metrics.recall, Some(0.0));
+    let wrong = report
+        .windows
+        .iter()
+        .find(|w| w.method == EvaluationMethod::C && w.scenario_id == "access-post")
+        .unwrap();
+    assert_eq!(wrong.expected, ExpectedLabel::Suspicious);
+    assert_eq!(wrong.series_decision, SeriesDecision::Normal);
+    assert_eq!(
+        wrong
+            .classifier
+            .as_ref()
+            .unwrap()
+            .answer()
+            .unwrap()
+            .confidence,
+        1.0
+    );
 }

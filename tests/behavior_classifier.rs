@@ -98,6 +98,9 @@ async fn uncertain_observation_and_high_confidence_unknown_never_become_normal()
 async fn protocol_failures_are_bounded_and_do_not_echo_remote_data() {
     for (mode, expected) in [
         ("overloaded", ClassificationErrorKind::Http),
+        ("stopped", ClassificationErrorKind::Transport),
+        ("wrong_id", ClassificationErrorKind::InvalidResponse),
+        ("duplicate", ClassificationErrorKind::InvalidResponse),
         ("missing_tool", ClassificationErrorKind::Capability),
         ("model_mismatch", ClassificationErrorKind::ModelMismatch),
         ("oversize", ClassificationErrorKind::ResponseTooLarge),

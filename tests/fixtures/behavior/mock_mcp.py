@@ -21,6 +21,8 @@ for line in sys.stdin:
         assert "IZANAGI_SECRET_FILE" not in os.environ
         assert "IZANAGI_SESSION_TOKEN" not in os.environ
         assert "AWS_SECRET_ACCESS_KEY" not in os.environ
+        if mode == "stopped":
+            sys.exit(0)
         if mode == "timeout":
             time.sleep(30)
         if mode == "stderr":
@@ -44,4 +46,7 @@ for line in sys.stdin:
             result = {"content": [{"type": "text", "text": json.dumps(evaluation)}]}
         else:
             result = {"structuredContent": evaluation, "content": [{"type": "text", "text": json.dumps(evaluation)}], "isError": False}
-    print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}), flush=True)
+    reply = {"jsonrpc": "2.0", "id": request["id"] + (1 if mode == "wrong_id" else 0), "result": result}
+    print(json.dumps(reply), flush=True)
+    if mode == "duplicate":
+        print(json.dumps(reply), flush=True)
