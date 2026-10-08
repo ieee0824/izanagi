@@ -140,6 +140,19 @@ regressions cover timeout bookkeeping with duplicate pending hosts and a local
 lookup followed by an empty/no-op resolution. Linux cross-target all-target,
 all-feature Clippy passes.
 
+### Configuration validation and conversion
+
+All three original configuration candidates and new helpers are below 50 lines.
+Behavior/backend requirements, platform restrictions, container networking,
+share-path shape/resolution/warnings and Apple container conversion have explicit
+responsibilities. The same validation order and defensive network rejection are
+preserved, including native-to-Apple conversion outside Linux.
+
+All 51 existing configuration tests and four integration tests pass. An added
+regression verifies missing QEMU configuration is reported before a tracer
+platform error, and platform errors before invalid share paths. Linux
+cross-target all-target/all-feature Clippy passes.
+
 ## Outstanding work
 
 The remaining inventory is work to complete, except explicitly documented
