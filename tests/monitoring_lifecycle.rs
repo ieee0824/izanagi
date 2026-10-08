@@ -382,3 +382,38 @@ async fn cancelling_start_rolls_back_reservation_and_closes_connection() {
             .contains("already running")
     );
 }
+
+#[tokio::test]
+#[serial_test::serial]
+async fn dropping_tracer_stops_receiver_task_and_closes_stream() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let agent = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let (reader, writer) = stream.into_split();
+        let mut peer = ProtocolClient::new(reader, writer, None);
+        peer.recv_message().await.unwrap();
+        peer.send_message(&Message::Hello {
+            authenticated: false,
+            token: None,
+        })
+        .await
+        .unwrap();
+        peer.send_message(&Message::Ready).await.unwrap();
+        peer.recv_message().await.unwrap();
+        peer.send_message(&Message::TraceStarted).await.unwrap();
+        assert!(matches!(
+            peer.recv_message().await.unwrap(),
+            Some(Message::Stop)
+        ));
+        assert!(peer.recv_message().await.unwrap().is_none());
+    });
+    let tracer = VmAgentTracer::new(VmAgentConfig { port: port.into() });
+    let mut events = tracer.start(&filter()).await.unwrap();
+    drop(tracer);
+    tokio::time::timeout(std::time::Duration::from_secs(5), agent)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(events.recv().await.is_none());
+}

@@ -298,11 +298,14 @@ impl Tracer for VmAgentTracer {
         if inner.shutdown_tx.is_none() {
             anyhow::bail!("tracer startup cancelled");
         }
-        let state = Arc::clone(&self.inner);
+        // The task must not keep its own shutdown sender/JoinHandle alive.
+        let state = Arc::downgrade(&self.inner);
         inner.task = Some(tokio::spawn(async move {
             // Retain a sender until the failure reason has been recorded.
             let result = Self::receive_events(&mut client, tx.clone(), &mut shutdown_rx).await;
-            if let Err(error) = result {
+            if let Err(error) = result
+                && let Some(state) = state.upgrade()
+            {
                 state
                     .lock()
                     .expect("VmAgentTracerInner lock poisoned")
