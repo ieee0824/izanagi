@@ -12,7 +12,7 @@ use crate::protocol::{self, Message};
 /// `secret` が `Some` の場合はシーケンス番号付き HMAC-SHA256 認証を行い、
 /// `None` の場合は非認証モードでメッセージを送受信する。
 pub struct ProtocolClient<R, W> {
-    reader: R,
+    reader: protocol::MessageReader<R>,
     writer: W,
     secret: Option<Vec<u8>>,
     send_seq: u64,
@@ -28,7 +28,7 @@ where
     /// handshake は行わない。呼び出し側で `handshake()` を別途呼ぶこと。
     pub fn new(reader: R, writer: W, secret: Option<Vec<u8>>) -> Self {
         Self {
-            reader,
+            reader: protocol::MessageReader::new(reader),
             writer,
             secret,
             send_seq: 0,
@@ -109,12 +109,9 @@ where
 
     /// メッセージを受信する。認証モードに応じて HMAC 検証を行う。
     pub async fn recv_message(&mut self) -> anyhow::Result<Option<Message>> {
-        match self.secret.as_deref() {
-            Some(s) => {
-                protocol::read_message_authenticated(&mut self.reader, s, &mut self.recv_seq).await
-            }
-            None => protocol::read_message(&mut self.reader).await,
-        }
+        self.reader
+            .recv(self.secret.as_deref(), &mut self.recv_seq)
+            .await
     }
 
     /// 現在の認証状態を返す。

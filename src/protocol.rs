@@ -154,22 +154,97 @@ fn parse_header(header: &[u8; HEADER_SIZE]) -> anyhow::Result<(MessageType, u32)
     Ok((message_type, length))
 }
 
-async fn read_header<R: AsyncRead + Unpin>(
-    reader: &mut R,
-) -> anyhow::Result<Option<[u8; HEADER_SIZE]>> {
-    let mut header = [0; HEADER_SIZE];
-    if reader.read(&mut header[..1]).await? == 0 {
-        return Ok(None);
+/// Connection-owned, cancellation-safe protocol receiver.
+///
+/// Keep this receiver for the entire connection, including handshake and shell
+/// transitions. Cancelling `recv` preserves all consumed bytes. Authentication
+/// mode and the sequence counter must remain the same when resuming a receive.
+pub struct MessageReader<R> {
+    reader: R,
+    frame: Vec<u8>,
+    filled: usize,
+    failed: bool,
+}
+
+impl<R: AsyncRead + Unpin> MessageReader<R> {
+    pub fn new(reader: R) -> Self {
+        Self {
+            reader,
+            frame: Vec::new(),
+            filled: 0,
+            failed: false,
+        }
     }
-    if header[0] != WIRE_MAGIC {
-        anyhow::bail!("incompatible protocol version; upgrade host and agent together");
+
+    async fn fill_to(&mut self, target: usize) -> anyhow::Result<bool> {
+        if self.frame.len() < target {
+            self.frame.resize(target, 0);
+        }
+        while self.filled < target {
+            let n = self
+                .reader
+                .read(&mut self.frame[self.filled..target])
+                .await?;
+            if n == 0 {
+                if self.filled == 0 {
+                    return Ok(false);
+                }
+                return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+            }
+            // No await between consuming bytes and committing their position.
+            self.filled += n;
+        }
+        Ok(true)
     }
-    reader.read_exact(&mut header[1..2]).await?;
-    if header[1] != WIRE_VERSION {
-        anyhow::bail!("unsupported protocol version: {}", header[1]);
+
+    pub async fn recv(
+        &mut self,
+        auth_key: Option<&[u8]>,
+        expected_sequence: &mut u64,
+    ) -> anyhow::Result<Option<Message>> {
+        if self.failed {
+            anyhow::bail!("protocol receiver failed; close the connection");
+        }
+        let result = self.recv_frame(auth_key, expected_sequence).await;
+        if result.is_err() {
+            // A malformed/truncated frame cannot be retried as a new header.
+            self.failed = true;
+        } else {
+            self.frame.clear();
+            self.filled = 0;
+        }
+        result
     }
-    reader.read_exact(&mut header[2..]).await?;
-    Ok(Some(header))
+
+    async fn recv_frame(
+        &mut self,
+        auth_key: Option<&[u8]>,
+        expected_sequence: &mut u64,
+    ) -> anyhow::Result<Option<Message>> {
+        if !self.fill_to(1).await? {
+            return Ok(None);
+        }
+        if self.frame[0] != WIRE_MAGIC {
+            anyhow::bail!("incompatible protocol version; upgrade host and agent together");
+        }
+        self.fill_to(2).await?;
+        if self.frame[1] != WIRE_VERSION {
+            anyhow::bail!("unsupported protocol version: {}", self.frame[1]);
+        }
+        self.fill_to(HEADER_SIZE).await?;
+        // Validate the size before allocating body/trailer storage.
+        let (_, length) = parse_header(self.frame[..HEADER_SIZE].try_into().unwrap())?;
+        let body_end = HEADER_SIZE + length as usize;
+        let frame_end = body_end + if auth_key.is_some() { 8 + HMAC_SIZE } else { 0 };
+        self.fill_to(frame_end).await?;
+        let message = match auth_key {
+            Some(key) => {
+                decode_authenticated_message(&self.frame, body_end, key, expected_sequence)?
+            }
+            None => decode_message(&self.frame)?,
+        };
+        Ok(Some(message))
+    }
 }
 
 /// メッセージをワイヤーフォーマットにエンコードする。
@@ -235,29 +310,10 @@ pub async fn write_message<W: AsyncWrite + Unpin>(
 /// `AsyncRead` からメッセージを読み取る。
 ///
 /// ストリームが閉じた場合は `Ok(None)` を返す。
+/// One-shot API: if this future is cancelled, close the connection. Use a
+/// connection-owned `MessageReader` when receives can be retried after cancellation.
 pub async fn read_message<R: AsyncRead + Unpin>(reader: &mut R) -> anyhow::Result<Option<Message>> {
-    let Some(header) = read_header(reader).await? else {
-        return Ok(None);
-    };
-    let (header_type, length) = parse_header(&header)?;
-
-    // ボディ読み取り
-    let mut body = vec![0u8; length as usize];
-    reader.read_exact(&mut body).await?;
-
-    let msg: Message = wire_codec::decode(&body)?;
-
-    // ヘッダの型とデシリアライズされたメッセージの型が一致するか検証
-    let actual_type = msg.message_type();
-    if header_type != actual_type {
-        anyhow::bail!(
-            "message type mismatch: header says {:?}, body is {:?}",
-            header_type,
-            actual_type
-        );
-    }
-
-    Ok(Some(msg))
+    MessageReader::new(reader).recv(None, &mut 0).await
 }
 
 // ---------------------------------------------------------------------------
@@ -348,31 +404,29 @@ pub async fn write_message_authenticated<W: AsyncWrite + Unpin>(
 /// `expected_sequence` は受信側の期待シーケンス番号。
 /// 受信した sequence が expected 以上であることを検証し、
 /// 検証成功後に expected を受信値+1 に更新する。
+/// One-shot API; keep a `MessageReader` across cancellable receives instead.
 pub async fn read_message_authenticated<R: AsyncRead + Unpin>(
     reader: &mut R,
     secret: &[u8],
     expected_sequence: &mut u64,
 ) -> anyhow::Result<Option<Message>> {
-    let Some(header) = read_header(reader).await? else {
-        return Ok(None);
-    };
-    let (header_type, length) = parse_header(&header)?;
+    MessageReader::new(reader)
+        .recv(Some(secret), expected_sequence)
+        .await
+}
 
-    // ボディ読み取り
-    let mut body = vec![0u8; length as usize];
-    reader.read_exact(&mut body).await?;
-
-    // シーケンス番号読み取り (u64 LE = 8 bytes)
-    let mut seq_bytes = [0u8; 8];
-    reader.read_exact(&mut seq_bytes).await?;
-    let received_sequence = u64::from_le_bytes(seq_bytes);
-
-    // HMAC 読み取り
-    let mut hmac_bytes = [0u8; HMAC_SIZE];
-    reader.read_exact(&mut hmac_bytes).await?;
+fn decode_authenticated_message(
+    frame: &[u8],
+    body_end: usize,
+    auth_key: &[u8],
+    expected_sequence: &mut u64,
+) -> anyhow::Result<Message> {
+    let seq_bytes: &[u8; 8] = frame[body_end..body_end + 8].try_into().unwrap();
+    let hmac_bytes: &[u8; HMAC_SIZE] = frame[body_end + 8..].try_into().unwrap();
+    let received_sequence = u64::from_le_bytes(*seq_bytes);
 
     // HMAC 検証: type + length + body + sequence に対して計算
-    if !verify_hmac(secret, &[&header, &body, &seq_bytes], &hmac_bytes) {
+    if !verify_hmac(auth_key, &[&frame[..body_end], seq_bytes], hmac_bytes) {
         anyhow::bail!("HMAC verification failed: message authentication failed");
     }
 
@@ -403,19 +457,10 @@ pub async fn read_message_authenticated<R: AsyncRead + Unpin>(
         anyhow::anyhow!("sequence number overflow: received {}", received_sequence)
     })?;
 
-    let msg: Message = wire_codec::decode(&body)?;
-
-    let actual_type = msg.message_type();
-    if header_type != actual_type {
-        anyhow::bail!(
-            "message type mismatch: header says {:?}, body is {:?}",
-            header_type,
-            actual_type
-        );
-    }
+    let msg = decode_message(&frame[..body_end])?;
 
     *expected_sequence = next_sequence;
-    Ok(Some(msg))
+    Ok(msg)
 }
 
 /// ファイルパスから共有シークレットを読み込む。
@@ -1162,5 +1207,90 @@ mod tests {
                 .to_string()
                 .contains("sequence number overflow")
         );
+    }
+
+    #[tokio::test]
+    async fn cancelled_authenticated_receive_rejects_invalid_frame_without_advancing_sequence() {
+        let auth_key = rand::random::<[u8; 32]>();
+        for mode in ["mac", "type", "sequence"] {
+            let mut frame = encode_message_authenticated(&Message::Ready, &auth_key, 0).unwrap();
+            let body_end = frame.len() - 8 - HMAC_SIZE;
+            match mode {
+                "mac" => *frame.last_mut().unwrap() ^= 1,
+                "type" => frame[2] = MessageType::Stop as u8,
+                "sequence" => frame[body_end] = 1,
+                _ => unreachable!(),
+            }
+            if mode != "mac" {
+                let mac = compute_hmac(&auth_key, &[&frame[..body_end + 8]]);
+                frame[body_end + 8..].copy_from_slice(&mac);
+            }
+            let (mut peer, reader) = tokio::io::duplex(4096);
+            let mut reader = MessageReader::new(reader);
+            let mut sequence = 0;
+            peer.write_all(&frame[..frame.len() - 1]).await.unwrap();
+            assert!(
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(1),
+                    reader.recv(Some(&auth_key), &mut sequence)
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(sequence, 0);
+            peer.write_all(&frame[frame.len() - 1..]).await.unwrap();
+            let error = reader
+                .recv(Some(&auth_key), &mut sequence)
+                .await
+                .unwrap_err()
+                .to_string();
+            let expected = match mode {
+                "mac" => "HMAC verification failed",
+                "type" => "message type mismatch",
+                _ => "sequence gap too large",
+            };
+            assert!(error.contains(expected), "{mode}: {error}");
+            assert_eq!(sequence, 0);
+            assert!(
+                reader
+                    .recv(Some(&auth_key), &mut sequence)
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("receiver failed")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn stateful_receiver_rejects_oversized_header_before_allocating_body() {
+        for authenticated in [false, true] {
+            let mut header = [
+                WIRE_MAGIC,
+                WIRE_VERSION,
+                MessageType::Ready as u8,
+                0,
+                0,
+                0,
+                0,
+            ];
+            header[3..].copy_from_slice(&(MAX_BODY_SIZE + 1).to_le_bytes());
+            let (mut peer, reader) = tokio::io::duplex(4096);
+            peer.write_all(&header).await.unwrap();
+            let mut reader = MessageReader::new(reader);
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                reader.recv(authenticated.then_some(&b"test-key"[..]), &mut 0),
+            )
+            .await
+            .unwrap();
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("message body too large")
+            );
+            assert_eq!(reader.frame.len(), HEADER_SIZE);
+        }
     }
 }

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use izanagi::protocol::{self, Message};
+use izanagi::protocol::{self, Message, MessageReader};
 use izanagi::tracer::Tracer;
 
 use crate::crypto::{constant_time_eq, sha256_hex};
@@ -17,17 +17,15 @@ pub(crate) async fn handle_connection<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let (mut reader, mut writer) = tokio::io::split(stream);
+    let (reader, mut writer) = tokio::io::split(stream);
+    let mut reader = MessageReader::new(reader);
     let authenticated = secret.is_some();
     let mut send_seq = 0u64;
     let mut recv_seq = 0u64;
 
     // Hello ハンドシェイク: ホストから Hello を受信し、認証モードを合意する (#177)
     // シークレット設定時は Hello メッセージも HMAC で保護する
-    let hello_msg = match &secret {
-        Some(s) => protocol::read_message_authenticated(&mut reader, s, &mut recv_seq).await?,
-        None => protocol::read_message(&mut reader).await?,
-    };
+    let hello_msg = recv_message(&mut reader, secret, &mut recv_seq).await?;
     match hello_msg {
         Some(Message::Hello {
             authenticated: host_auth,
@@ -255,7 +253,7 @@ where
 
 /// 対話シェルを PTY 経由で実行し、ホストと stdin/stdout をストリーミングする。
 async fn handle_shell<R, W>(
-    reader: &mut R,
+    reader: &mut MessageReader<R>,
     writer: &mut W,
     secret: Option<&[u8]>,
     send_seq: &mut u64,
@@ -447,14 +445,11 @@ pub(crate) async fn send_message<W: tokio::io::AsyncWrite + Unpin>(
 
 /// シークレットの有無に応じて認証付き/なしでメッセージを受信する。
 pub(crate) async fn recv_message<R: tokio::io::AsyncRead + Unpin>(
-    reader: &mut R,
+    reader: &mut MessageReader<R>,
     secret: Option<&[u8]>,
     recv_seq: &mut u64,
 ) -> anyhow::Result<Option<Message>> {
-    match secret {
-        Some(s) => protocol::read_message_authenticated(reader, s, recv_seq).await,
-        None => protocol::read_message(reader).await,
-    }
+    reader.recv(secret, recv_seq).await
 }
 
 #[cfg(test)]
