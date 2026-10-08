@@ -13,6 +13,7 @@
 - 変更前の既存ホストテスト: 466 件成功。
 - 修正前の追加確認: 474 件成功、再現テスト 3 件失敗。同じ根本原因であり、別々の不具合 3 件ではない。
 - 修正後のホストテスト: macOS 480 件成功、失敗・ignore なし。繰り返しキャンセル、次フレーム、認証失敗時のシーケンス維持、ヘッダのサイズ上限の回帰テストも追加。
+- PR #36 の CI: Linux ホスト 458 件、macOS ホスト 480 件、Linux agent 38 件成功。
 - agent の macOS で実行可能なテスト: 33 件成功。Linux 専用 PTY / eBPF の実動作は含まない。
 - Format / Clippy (`--all-targets -- -D warnings`) / `git diff --check`: 成功。
 - 実 QEMU スモーク: 既存 Debian イメージが Hello 前に接続を閉じ、失敗。Exec / Event まで到達していない。
@@ -107,4 +108,4 @@ cargo clippy --all-targets -- -D warnings
 5. 専用 VM の監視接続を切断し、exec / shell / up が失敗して VM・セッション状態を片付けることを確認する。
 6. 上記の分割フレーム + resize の再現テストが修正後に成功する。
 
-Linux での追加シナリオは今回の PR の CI で確認する。実 VM での最新イメージの成功確認は未実施。
+Linux での追加シナリオも今回の PR の CI で成功した。実 VM での最新イメージの成功確認は未実施。

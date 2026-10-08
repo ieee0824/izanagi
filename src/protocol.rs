@@ -1264,6 +1264,7 @@ mod tests {
 
     #[tokio::test]
     async fn stateful_receiver_rejects_oversized_header_before_allocating_body() {
+        let auth_key = rand::random::<[u8; 32]>();
         for authenticated in [false, true] {
             let mut header = [
                 WIRE_MAGIC,
@@ -1280,7 +1281,7 @@ mod tests {
             let mut reader = MessageReader::new(reader);
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(1),
-                reader.recv(authenticated.then_some(&b"test-key"[..]), &mut 0),
+                reader.recv(authenticated.then_some(&auth_key[..]), &mut 0),
             )
             .await
             .unwrap();
