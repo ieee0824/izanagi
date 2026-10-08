@@ -122,7 +122,23 @@ Clippy passes.
 The first Linux run for the host-tracing commit exposed a test-fixture permission
 assumption: `/proc/1/ns/pid` is inaccessible to the CI user. Forwarding tests now
 use the existing fixed collector fixture, avoiding privileged machine state.
-Production namespace validation remains unchanged. Rerun CI is required.
+Production namespace validation remains unchanged. Linux CI at `4105315`
+passes the root test suite, including all new host eBPF tests, and all-feature
+Clippy. Agent, telemetry, DNS, common, no_std eBPF and secret-scan gates also pass.
+
+### Proxy management and DNS allowlist
+
+Both proxy-manager candidates and the asynchronous DNS-resolution candidate
+are split, with all helpers below 50 lines. Proxy argument construction and
+private mapping-file lifetime remain separate from process startup; original
+and canonical CA paths still use the same rejection checks. DNS spawn/collection
+and timeout bookkeeping preserve completed successes/failures, pending order,
+duplicates, warning text and the blocking-task abort limitation.
+
+The eight proxy-manager tests and six DNS allowlist tests pass. Added DNS
+regressions cover timeout bookkeeping with duplicate pending hosts and a local
+lookup followed by an empty/no-op resolution. Linux cross-target all-target,
+all-feature Clippy passes.
 
 ## Outstanding work
 
