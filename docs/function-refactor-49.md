@@ -201,6 +201,20 @@ keeps its advisory diagnostics after stop, and state is cleared at the same poin
 All 12 QEMU argument tests, nine Apple argument tests and the full Apple Container
 test group pass. Linux cross-target all-target/all-feature Clippy passes.
 
+### QEMU readiness and command exchange
+
+Both readiness-wait and command-exchange candidates and their new helpers are
+below 50 lines. A single handshake attempt owns its bounded handshake and
+fatal-vs-retry decision; the outer boot deadline/backoff remain unchanged.
+Exec exchange preserves connection-lock scope, broken-connection marking and
+agent-error handling. PCAP records are still written only after successful
+exchange and outside the connection lock.
+
+All 32 QEMU sandbox tests pass. Existing handshake regressions additionally
+verify fatal authentication errors propagate from the retry boundary, while an
+immediate disconnect returns a retryable absence. Linux cross-target all-target,
+all-feature Clippy passes.
+
 ## Outstanding work
 
 The remaining inventory is work to complete, except explicitly documented

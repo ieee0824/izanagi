@@ -375,37 +375,9 @@ impl QemuSandbox {
                     tokio::time::timeout(connect_timeout, TcpStream::connect(&addr)).await;
                 match connect_result {
                     Ok(Ok(stream)) => {
-                        // 接続成功 — ハンドシェイクを試行する。
-                        // ハンドシェイク失敗（Connection reset 等）はリトライ可能とみなし、
-                        // QEMU を再起動せずバックオフ後に再接続する。
-                        let handshake_timeout = tokio::time::Duration::from_secs(15);
-                        let handshake_result = tokio::time::timeout(
-                            handshake_timeout,
-                            Self::try_handshake(stream, &secret, &token),
-                        )
-                        .await;
-                        match handshake_result {
-                            Ok(Ok(conn)) => return Ok(conn),
-                            Ok(Err(e)) => {
-                                let msg = e.to_string();
-                                // 認証/プロトコルエラーはリトライしても解決しない
-                                let is_fatal = msg.contains("authentication mode mismatch")
-                                    || msg.contains("incompatible protocol version")
-                                    || msg.contains("unsupported protocol version")
-                                    || msg.contains("HMAC verification failed")
-                                    || msg.contains("token mismatch")
-                                    || msg.contains("expected Hello message")
-                                    || msg.contains("expected Ready message")
-                                    || msg.contains("agent error on hello")
-                                    || msg.contains("agent error on connect");
-                                if is_fatal {
-                                    return Err(e);
-                                }
-                                eprintln!("Handshake failed (will retry): {}", e,);
-                            }
-                            Err(_) => {
-                                eprintln!("Handshake timed out (will retry)");
-                            }
+                        if let Some(conn) = Self::attempt_handshake(stream, &secret, &token).await?
+                        {
+                            return Ok(conn);
                         }
                         tokio::time::sleep(backoff).await;
                         backoff = std::cmp::min(backoff * 2, tokio::time::Duration::from_secs(5));
@@ -425,6 +397,46 @@ impl QemuSandbox {
         })
         .await
         .map_err(|_| anyhow::anyhow!("Timed out waiting for VM agent ({}s)", BOOT_TIMEOUT_SECS))?
+    }
+
+    async fn attempt_handshake(
+        stream: TcpStream,
+        secret: &Option<Vec<u8>>,
+        token: &Option<String>,
+    ) -> anyhow::Result<Option<PersistentConnection>> {
+        // 接続成功 — ハンドシェイクを試行する。
+        // ハンドシェイク失敗（Connection reset 等）はリトライ可能とみなし、
+        // QEMU を再起動せずバックオフ後に再接続する。
+        let handshake_timeout = tokio::time::Duration::from_secs(15);
+        let handshake_result = tokio::time::timeout(
+            handshake_timeout,
+            Self::try_handshake(stream, secret, token),
+        )
+        .await;
+        match handshake_result {
+            Ok(Ok(conn)) => return Ok(Some(conn)),
+            Ok(Err(e)) => {
+                let msg = e.to_string();
+                // 認証/プロトコルエラーはリトライしても解決しない
+                let is_fatal = msg.contains("authentication mode mismatch")
+                    || msg.contains("incompatible protocol version")
+                    || msg.contains("unsupported protocol version")
+                    || msg.contains("HMAC verification failed")
+                    || msg.contains("token mismatch")
+                    || msg.contains("expected Hello message")
+                    || msg.contains("expected Ready message")
+                    || msg.contains("agent error on hello")
+                    || msg.contains("agent error on connect");
+                if is_fatal {
+                    return Err(e);
+                }
+                eprintln!("Handshake failed (will retry): {}", e,);
+            }
+            Err(_) => {
+                eprintln!("Handshake timed out (will retry)");
+            }
+        }
+        Ok(None)
     }
 
     /// TCP 接続上で Hello ハンドシェイク + Ready を待つ。
@@ -459,51 +471,13 @@ impl QemuSandbox {
         };
 
         // conn_mutex ロック内で送受信のみ行い、pcap 記録はロック外で実行
-        let result: anyhow::Result<Message> = {
-            let conn_mutex = self
-                .connection
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("no persistent connection available"))?;
-            let mut conn = conn_mutex.lock().await;
-
-            if conn.broken {
-                anyhow::bail!(
-                    "agent connection is broken (previous communication error). Restart with `izanagi down && izanagi up`."
-                );
-            }
-
-            if let Err(e) = conn.client.send_message(&exec_msg).await {
-                conn.broken = true;
-                anyhow::bail!("agent connection lost during send: {}", e);
-            }
-
-            match conn.client.recv_message().await {
-                Ok(Some(msg @ Message::ExecResult { .. })) => Ok(msg),
-                Ok(Some(Message::Error(msg))) => {
-                    anyhow::bail!("agent error: {}", msg);
-                }
-                Ok(Some(other)) => {
-                    conn.broken = true;
-                    anyhow::bail!("expected ExecResult, got {:?}", other);
-                }
-                Ok(None) => {
-                    conn.broken = true;
-                    anyhow::bail!("agent connection closed unexpectedly");
-                }
-                Err(e) => {
-                    conn.broken = true;
-                    anyhow::bail!("agent connection lost during recv: {}", e);
-                }
-            }
-        }; // conn_mutex ロック解放
+        let result = self.exchange_exec(&exec_msg).await?;
 
         // pcap 記録: ロック外で非同期に実行
         self.record_pcap(Direction::HostToGuest, &exec_msg);
-        if let Ok(ref msg) = result {
-            self.record_pcap(Direction::GuestToHost, msg);
-        }
+        self.record_pcap(Direction::GuestToHost, &result);
 
-        match result? {
+        match result {
             Message::ExecResult {
                 exit_code,
                 stdout,
@@ -514,6 +488,44 @@ impl QemuSandbox {
                 stderr,
             }),
             _ => unreachable!(),
+        }
+    }
+
+    async fn exchange_exec(&self, exec_msg: &Message) -> anyhow::Result<Message> {
+        let conn_mutex = self
+            .connection
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no persistent connection available"))?;
+        let mut conn = conn_mutex.lock().await;
+
+        if conn.broken {
+            anyhow::bail!(
+                "agent connection is broken (previous communication error). Restart with `izanagi down && izanagi up`."
+            );
+        }
+
+        if let Err(e) = conn.client.send_message(exec_msg).await {
+            conn.broken = true;
+            anyhow::bail!("agent connection lost during send: {}", e);
+        }
+
+        match conn.client.recv_message().await {
+            Ok(Some(msg @ Message::ExecResult { .. })) => Ok(msg),
+            Ok(Some(Message::Error(msg))) => {
+                anyhow::bail!("agent error: {}", msg);
+            }
+            Ok(Some(other)) => {
+                conn.broken = true;
+                anyhow::bail!("expected ExecResult, got {:?}", other);
+            }
+            Ok(None) => {
+                conn.broken = true;
+                anyhow::bail!("agent connection closed unexpectedly");
+            }
+            Err(e) => {
+                conn.broken = true;
+                anyhow::bail!("agent connection lost during recv: {}", e);
+            }
         }
     }
 
@@ -1445,14 +1457,16 @@ mod tests {
         let addr = listener.local_addr().unwrap();
 
         let agent = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let (mut reader, mut writer) = tokio::io::split(stream);
-            let _ = crate::protocol::read_message(&mut reader).await;
-            // Error を返す
-            let err = Message::Error("authentication mode mismatch".to_string());
-            crate::protocol::write_message(&mut writer, &err)
-                .await
-                .unwrap();
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (mut reader, mut writer) = tokio::io::split(stream);
+                let _ = crate::protocol::read_message(&mut reader).await;
+                // Error を返す
+                let err = Message::Error("authentication mode mismatch".to_string());
+                crate::protocol::write_message(&mut writer, &err)
+                    .await
+                    .unwrap();
+            }
         });
 
         let stream = TcpStream::connect(addr).await.unwrap();
@@ -1462,6 +1476,12 @@ mod tests {
         let result = QemuSandbox::try_handshake(stream, &secret, &token).await;
         assert!(result.is_err());
 
+        let stream = TcpStream::connect(addr).await.unwrap();
+        assert!(
+            QemuSandbox::attempt_handshake(stream, &secret, &token)
+                .await
+                .is_err()
+        );
         agent.await.unwrap();
     }
 
@@ -1474,8 +1494,10 @@ mod tests {
         let addr = listener.local_addr().unwrap();
 
         let agent = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            drop(stream); // 即切断
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().await.unwrap();
+                drop(stream); // 即切断
+            }
         });
 
         let stream = TcpStream::connect(addr).await.unwrap();
@@ -1485,6 +1507,13 @@ mod tests {
         let result = QemuSandbox::try_handshake(stream, &secret, &token).await;
         assert!(result.is_err());
 
+        let stream = TcpStream::connect(addr).await.unwrap();
+        assert!(
+            QemuSandbox::attempt_handshake(stream, &secret, &token)
+                .await
+                .unwrap()
+                .is_none()
+        );
         agent.await.unwrap();
     }
 }

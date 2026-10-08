@@ -3,9 +3,7 @@ src/commands/config.rs	cmd_config_mitm	36	139
 src/engine.rs	start	202	141
 src/landlock_sandbox.rs	build_ruleset	55	83
 src/landlock_sandbox.rs	exec	273	59
-src/qemu_sandbox.rs	wait_for_agent_ready	362	67
-src/qemu_sandbox.rs	send_command	450	69
-src/qemu_sandbox.rs	up	662	157
+src/qemu_sandbox.rs	up	674	157
 izanagi-dns-proxy/src/main.rs	main	41	50
 izanagi-dns-proxy/src/proxy.rs	run	30	52
 izanagi-dns-proxy/src/proxy.rs	handle_query	197	102
