@@ -129,13 +129,14 @@ pub fn build_engine(config: &Config) -> anyhow::Result<Engine> {
 /// Sandbox・Tracer・Detector を合成し、全体のライフサイクルを管理する。
 pub struct Engine {
     sandbox: Box<dyn Sandbox>,
-    tracer: Box<dyn Tracer>,
+    tracer: Arc<dyn Tracer>,
     detector: Arc<Detector>,
     shutdown_tx: Option<oneshot::Sender<()>>,
     handle: Option<JoinHandle<()>>,
     /// 全 syscall イベント受信時のコールバック。設定されている場合、
     /// 監視ループ内で各イベントに対して呼ばれる。
     on_event: Option<EventHandler>,
+    monitoring_failure: tokio::sync::watch::Receiver<Option<String>>,
 }
 
 /// アラート発生時のコールバック。
@@ -147,13 +148,15 @@ pub type EventHandler = Box<dyn Fn(&SyscallEvent) + Send>;
 
 impl Engine {
     pub fn new(sandbox: Box<dyn Sandbox>, tracer: Box<dyn Tracer>, detector: Detector) -> Self {
+        let (_, monitoring_failure) = tokio::sync::watch::channel(None);
         Self {
             sandbox,
-            tracer,
+            tracer: Arc::from(tracer),
             detector: Arc::new(detector),
             shutdown_tx: None,
             handle: None,
             on_event: None,
+            monitoring_failure,
         }
     }
 
@@ -194,8 +197,13 @@ impl Engine {
         }
         // VmAgentTracer は agent と同じ HMAC シークレットで認証する必要がある。
         // シークレットの読み込みに失敗した場合はエラーを伝播し、認証なしで tracer を起動しない。
-        if let Some(secret) = crate::protocol::load_shared_secret_from_env()? {
-            self.tracer.set_secret(secret);
+        match crate::protocol::load_shared_secret_from_env() {
+            Ok(Some(auth_key)) => self.tracer.set_secret(auth_key),
+            Ok(None) => {}
+            Err(error) => {
+                let _ = self.sandbox.down().await;
+                return Err(error);
+            }
         }
 
         let mut rx = match self.tracer.start(trace_filter).await {
@@ -241,6 +249,9 @@ impl Engine {
             })
         };
 
+        let (failure_tx, failure_rx) = tokio::sync::watch::channel(None);
+        self.monitoring_failure = failure_rx;
+        let tracer = Arc::clone(&self.tracer);
         let handle = tokio::spawn(async move {
             // イベント処理総数のカウンタ。
             // 一定件数ごとにチャネル長をチェックし、飽和状態を検知する。
@@ -288,7 +299,12 @@ impl Engine {
                                     });
                                 }
                             }
-                            None => break, // チャネルが閉じられた
+                            None => {
+                                if tracer.requires_live_monitoring() {
+                                    failure_tx.send_replace(Some(tracer.failure_reason().unwrap_or_else(|| "trace event stream ended unexpectedly".into())));
+                                }
+                                break;
+                            }
                         }
                     }
                     _ = &mut shutdown_rx => {
@@ -334,8 +350,46 @@ impl Engine {
         Ok(())
     }
 
+    /// Fails as soon as required monitoring ends. NullTracer deliberately opts out.
+    pub async fn wait_for_monitoring_failure(&self) -> anyhow::Error {
+        let mut health = self.monitoring_failure.clone();
+        loop {
+            if let Some(reason) = health.borrow().clone() {
+                return anyhow::anyhow!("monitoring failed: {reason}");
+            }
+            if health.changed().await.is_err() {
+                if self.tracer.requires_live_monitoring() && self.handle.is_some() {
+                    return anyhow::anyhow!("monitoring task ended unexpectedly");
+                }
+                // Normal stop or deliberately unmonitored operation.
+                return std::future::pending().await;
+            }
+        }
+    }
+
+    /// Run only while required monitoring is healthy; the caller then stops the engine.
+    pub async fn exec(
+        &self,
+        cmd: &[String],
+        env: &std::collections::HashMap<String, String>,
+    ) -> anyhow::Result<crate::sandbox::ExecOutput> {
+        tokio::select! {
+            biased;
+            error = self.wait_for_monitoring_failure() => Err(error),
+            result = self.sandbox.exec(cmd, env) => result,
+        }
+    }
+
+    pub async fn shell(&self) -> anyhow::Result<()> {
+        tokio::select! {
+            biased;
+            error = self.wait_for_monitoring_failure() => Err(error),
+            result = self.sandbox.shell() => result,
+        }
+    }
+
     /// 内部の Sandbox への参照を返す。
-    /// `exec` / `shell` の呼び出しに使う。
+    /// 設定・セッション情報の取得用。実行は監視状態を確認する Engine::exec / shell を使う。
     pub fn sandbox(&self) -> &dyn Sandbox {
         self.sandbox.as_ref()
     }

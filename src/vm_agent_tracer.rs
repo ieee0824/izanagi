@@ -43,10 +43,13 @@ impl Default for VmAgentConfig {
 /// `Event` メッセージを受信して `SyscallEvent` に復元する。
 pub struct VmAgentTracer {
     config: VmAgentConfig,
-    inner: std::sync::Mutex<VmAgentTracerInner>,
+    inner: Arc<std::sync::Mutex<VmAgentTracerInner>>,
 }
 
 struct VmAgentTracerInner {
+    starting: bool,
+    failure: Option<String>,
+    task: Option<tokio::task::JoinHandle<()>>,
     /// 停止シグナル送信用。
     shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
     /// Hello ハンドシェイクで送信するトークン（SHA256 ハッシュ済み）。
@@ -62,12 +65,15 @@ impl VmAgentTracer {
     pub fn new(config: VmAgentConfig) -> Self {
         Self {
             config,
-            inner: std::sync::Mutex::new(VmAgentTracerInner {
+            inner: Arc::new(std::sync::Mutex::new(VmAgentTracerInner {
+                starting: false,
+                failure: None,
+                task: None,
                 shutdown_tx: None,
                 token: None,
                 port_override: None,
                 secret: None,
-            }),
+            })),
         }
     }
 
@@ -122,35 +128,65 @@ impl VmAgentTracer {
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
+        let mut client = Self::prepare(stream, filter, secret, token).await?;
+        Self::receive_events(&mut client, tx, &mut shutdown_rx).await
+    }
+
+    async fn prepare<S>(
+        stream: S,
+        filter: &TraceFilter,
+        auth_key: Option<Vec<u8>>,
+        token_hash: Option<String>,
+    ) -> anyhow::Result<
+        crate::protocol_client::ProtocolClient<tokio::io::ReadHalf<S>, tokio::io::WriteHalf<S>>,
+    >
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
         let (reader, writer) = tokio::io::split(stream);
-        let mut client = crate::protocol_client::ProtocolClient::new(reader, writer, secret);
+        let mut client = crate::protocol_client::ProtocolClient::new(reader, writer, auth_key);
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            client.handshake_and_wait_ready(token_hash).await?;
+            client.start_tracing(filter).await
+        })
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "timed out waiting for agent tracing readiness; upgrade host and agent together"
+            )
+        })??;
+        Ok(client)
+    }
 
-        client.handshake_and_wait_ready(token).await?;
-
-        // Start メッセージを送信
-        client.send_message(&Message::Start(filter.clone())).await?;
-
+    async fn receive_events<R, W>(
+        client: &mut crate::protocol_client::ProtocolClient<R, W>,
+        tx: mpsc::Sender<Arc<SyscallEvent>>,
+        shutdown_rx: &mut tokio::sync::oneshot::Receiver<()>,
+    ) -> anyhow::Result<()>
+    where
+        R: tokio::io::AsyncRead + Unpin,
+        W: tokio::io::AsyncWrite + Unpin,
+    {
         // イベント受信ループ
         loop {
             tokio::select! {
                 result = client.recv_message() => {
                     match result? {
                         Some(Message::Event(event)) => {
-                            if tx.send(Arc::new(event)).await.is_err() {
-                                break;
+                            tokio::select! {
+                                result = tx.send(Arc::new(event)) => { if result.is_err() { break; } }
+                                _ = &mut *shutdown_rx => { break; }
                             }
                         }
                         Some(Message::Error(e)) => {
                             anyhow::bail!("agent error: {}", e);
                         }
-                        Some(_) => {}
-                        None => {
-                            break;
-                        }
+                        Some(other) => anyhow::bail!("unexpected message while monitoring: {:?}", other.message_type()),
+                        None => anyhow::bail!("agent disconnected while monitoring"),
                     }
                 }
-                _ = &mut shutdown_rx => {
-                    let _ = client.send_message(&Message::Stop).await;
+                _ = &mut *shutdown_rx => {
+                    let _ = tokio::time::timeout(std::time::Duration::from_secs(1), client.send_message(&Message::Stop)).await;
                     break;
                 }
             }
@@ -160,12 +196,34 @@ impl VmAgentTracer {
     }
 }
 
+struct StartReservation {
+    inner: Arc<std::sync::Mutex<VmAgentTracerInner>>,
+    committed: bool,
+}
+impl Drop for StartReservation {
+    fn drop(&mut self) {
+        if !self.committed {
+            let mut inner = self.inner.lock().expect("VmAgentTracerInner lock poisoned");
+            inner.shutdown_tx = None;
+            inner.starting = false;
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tracer 実装 (TCP 接続)
 // ---------------------------------------------------------------------------
 
 #[async_trait::async_trait]
 impl Tracer for VmAgentTracer {
+    fn failure_reason(&self) -> Option<String> {
+        self.inner
+            .lock()
+            .expect("VmAgentTracerInner lock poisoned")
+            .failure
+            .clone()
+    }
+
     fn set_session_token(&self, token_hash: String) {
         self.inner
             .lock()
@@ -199,10 +257,9 @@ impl Tracer for VmAgentTracer {
         // チェックと設定を同一ロック内で原子的に行い TOCTOU を防止
         let (token, port, secret) = {
             let mut inner = self.inner.lock().expect("VmAgentTracerInner lock poisoned");
-            if inner.shutdown_tx.is_some() {
+            if inner.shutdown_tx.is_some() || inner.starting {
                 anyhow::bail!("VmAgentTracer is already running");
             }
-            inner.shutdown_tx = Some(shutdown_tx);
             let port = match inner.port_override {
                 Some(p) => p,
                 None => u16::try_from(self.config.port).map_err(|_| {
@@ -212,42 +269,66 @@ impl Tracer for VmAgentTracer {
                     )
                 })?,
             };
+            inner.shutdown_tx = Some(shutdown_tx);
+            inner.starting = true;
+            inner.failure = None;
             (inner.token.clone(), port, inner.secret.clone())
         };
 
-        // TCP 接続（sandbox が動的に割り当てたポートを使用）
-        // 接続失敗時は shutdown_tx をロールバックし、次回の start() を可能にする。
-        let addr = format!("127.0.0.1:{}", port);
-        let stream = match TcpStream::connect(&addr).await {
-            Ok(s) => s,
-            Err(e) => {
-                let mut inner = self.inner.lock().expect("VmAgentTracerInner lock poisoned");
-                inner.shutdown_tx = None;
-                return Err(e.into());
-            }
+        // Roll back the reservation on every failure or cancellation.
+        let mut reservation = StartReservation {
+            inner: Arc::clone(&self.inner),
+            committed: false,
         };
-
-        let filter = filter.clone();
-        tokio::spawn(async move {
-            if let Err(e) =
-                Self::run_on_stream_inner(stream, &filter, tx, shutdown_rx, secret, token).await
-            {
-                eprintln!("VmAgentTracer error: {}", e);
+        let mut shutdown_rx = shutdown_rx;
+        let setup = async {
+            let stream = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                TcpStream::connect(("127.0.0.1", port)),
+            )
+            .await??;
+            Self::prepare(stream, filter, secret, token).await
+        };
+        let mut client = tokio::select! {
+            biased;
+            _ = &mut shutdown_rx => anyhow::bail!("tracer startup cancelled"),
+            result = setup => result?,
+        };
+        let mut inner = self.inner.lock().expect("VmAgentTracerInner lock poisoned");
+        if inner.shutdown_tx.is_none() {
+            anyhow::bail!("tracer startup cancelled");
+        }
+        let state = Arc::clone(&self.inner);
+        inner.task = Some(tokio::spawn(async move {
+            // Retain a sender until the failure reason has been recorded.
+            let result = Self::receive_events(&mut client, tx.clone(), &mut shutdown_rx).await;
+            if let Err(error) = result {
+                state
+                    .lock()
+                    .expect("VmAgentTracerInner lock poisoned")
+                    .failure = Some(error.to_string());
             }
-        });
-
+        }));
+        inner.starting = false;
+        reservation.committed = true;
         Ok(rx)
     }
 
     async fn stop(&self) -> anyhow::Result<()> {
-        if let Some(tx) = self
-            .inner
-            .lock()
-            .expect("VmAgentTracerInner lock poisoned")
-            .shutdown_tx
-            .take()
-        {
+        let (shutdown, task) = {
+            let mut inner = self.inner.lock().expect("VmAgentTracerInner lock poisoned");
+            (inner.shutdown_tx.take(), inner.task.take())
+        };
+        if let Some(tx) = shutdown {
             let _ = tx.send(());
+        }
+        if let Some(mut task) = task
+            && tokio::time::timeout(std::time::Duration::from_secs(2), &mut task)
+                .await
+                .is_err()
+        {
+            task.abort();
+            let _ = task.await;
         }
         Ok(())
     }
@@ -325,6 +406,9 @@ mod tests {
             // Start を受信
             let msg = protocol::read_message(&mut reader).await.unwrap().unwrap();
             assert!(matches!(msg, Message::Start(_)));
+            protocol::write_message(&mut writer, &Message::TraceStarted)
+                .await
+                .unwrap();
 
             // Event を送信
             protocol::write_message(&mut writer, &Message::Event(test_event_clone))
@@ -338,9 +422,11 @@ mod tests {
 
         // host 側
         let host_handle = tokio::spawn(async move {
-            VmAgentTracer::run_on_stream(client, &filter, tx, shutdown_rx)
-                .await
-                .unwrap();
+            assert!(
+                VmAgentTracer::run_on_stream(client, &filter, tx, shutdown_rx)
+                    .await
+                    .is_err()
+            );
         });
 
         // イベント受信
@@ -427,6 +513,14 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert!(matches!(msg, Message::Start(_)));
+            protocol::write_message_authenticated(
+                &mut writer,
+                &Message::TraceStarted,
+                &agent_key,
+                &mut send_seq,
+            )
+            .await
+            .unwrap();
 
             // Event を認証付きで送信
             protocol::write_message_authenticated(
@@ -521,6 +615,9 @@ mod tests {
 
             // Start を受信 → shutdown 可能を通知
             let _ = protocol::read_message(&mut reader).await.unwrap();
+            protocol::write_message(&mut writer, &Message::TraceStarted)
+                .await
+                .unwrap();
             ready_clone.notify_one();
 
             // Stop を待つ
@@ -653,6 +750,9 @@ mod tests {
 
             // Start を受信 → shutdown 可能を通知
             let _msg = protocol::read_message(&mut reader).await.unwrap().unwrap();
+            protocol::write_message(&mut writer, &Message::TraceStarted)
+                .await
+                .unwrap();
             ready_clone.notify_one();
 
             // Stop メッセージを待つ
@@ -741,6 +841,9 @@ mod tests {
             // Start 受信
             let msg = protocol::read_message(&mut reader).await.unwrap().unwrap();
             assert!(matches!(msg, Message::Start(_)));
+            protocol::write_message(&mut writer, &Message::TraceStarted)
+                .await
+                .unwrap();
 
             // Event 送信
             protocol::write_message(&mut writer, &Message::Event(test_event_clone))
@@ -817,6 +920,9 @@ mod tests {
             // Start 受信
             let msg = protocol::read_message(&mut reader).await.unwrap().unwrap();
             assert!(matches!(msg, Message::Start(_)));
+            protocol::write_message(&mut writer, &Message::TraceStarted)
+                .await
+                .unwrap();
             let _ = start_tx.send(());
 
             // Stop を待つ
@@ -890,6 +996,9 @@ mod tests {
                 .await
                 .unwrap();
             let _msg = protocol::read_message(&mut reader).await.unwrap();
+            protocol::write_message(&mut writer, &Message::TraceStarted)
+                .await
+                .unwrap();
             let _ = protocol::read_message(&mut reader).await;
         });
 
@@ -935,6 +1044,9 @@ mod tests {
 
             let msg = protocol::read_message(&mut reader).await.unwrap().unwrap();
             assert!(matches!(msg, Message::Start(_)));
+            protocol::write_message(&mut writer, &Message::TraceStarted)
+                .await
+                .unwrap();
 
             let msg = protocol::read_message(&mut reader).await.unwrap();
             assert!(matches!(msg, Some(Message::Stop)));

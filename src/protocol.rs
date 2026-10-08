@@ -37,6 +37,7 @@ pub enum MessageType {
     ShellData = 9,
     ShellClose = 10,
     ShellResize = 11,
+    TraceStarted = 12,
 }
 
 impl TryFrom<u8> for MessageType {
@@ -56,6 +57,7 @@ impl TryFrom<u8> for MessageType {
             9 => Ok(Self::ShellData),
             10 => Ok(Self::ShellClose),
             11 => Ok(Self::ShellResize),
+            12 => Ok(Self::TraceStarted),
             _ => anyhow::bail!("unknown message type: {}", value),
         }
     }
@@ -100,6 +102,8 @@ pub enum Message {
     ShellClose { exit_code: i32 },
     /// host → agent: ターミナルリサイズ。
     ShellResize { rows: u16, cols: u16 },
+    /// agent → host: tracing is active; emitted only after successful Start.
+    TraceStarted,
 }
 
 impl Message {
@@ -118,6 +122,7 @@ impl Message {
             Self::ShellData { .. } => MessageType::ShellData,
             Self::ShellClose { .. } => MessageType::ShellClose,
             Self::ShellResize { .. } => MessageType::ShellResize,
+            Self::TraceStarted => MessageType::TraceStarted,
         }
     }
 }
@@ -507,6 +512,7 @@ mod tests {
         for (message, fixture) in [
             (Message::Stop, vec![0xff, 2, 1, 1, 0, 0, 0, 1]),
             (Message::Ready, vec![0xff, 2, 3, 1, 0, 0, 0, 3]),
+            (Message::TraceStarted, vec![0xff, 2, 12, 1, 0, 0, 0, 12]),
             (
                 Message::Error("x".into()),
                 vec![0xff, 2, 4, 3, 0, 0, 0, 4, 1, b'x'],
@@ -529,6 +535,7 @@ mod tests {
         let messages = vec![
             make_start_message(),
             Message::Stop,
+            Message::TraceStarted,
             make_event_message(),
             Message::Ready,
             Message::Error("失敗".into()),
@@ -826,6 +833,7 @@ mod tests {
         let messages = vec![
             make_start_message(),
             Message::Stop,
+            Message::TraceStarted,
             make_event_message(),
             Message::Ready,
             Message::Error("test error".to_string()),
@@ -881,6 +889,7 @@ mod tests {
         let messages = vec![
             make_start_message(),
             Message::Stop,
+            Message::TraceStarted,
             make_event_message(),
             Message::Ready,
             Message::Error("test error".to_string()),

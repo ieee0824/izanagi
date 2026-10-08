@@ -847,78 +847,14 @@ impl Sandbox for QemuSandbox {
             anyhow::bail!("agent connection is broken. Restart with `izanagi down && izanagi up`.");
         }
 
-        // 現在のターミナルサイズを取得
-        let (rows, cols) = get_terminal_size();
-
-        // Shell メッセージを送信
-        let shell_msg = Message::Shell { rows, cols };
-        conn.client.send_message(&shell_msg).await?;
-
-        // ターミナルを raw mode に設定
-        let _raw_guard = RawModeGuard::enable()?;
-
-        // stdin を非同期で読む
-        let mut stdin = tokio::io::stdin();
-        let mut stdin_buf = vec![0u8; 1024];
-
-        // SIGWINCH ハンドラ
-        let mut sigwinch =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())?;
-
-        loop {
-            tokio::select! {
-                // stdin → agent
-                n = stdin.read(&mut stdin_buf) => {
-                    match n {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            let msg = Message::ShellData {
-                                stream: 0,
-                                data: stdin_buf[..n].to_vec(),
-                            };
-                            conn.client.send_message(&msg).await?;
-                        }
-                        Err(e) => {
-                            eprintln!("stdin error: {}", e);
-                            break;
-                        }
-                    }
-                }
-                // agent → stdout
-                result = conn.client.recv_message() => {
-                    match result? {
-                        Some(Message::ShellData { data, .. }) => {
-                            use std::io::Write;
-                            std::io::stdout().write_all(&data)?;
-                            std::io::stdout().flush()?;
-                        }
-                        Some(Message::ShellClose { exit_code }) => {
-                            if exit_code != 0 {
-                                eprintln!("\nshell exited with code {}", exit_code);
-                            }
-                            break;
-                        }
-                        Some(Message::Error(e)) => {
-                            conn.broken = true;
-                            anyhow::bail!("agent error: {}", e);
-                        }
-                        None => {
-                            conn.broken = true;
-                            break;
-                        }
-                        _ => {}
-                    }
-                }
-                // SIGWINCH → agent
-                _ = sigwinch.recv() => {
-                    let (rows, cols) = get_terminal_size();
-                    let msg = Message::ShellResize { rows, cols };
-                    conn.client.send_message(&msg).await?;
-                }
+        match crate::terminal_shell::interactive_shell(&mut conn.client).await {
+            Ok(0) => Ok(()),
+            Ok(code) => anyhow::bail!("shell exited with code {code}"),
+            Err(error) => {
+                conn.broken = true;
+                Err(error)
             }
         }
-
-        Ok(())
     }
 
     async fn down(&mut self) -> anyhow::Result<()> {
@@ -964,54 +900,68 @@ impl Sandbox for QemuSandbox {
     }
 }
 
-/// ターミナルサイズを取得する。取得失敗時は 24x80 を返す。
-fn get_terminal_size() -> (u16, u16) {
-    unsafe {
-        let mut ws: libc::winsize = std::mem::zeroed();
-        if libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) == 0
-            && ws.ws_row > 0
-            && ws.ws_col > 0
-        {
-            (ws.ws_row, ws.ws_col)
-        } else {
-            (24, 80)
-        }
-    }
-}
-
-/// RAII でターミナルを raw mode に設定し、ドロップ時に復元する。
-struct RawModeGuard {
-    original: libc::termios,
-}
-
-impl RawModeGuard {
-    fn enable() -> anyhow::Result<Self> {
-        unsafe {
-            let mut original: libc::termios = std::mem::zeroed();
-            if libc::tcgetattr(libc::STDIN_FILENO, &mut original) != 0 {
-                anyhow::bail!("tcgetattr failed: {}", std::io::Error::last_os_error());
-            }
-            let mut raw = original;
-            libc::cfmakeraw(&mut raw);
-            if libc::tcsetattr(libc::STDIN_FILENO, libc::TCSAFLUSH, &raw) != 0 {
-                anyhow::bail!("tcsetattr failed: {}", std::io::Error::last_os_error());
-            }
-            Ok(Self { original })
-        }
-    }
-}
-
-impl Drop for RawModeGuard {
-    fn drop(&mut self) {
-        unsafe {
-            libc::tcsetattr(libc::STDIN_FILENO, libc::TCSAFLUSH, &self.original);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_sandbox_shell_exits_and_restores_terminal_without_input() {
+        for mode in ["close", "disconnect", "error", "cancel"] {
+            crate::pty_test_support::exercise("qemu_sandbox::tests::shell_runtime_probe", mode);
+        }
+    }
+
+    #[test]
+    fn shell_runtime_probe() {
+        let Ok(port) = std::env::var("IZANAGI_PTY_TEST_PORT") else {
+            return;
+        };
+        let mode = std::env::var("IZANAGI_PTY_TEST_MODE").unwrap();
+        let original = crate::pty_test_support::terminal_snapshot();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = runtime.block_on(async {
+            let stream = TcpStream::connect(("127.0.0.1", port.parse::<u16>().unwrap()))
+                .await
+                .unwrap();
+            let conn =
+                QemuSandbox::try_handshake(stream, &load_shared_secret_from_env().unwrap(), &None)
+                    .await
+                    .unwrap();
+            let mut sandbox = QemuSandbox::new();
+            sandbox.status = SandboxStatus::Running;
+            sandbox.connection = Some(Mutex::new(conn));
+            if mode == "cancel" {
+                tokio::time::timeout(std::time::Duration::from_millis(200), sandbox.shell())
+                    .await
+                    .map_err(anyhow::Error::from)?
+            } else {
+                sandbox.shell().await
+            }
+        });
+        match mode.as_str() {
+            "close" => result.unwrap(),
+            "disconnect" => assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("agent disconnected during shell")
+            ),
+            "error" => assert!(result.unwrap_err().to_string().contains("shell test error")),
+            "cancel" => assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("deadline has elapsed")
+            ),
+            _ => unreachable!(),
+        }
+        drop(runtime);
+        crate::pty_test_support::assert_terminal_restored(&original);
+    }
 
     /// テスト用ヘルパー: 旧シグネチャ互換の `build_qemu_args` ラッパー。
     #[allow(clippy::too_many_arguments)]

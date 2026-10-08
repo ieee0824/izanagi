@@ -19,7 +19,13 @@ pub mod rules;
 pub mod sandbox;
 pub mod sanitize;
 pub mod session;
+pub mod terminal_shell;
 pub mod tracer;
 pub mod util;
 pub mod vm_agent_tracer;
 mod wire_codec;
+
+#[cfg(test)]
+extern crate self as izanagi;
+#[cfg(test)]
+mod pty_test_support;
