@@ -26,6 +26,7 @@ mod connection;
 mod crypto;
 mod exec;
 mod security;
+mod shell;
 
 use izanagi::protocol;
 use std::sync::Arc;

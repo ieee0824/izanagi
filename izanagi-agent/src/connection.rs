@@ -6,6 +6,7 @@ use izanagi::tracer::Tracer;
 use crate::crypto::{constant_time_eq, sha256_hex};
 use crate::exec::{EXEC_USER, execute_command};
 use crate::security::sanitize_anyhow_error;
+use crate::shell::{ShellChild, relay_shell};
 
 /// 1 つのホスト接続を処理する。
 pub(crate) async fn handle_connection<S>(
@@ -406,104 +407,10 @@ where
         }
     }
 
-    // 親プロセス: master_fd を tokio の AsyncFd でラップ
+    // Own the child before any fallible parent-side setup.
+    let child = ShellChild::new(pid);
     let master = unsafe { std::fs::File::from_raw_fd(master_fd) };
-    // ノンブロッキングに設定
-    unsafe {
-        let flags = libc::fcntl(master_fd, libc::F_GETFL);
-        libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-    }
-    let master_async = tokio::io::unix::AsyncFd::new(master)?;
-
-    loop {
-        tokio::select! {
-            // PTY → ホスト (stdout)
-            readable = master_async.readable() => {
-                match readable {
-                    Ok(mut guard) => {
-                        match guard.try_io(|inner| {
-                            use std::io::Read;
-                            let mut buf = vec![0u8; 4096];
-                            let n = inner.get_ref().read(&mut buf)?;
-                            buf.truncate(n);
-                            Ok(buf)
-                        }) {
-                            Ok(Ok(data)) if !data.is_empty() => {
-                                send_message(
-                                    writer,
-                                    &Message::ShellData { stream: 1, data },
-                                    secret,
-                                    send_seq,
-                                ).await?;
-                            }
-                            Ok(Ok(_)) => {
-                                // EOF — シェル終了
-                                break;
-                            }
-                            Ok(Err(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                                continue;
-                            }
-                            Ok(Err(_)) => {
-                                break;
-                            }
-                            Err(_would_block) => {
-                                continue;
-                            }
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-            // ホスト → PTY (stdin) / リサイズ / クローズ
-            result = recv_message(reader, secret, recv_seq) => {
-                match result? {
-                    Some(Message::ShellData { stream: 0, data }) => {
-                        // stdin をPTY に書き込み
-                        match master_async.writable().await {
-                            Ok(mut guard) => {
-                                let _ = guard.try_io(|inner| {
-                                    use std::io::Write;
-                                    inner.get_ref().write_all(&data)
-                                });
-                            }
-                            Err(_) => break,
-                        }
-                    }
-                    Some(Message::ShellResize { rows, cols }) => {
-                        let ws = libc::winsize {
-                            ws_row: rows,
-                            ws_col: cols,
-                            ws_xpixel: 0,
-                            ws_ypixel: 0,
-                        };
-                        unsafe {
-                            libc::ioctl(master_fd, libc::TIOCSWINSZ, &ws);
-                        }
-                    }
-                    Some(Message::Stop) | None => {
-                        break;
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-
-    // 子プロセスの終了を待つ
-    let mut status: libc::c_int = 0;
-    unsafe {
-        libc::waitpid(pid, &mut status, 0);
-    }
-    let exit_code = if libc::WIFEXITED(status) {
-        libc::WEXITSTATUS(status)
-    } else {
-        -1
-    };
-
-    send_message(writer, &Message::ShellClose { exit_code }, secret, send_seq).await?;
-    eprintln!("shell closed with exit code {}", exit_code);
-
-    Ok(())
+    relay_shell(reader, writer, secret, send_seq, recv_seq, master, child).await
 }
 
 /// agent 自身が発生させた syscall イベントかどうかを判定する。
@@ -519,7 +426,7 @@ fn is_agent_event(event: &izanagi::event::SyscallEvent, agent_pid: u32) -> bool 
 }
 
 /// シークレットの有無に応じて認証付き/なしでメッセージを送信する。
-async fn send_message<W: tokio::io::AsyncWrite + Unpin>(
+pub(crate) async fn send_message<W: tokio::io::AsyncWrite + Unpin>(
     writer: &mut W,
     msg: &Message,
     secret: Option<&[u8]>,
@@ -532,7 +439,7 @@ async fn send_message<W: tokio::io::AsyncWrite + Unpin>(
 }
 
 /// シークレットの有無に応じて認証付き/なしでメッセージを受信する。
-async fn recv_message<R: tokio::io::AsyncRead + Unpin>(
+pub(crate) async fn recv_message<R: tokio::io::AsyncRead + Unpin>(
     reader: &mut R,
     secret: Option<&[u8]>,
     recv_seq: &mut u64,
