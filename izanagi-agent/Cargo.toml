@@ -16,7 +16,7 @@ ebpf = ["izanagi/ebpf"]
 
 [dependencies]
 anyhow = "1"
-bincode = "1"
+bincode = "3"
 serde = { version = "1", features = ["derive"] }
 smallvec = { version = "1", features = ["serde"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "io-util", "time", "net"] }
