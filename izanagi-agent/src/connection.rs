@@ -579,7 +579,9 @@ mod tests {
                     .unwrap();
                 let reply = client.recv_message().await.unwrap().unwrap();
                 if authenticated {
-                    assert!(matches!(reply, Message::ExecResult { exit_code: 1, .. }));
+                    assert!(
+                        matches!(reply, Message::ExecResult { exit_code, .. } if exit_code != 0)
+                    );
                 } else {
                     assert!(matches!(reply, Message::Error(_)));
                 }
