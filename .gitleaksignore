@@ -1,0 +1,4 @@
+# Synthetic API keys in redaction unit tests, not real credentials.
+# Ignore only these historical findings; keep scanning all other content.
+a38955a3ec3cce9777168b8f80cd92f9812a9434:src/event.rs:generic-api-key:418
+a38955a3ec3cce9777168b8f80cd92f9812a9434:src/event.rs:generic-api-key:430
