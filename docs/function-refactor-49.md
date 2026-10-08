@@ -166,6 +166,29 @@ All 30 DTrace tests pass on macOS, including a new regression proving a full
 channel drops events while stdout continues draining. Default-feature all-target
 Clippy passes. Linux feature checks and CI remain required for the final head.
 
+### VM agent tracing
+
+Both original VM agent candidates and every new production helper are below
+50 lines. Optional telemetry loss accounting, atomic startup reservation,
+connection/readiness and failure recording are separate responsibilities.
+Reservation rollback, receive cancellation, stop notification, bounded queues
+and weak task ownership remain unchanged. All 13 VM agent tests and the eight
+behavior-scenario/five monitoring-lifecycle integration tests pass. The added
+telemetry regression verifies saturation marks the next delivered event with
+EventLoss. Linux cross-target all-feature/all-target Clippy passes.
+
+### CLI entry and startup command
+
+Both main entry candidates and both startup-command candidates are split; their
+new helpers are below 50 lines. Lock opening preserves creation-vs-stale state
+and never truncates an existing file. Entry dispatch preserves config-free
+commands and config/override/validation/authentication order. Startup keeps
+pcap/proxy/engine/CA/state order, rollback, flush-warning suppression and shutdown
+error priority. CA retry and trust-store update preserve nonfatal diagnostics.
+All existing binary tests pass; regressions cover lock-file contents on reopen
+and config-path dispatch without an existing configuration. Linux cross-target
+all-target/all-feature Clippy passes.
+
 ## Outstanding work
 
 The remaining inventory is work to complete, except explicitly documented

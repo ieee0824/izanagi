@@ -25,14 +25,7 @@ pub async fn cmd_up(
     let _lock = acquire_instance_lock()?;
 
     // --pcap オプションが指定されている場合、pcap ファイルを初期化
-    let pcap_writer = if let Some(path) = pcap_path {
-        let writer = PcapWriter::create(path)
-            .map_err(|e| anyhow::anyhow!("pcap ファイルの作成に失敗: {}: {}", path.display(), e))?;
-        eprintln!("[pcap] キャプチャ開始: {}", path.display());
-        Some(Arc::new(writer))
-    } else {
-        None
-    };
+    let pcap_writer = open_pcap_capture(pcap_path)?;
 
     // DNS プロキシ / HTTP キャプチャプロキシを自動起動 (#270, #271)
     let mut proxy_manager = ProxyManager::start(config, config_path).await?;
@@ -48,24 +41,7 @@ pub async fn cmd_up(
     }
 
     let iza_dir = izanagi_dir();
-    let runtime_state_result = persist_runtime_state(
-        &iza_dir,
-        engine.sandbox().session_backend(),
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs(),
-        write_pid_file,
-    );
-    if let Err(startup_error) = runtime_state_result {
-        if let Err(e) =
-            cleanup_running_resources(&mut proxy_manager, &mut engine, &log_storage, &iza_dir).await
-        {
-            eprintln!("警告: 起動失敗後のクリーンアップにも失敗しました: {}", e);
-        }
-        return Err(startup_error);
-    }
+    persist_or_cleanup(&iza_dir, &mut proxy_manager, &mut engine, &log_storage).await?;
 
     println!(
         "サンドボックスを起動しました (PID: {})。Ctrl+C または izanagi down で停止します。",
@@ -74,38 +50,7 @@ pub async fn cmd_up(
 
     // Ctrl+C を待ちつつ、定期的に LogStorage をフラッシュする。
     // logs -f (別プロセス) がリアルタイムでログを読めるようにするため。
-    let mut flush_interval = tokio::time::interval(std::time::Duration::from_secs(1));
-    let shutdown_signal = wait_for_shutdown_signal();
-    tokio::pin!(shutdown_signal);
-    let mut flush_error_warned = false;
-    let wait_result = loop {
-        tokio::select! {
-            _ = flush_interval.tick() => {
-                let storage = log_storage.clone();
-                match tokio::task::spawn_blocking(move || storage.flush()).await {
-                    Ok(Ok(_)) => { flush_error_warned = false; }
-                    Ok(Err(e)) => {
-                        if !flush_error_warned {
-                            eprintln!("警告: ログのフラッシュに失敗 (以降の連続失敗は抑制): {}", e);
-                            flush_error_warned = true;
-                        }
-                    }
-                    Err(e) => {
-                        if !flush_error_warned {
-                            eprintln!("警告: フラッシュタスクの実行に失敗 (以降の連続失敗は抑制): {}", e);
-                            flush_error_warned = true;
-                        }
-                    }
-                }
-            }
-            error = engine.wait_for_monitoring_failure() => {
-                break Err(std::io::Error::other(error.to_string()));
-            }
-            result = &mut shutdown_signal => {
-                break result;
-            }
-        }
-    };
+    let wait_result = wait_with_log_flush(&engine, &log_storage).await;
 
     println!("\nシャットダウン中...");
     let cleanup_result =
@@ -115,6 +60,90 @@ pub async fn cmd_up(
     println!("サンドボックスを停止しました。");
 
     Ok(0)
+}
+
+fn open_pcap_capture(pcap_path: Option<&Path>) -> anyhow::Result<Option<Arc<PcapWriter>>> {
+    Ok(if let Some(path) = pcap_path {
+        let writer = PcapWriter::create(path)
+            .map_err(|e| anyhow::anyhow!("pcap ファイルの作成に失敗: {}: {}", path.display(), e))?;
+        eprintln!("[pcap] キャプチャ開始: {}", path.display());
+        Some(Arc::new(writer))
+    } else {
+        None
+    })
+}
+
+async fn wait_with_log_flush(
+    engine: &Engine,
+    log_storage: &Arc<LogStorage>,
+) -> std::io::Result<()> {
+    let mut flush_interval = tokio::time::interval(std::time::Duration::from_secs(1));
+    let shutdown_signal = wait_for_shutdown_signal();
+    tokio::pin!(shutdown_signal);
+    let mut flush_error_warned = false;
+    loop {
+        tokio::select! {
+            _ = flush_interval.tick() => {
+                flush_logs(log_storage, &mut flush_error_warned).await;
+            }
+            error = engine.wait_for_monitoring_failure() => {
+                break Err(std::io::Error::other(error.to_string()));
+            }
+            result = &mut shutdown_signal => {
+                break result;
+            }
+        }
+    }
+}
+
+async fn flush_logs(log_storage: &Arc<LogStorage>, flush_error_warned: &mut bool) {
+    let storage = log_storage.clone();
+    match tokio::task::spawn_blocking(move || storage.flush()).await {
+        Ok(Ok(_)) => {
+            *flush_error_warned = false;
+        }
+        Ok(Err(e)) => {
+            if !*flush_error_warned {
+                eprintln!("警告: ログのフラッシュに失敗 (以降の連続失敗は抑制): {}", e);
+                *flush_error_warned = true;
+            }
+        }
+        Err(e) => {
+            if !*flush_error_warned {
+                eprintln!(
+                    "警告: フラッシュタスクの実行に失敗 (以降の連続失敗は抑制): {}",
+                    e
+                );
+                *flush_error_warned = true;
+            }
+        }
+    }
+}
+
+async fn persist_or_cleanup(
+    iza_dir: &Path,
+    proxy_manager: &mut ProxyManager,
+    engine: &mut Engine,
+    log_storage: &Arc<LogStorage>,
+) -> anyhow::Result<()> {
+    let runtime_state_result = persist_runtime_state(
+        iza_dir,
+        engine.sandbox().session_backend(),
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+        write_pid_file,
+    );
+    if let Err(startup_error) = runtime_state_result {
+        if let Err(e) = cleanup_running_resources(proxy_manager, engine, log_storage, iza_dir).await
+        {
+            eprintln!("警告: 起動失敗後のクリーンアップにも失敗しました: {}", e);
+        }
+        return Err(startup_error);
+    }
+    Ok(())
 }
 
 fn persist_runtime_state<F>(
@@ -202,26 +231,8 @@ where
 async fn install_ca_cert(engine: &Engine, ca_path: &Path) {
     // izanagi-http-capture が CA 証明書を書き出す前に読み取りを試みると
     // 一時的に ENOENT となる可能性があるため、短時間リトライする。
-    let ca_pem = {
-        let timeout = std::time::Duration::from_secs(5);
-        let start = std::time::Instant::now();
-        loop {
-            match std::fs::read_to_string(ca_path) {
-                Ok(s) => break s,
-                Err(e) => {
-                    if e.kind() == std::io::ErrorKind::NotFound && start.elapsed() < timeout {
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                        continue;
-                    }
-                    eprintln!(
-                        "[proxy] CA 証明書の読み取りに失敗 ({}): {} — HTTPS キャプチャが正常に動作しない可能性があります",
-                        ca_path.display(),
-                        e
-                    );
-                    return;
-                }
-            }
-        }
+    let Some(ca_pem) = read_ca_pem(ca_path).await else {
+        return;
     };
 
     // heredoc デリミタ衝突チェック（PEM 内容に 'IZANAGI_CA_EOF' が行として含まれていないことを確認）
@@ -260,13 +271,39 @@ async fn install_ca_cert(engine: &Engine, ca_path: &Path) {
         }
     }
 
+    update_ca_store(engine, &env).await;
+}
+
+async fn read_ca_pem(ca_path: &Path) -> Option<String> {
+    let timeout = std::time::Duration::from_secs(5);
+    let start = std::time::Instant::now();
+    loop {
+        match std::fs::read_to_string(ca_path) {
+            Ok(s) => return Some(s),
+            Err(e) => {
+                if e.kind() == std::io::ErrorKind::NotFound && start.elapsed() < timeout {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    continue;
+                }
+                eprintln!(
+                    "[proxy] CA 証明書の読み取りに失敗 ({}): {} — HTTPS キャプチャが正常に動作しない可能性があります",
+                    ca_path.display(),
+                    e
+                );
+                return None;
+            }
+        }
+    }
+}
+
+async fn update_ca_store(engine: &Engine, env: &HashMap<String, String>) {
     // 証明書ストアを更新 (Alpine/Debian: update-ca-certificates)
     let update_cmd = vec![
         "sh".to_string(),
         "-c".to_string(),
         "update-ca-certificates 2>/dev/null".to_string(),
     ];
-    match engine.exec(&update_cmd, &env).await {
+    match engine.exec(&update_cmd, env).await {
         Ok(output) if output.exit_code == 0 => {
             eprintln!("[proxy] CA 証明書をサンドボックス内にインストールしました");
         }
