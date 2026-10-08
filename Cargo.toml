@@ -22,7 +22,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "proce
 glob = "0.3"
 libc = "0.2"
 hmac = "0.12"
-sha2 = "0.10"
+sha2 = "0.11"
 regex = "1"
 smallvec = { version = "1", features = ["serde"] }
 toml = "0.8"
