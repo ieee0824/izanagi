@@ -4,8 +4,6 @@ src/apple_container_sandbox.rs	stop_container	562	51
 src/commands/config.rs	cmd_config_mitm	36	139
 src/commands/up.rs	cmd_up	20	99
 src/commands/up.rs	install_ca_cert	202	85
-src/dtrace_tracer.rs	parse_dtrace_line	355	136
-src/dtrace_tracer.rs	start	499	129
 src/engine.rs	start	202	141
 src/landlock_sandbox.rs	build_ruleset	55	83
 src/landlock_sandbox.rs	exec	273	59

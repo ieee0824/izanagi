@@ -153,6 +153,19 @@ regression verifies missing QEMU configuration is reported before a tracer
 platform error, and platform errors before invalid share paths. Linux
 cross-target all-target/all-feature Clippy passes.
 
+### DTrace tracing
+
+Both original DTrace candidates and new production helpers are below 50 lines.
+Syscall-name decoding, schema-driven path reconstruction and single-field
+fallbacks are separate from envelope parsing. Command selection/spawn, bounded
+stderr logging, nonblocking stdout forwarding and failed-start resource cleanup
+are named responsibilities. Double-start registration stays inside one lock;
+cleanup still aborts stdout, aborts stderr, then kills/reaps the new child.
+
+All 30 DTrace tests pass on macOS, including a new regression proving a full
+channel drops events while stdout continues draining. Default-feature all-target
+Clippy passes. Linux feature checks and CI remain required for the final head.
+
 ## Outstanding work
 
 The remaining inventory is work to complete, except explicitly documented
