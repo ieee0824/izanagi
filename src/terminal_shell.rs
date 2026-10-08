@@ -67,8 +67,9 @@ impl Terminal {
 impl Drop for Terminal {
     fn drop(&mut self) {
         loop {
-            // Restore immediately, including when the shell future is cancelled.
-            if unsafe { libc::tcsetattr(self.fd.as_raw_fd(), libc::TCSANOW, &self.original) } == 0 {
+            // Restore and discard pending guest input, including on cancellation.
+            if unsafe { libc::tcsetattr(self.fd.as_raw_fd(), libc::TCSAFLUSH, &self.original) } == 0
+            {
                 break;
             }
             let error = std::io::Error::last_os_error();
