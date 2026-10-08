@@ -912,6 +912,21 @@ mod tests {
     }
 
     #[test]
+    fn new_sandbox_shell_survives_fragmented_output_and_resize() {
+        crate::pty_test_support::exercise(
+            "qemu_sandbox::tests::shell_runtime_probe",
+            "fragment-resize",
+        );
+    }
+
+    #[test]
+    fn new_sandbox_shell_roundtrip_resize_exit_status_and_invalid_response() {
+        for mode in ["roundtrip", "nonzero", "unexpected"] {
+            crate::pty_test_support::exercise("qemu_sandbox::tests::shell_runtime_probe", mode);
+        }
+    }
+
+    #[test]
     fn shell_runtime_probe() {
         let Ok(port) = std::env::var("IZANAGI_PTY_TEST_PORT") else {
             return;
@@ -943,7 +958,14 @@ mod tests {
             }
         });
         match mode.as_str() {
-            "close" => result.unwrap(),
+            "close" | "fragment-resize" | "roundtrip" => result.unwrap(),
+            "nonzero" => assert!(result.unwrap_err().to_string().contains("42")),
+            "unexpected" => assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("unexpected shell response")
+            ),
             "disconnect" => assert!(
                 result
                     .unwrap_err()
