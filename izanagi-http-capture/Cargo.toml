@@ -14,7 +14,7 @@ edition = "2024"
 anyhow = "1"
 chrono = "0.4"
 clap = { version = "4", features = ["derive"] }
-rcgen = { version = "0.13", features = ["pem"] }
+rcgen = { version = "0.14", features = ["pem"] }
 rustls = "0.23"
 rustls-pemfile = "2"
 rustls-pki-types = "1"
