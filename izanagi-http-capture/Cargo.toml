@@ -21,7 +21,7 @@ rustls-pki-types = "1"
 time = "0.3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "time", "signal", "sync"] }
 tokio-rustls = "0.26"
-webpki-roots = "0.26"
+webpki-roots = "1.0"
 
 [[bin]]
 name = "izanagi-http-capture"
