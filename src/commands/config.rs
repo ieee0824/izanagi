@@ -176,53 +176,6 @@ fn cmd_config_mitm(config: &Config, config_path: &Path) -> anyhow::Result<u8> {
     Ok(0)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn config_display_hides_all_mapping_content_without_mutating_config() {
-        let mappings = vec![
-            "dummy=real-credential".to_string(),
-            "malformed-credential".to_string(),
-            "credential-on-left=value=with=equals".to_string(),
-            "=empty-dummy-credential".to_string(),
-            String::new(),
-        ];
-        let mut config = Config::default();
-        config.http_capture = Some(HttpCaptureSection {
-            enabled: true,
-            listen_http: "127.0.0.1:18080".parse().unwrap(),
-            listen_https: "127.0.0.1:18443".parse().unwrap(),
-            ca_cert_out: None,
-            secret_maps: mappings.clone(),
-        });
-
-        let output = redacted_config_toml(&config).unwrap();
-        for sensitive in &mappings {
-            if !sensitive.is_empty() {
-                assert!(!output.contains(sensitive));
-            }
-        }
-        assert!(!output.contains("credential"));
-        let displayed: Config = toml::from_str(&output).unwrap();
-        assert_eq!(
-            displayed.http_capture.unwrap().secret_maps,
-            vec!["[REDACTED]"; mappings.len()]
-        );
-        assert_eq!(config.http_capture.unwrap().secret_maps, mappings);
-    }
-
-    #[test]
-    fn config_display_without_http_capture_is_unchanged() {
-        let config = Config::default();
-        assert_eq!(
-            redacted_config_toml(&config).unwrap(),
-            toml::to_string_pretty(&config).unwrap()
-        );
-    }
-}
-
 /// Config を TOML として設定ファイルに書き出す。
 /// パーミッションは作成時に 0o600 を設定し、TOCTOU を防止する。
 fn write_config(path: &Path, config: &Config) -> anyhow::Result<()> {
@@ -262,4 +215,53 @@ fn write_config(path: &Path, config: &Config) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_display_hides_all_mapping_content_without_mutating_config() {
+        let mappings = vec![
+            "dummy=real-credential".to_string(),
+            "malformed-credential".to_string(),
+            "credential-on-left=value=with=equals".to_string(),
+            "=empty-dummy-credential".to_string(),
+            String::new(),
+        ];
+        let config = Config {
+            http_capture: Some(HttpCaptureSection {
+                enabled: true,
+                listen_http: "127.0.0.1:18080".parse().unwrap(),
+                listen_https: "127.0.0.1:18443".parse().unwrap(),
+                ca_cert_out: None,
+                secret_maps: mappings.clone(),
+            }),
+            ..Config::default()
+        };
+
+        let output = redacted_config_toml(&config).unwrap();
+        for sensitive in &mappings {
+            if !sensitive.is_empty() {
+                assert!(!output.contains(sensitive));
+            }
+        }
+        assert!(!output.contains("credential"));
+        let displayed: Config = toml::from_str(&output).unwrap();
+        assert_eq!(
+            displayed.http_capture.unwrap().secret_maps,
+            vec!["[REDACTED]"; mappings.len()]
+        );
+        assert_eq!(config.http_capture.unwrap().secret_maps, mappings);
+    }
+
+    #[test]
+    fn config_display_without_http_capture_is_unchanged() {
+        let config = Config::default();
+        assert_eq!(
+            redacted_config_toml(&config).unwrap(),
+            toml::to_string_pretty(&config).unwrap()
+        );
+    }
 }
