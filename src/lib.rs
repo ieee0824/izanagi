@@ -22,3 +22,4 @@ pub mod session;
 pub mod tracer;
 pub mod util;
 pub mod vm_agent_tracer;
+mod wire_codec;

@@ -377,6 +377,8 @@ impl QemuSandbox {
                                 let msg = e.to_string();
                                 // 認証/プロトコルエラーはリトライしても解決しない
                                 let is_fatal = msg.contains("authentication mode mismatch")
+                                    || msg.contains("incompatible protocol version")
+                                    || msg.contains("unsupported protocol version")
                                     || msg.contains("HMAC verification failed")
                                     || msg.contains("token mismatch")
                                     || msg.contains("expected Hello message")
@@ -783,13 +785,15 @@ impl Sandbox for QemuSandbox {
                     return Ok(());
                 }
                 Err(e) => {
+                    let incompatible = e.to_string().contains("incompatible protocol version")
+                        || e.to_string().contains("unsupported protocol version");
                     self.log_qemu_output().await;
                     eprintln!(
                         "WARNING: QEMU startup attempt {} failed (port {}): {}. {}",
                         attempt + 1,
                         self.host_port,
                         e,
-                        if attempt + 1 < PORT_RETRY_MAX {
+                        if attempt + 1 < PORT_RETRY_MAX && !incompatible {
                             "Retrying with a new port..."
                         } else {
                             "No more retries."
@@ -797,6 +801,9 @@ impl Sandbox for QemuSandbox {
                     );
                     let _ = self.shutdown_qemu().await;
                     last_error = Some(e);
+                    if incompatible {
+                        break;
+                    }
                 }
             }
         }

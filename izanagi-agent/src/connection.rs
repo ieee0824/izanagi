@@ -545,6 +545,61 @@ async fn recv_message<R: tokio::io::AsyncRead + Unpin>(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn v2_host_and_real_agent_handshake_over_tcp() {
+        use izanagi::protocol::{Message, read_message};
+        use izanagi::protocol_client::ProtocolClient;
+        use tokio::net::{TcpListener, TcpStream};
+
+        for authenticated in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let secret = authenticated.then(|| rand::random::<[u8; 32]>().to_vec());
+            let agent_secret = secret.clone();
+            let agent = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                super::handle_connection(
+                    stream,
+                    agent_secret.as_deref(),
+                    &std::sync::Arc::new(None),
+                )
+                .await
+            });
+            let stream = TcpStream::connect(address).await.unwrap();
+            let (reader, writer) = stream.into_split();
+            let mut client = ProtocolClient::new(reader, writer, secret);
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                client.handshake_and_wait_ready(None).await.unwrap();
+                client
+                    .send_message(&Message::Exec {
+                        cmd: vec![],
+                        env: Default::default(),
+                    })
+                    .await
+                    .unwrap();
+                let reply = client.recv_message().await.unwrap().unwrap();
+                if authenticated {
+                    assert!(
+                        matches!(reply, Message::ExecResult { exit_code, .. } if exit_code != 0)
+                    );
+                } else {
+                    assert!(matches!(reply, Message::Error(_)));
+                }
+            })
+            .await
+            .unwrap();
+            drop(client);
+            tokio::time::timeout(std::time::Duration::from_secs(5), agent)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        }
+        // Legacy data is rejected by the new shared reader without deserializing.
+        let mut legacy = &[5, 5, 0, 0, 0, 5, 0, 0, 0, 0][..];
+        assert!(read_message(&mut legacy).await.is_err());
+    }
+
     use super::*;
     use izanagi::event::{Syscall, SyscallEvent, SyscallResult};
     use std::time::SystemTime;

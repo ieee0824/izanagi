@@ -9,12 +9,12 @@ packer {
 
 variable "debian_version" {
   type    = string
-  default = "13.4.0"
+  default = "13.7.0"
 }
 
 variable "iso_checksum" {
   type    = string
-  default = "sha256:c31f8534597df52bd310f716d271bda30a1f58e6ff8fd9e8254eba66776c42d9"
+  default = "sha256:6e93fa1759bd9d4b0fc11e938987de6967ee7de5297dac1be27c3a75cc17024b"
 }
 
 locals {

@@ -10,7 +10,7 @@ use crate::event::{SyscallCategory, SyscallEvent};
 /// `Serialize`/`Deserialize` を実装しており、`Message::Start` に直接埋め込んで
 /// プロトコル経由で送受信される。
 ///
-/// **ワイヤー互換性に関する注意**: この構造体は bincode でシリアライズされ、
+/// **ワイヤー互換性に関する注意**: この構造体は postcard でシリアライズされ、
 /// host ↔ agent 間のプロトコルメッセージに含まれる。フィールドの追加・削除・
 /// 順序変更はワイヤー互換性に影響するため、host と agent を同時にデプロイするか、
 /// プロトコルバージョニングを導入すること。

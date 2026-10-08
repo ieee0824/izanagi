@@ -12,6 +12,8 @@ AGENT_TARGET := $(AGENT_TARGET_MUSL)
 AGENT_BINARY := izanagi-agent/target/$(AGENT_TARGET)/release/izanagi-agent
 AGENT_BINARY_GNU := izanagi-agent/target/$(AGENT_TARGET_GNU)/release/izanagi-agent
 EBPF_BINARY := izanagi-ebpf/target/bpfel-unknown-none/release/izanagi-ebpf
+# Keep LLVM bitcode compatible with the macOS LLVM 22 BPF linker.
+EBPF_TOOLCHAIN ?= nightly-2026-02-12
 IMAGE_NAME := izanagi-vm
 IMAGE_DIR := image
 PACKER_DIR := packer
@@ -39,7 +41,7 @@ build-agent-gnu: ## agent を Linux glibc クロスビルド (cargo-zigbuild 必
 .PHONY: build-ebpf
 build-ebpf: ## eBPF プログラムをビルド (nightly + bpf-linker + LLVM 必要)
 	cd izanagi-ebpf && DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/opt/llvm/lib \
-		cargo +nightly build --target bpfel-unknown-none --release -Z build-std=core
+		cargo +$(EBPF_TOOLCHAIN) build --target bpfel-unknown-none --release -Z build-std=core
 
 .PHONY: build-all
 build-all: build build-agent build-ebpf ## ホスト + agent + eBPF を全ビルド
