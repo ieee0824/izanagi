@@ -16,8 +16,6 @@ src/behavior_evaluation.rs	replay	178	77
 src/behavior_evaluation.rs	evaluate_manifest	364	235
 src/commands/config.rs	cmd_config_mitm	36	139
 src/commands/down.rs	validate_target_pid	51	56
-src/commands/init.rs	cmd_init	26	256
-src/commands/init.rs	generate_toml	300	110
 src/commands/logs.rs	tail_lines	181	55
 src/commands/mcp/exec_capture.rs	exec_on_session_capture	27	92
 src/commands/mcp/mod.rs	handle_message	73	86
