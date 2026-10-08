@@ -2,7 +2,12 @@
 //! Usage: IZANAGI_SECRET_FILE=... cargo run --example qemu_protocol_smoke -- CONFIG
 use anyhow::Context;
 use izanagi::sandbox::Sandbox;
-use izanagi::{protocol::Message, protocol_client::ProtocolClient, tracer::TraceFilter};
+use izanagi::{
+    event::{Syscall, SyscallArg},
+    protocol::Message,
+    protocol_client::ProtocolClient,
+    tracer::TraceFilter,
+};
 use sha2::{Digest, Sha256};
 
 #[tokio::main]
@@ -30,23 +35,43 @@ async fn main() -> anyhow::Result<()> {
             })
             .await?;
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let path = "/tmp/izanagi-protocol-path-smoke";
         let output = sandbox
             .exec(
-                &["/bin/echo".into(), "v2-event-generator".into()],
+                &[
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    format!("printf '%s\\n' $$; printf v2-event-generator > {path}; rm {path}"),
+                ],
                 &Default::default(),
             )
             .await?;
         anyhow::ensure!(output.exit_code == 0, "Exec failed");
-        let result =
-            tokio::time::timeout(std::time::Duration::from_secs(10), client.recv_message()).await;
-        match result {
-            Ok(Ok(Some(Message::Event(_)))) => println!("authenticated v2 Exec and Event received"),
-            Ok(Ok(Some(Message::Error(error)))) => anyhow::bail!("agent rejected tracing: {error}"),
-            Ok(Ok(Some(_))) => anyhow::bail!("unexpected message instead of Event"),
-            Ok(Ok(None)) => anyhow::bail!("agent disconnected before Event"),
-            Ok(Err(error)) => return Err(error),
-            Err(_) => anyhow::bail!("timed out waiting for Event"),
-        }
+        let pid: u32 = String::from_utf8(output.stdout)?.trim().parse()?;
+        // An arbitrary background event is insufficient: require the pathname
+        // from this command's actual openat, with no trailing NUL.
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                match client.recv_message().await? {
+                    Some(Message::Event(event)) => {
+                        if event.pid == pid
+                            && event.syscall == Syscall::OpenAt
+                            && event.args.iter().any(
+                                |arg| matches!(arg, SyscallArg::Path(value) if value == std::path::Path::new(path)),
+                            )
+                        {
+                            return Ok::<_, anyhow::Error>(());
+                        }
+                    }
+                    Some(Message::Error(error)) => anyhow::bail!("agent rejected tracing: {error}"),
+                    None => anyhow::bail!("agent disconnected before pathname Event"),
+                    other => anyhow::bail!("unexpected message instead of Event: {other:?}"),
+                }
+            }
+        })
+        .await
+        .context("timed out waiting for command's pathname Event")??;
+        println!("authenticated v2 Exec and matching PID/path Event received");
         client.send_message(&Message::Stop).await?;
         Ok(())
     }

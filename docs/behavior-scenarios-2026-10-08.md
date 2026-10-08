@@ -92,20 +92,46 @@ cargo test --manifest-path izanagi-agent/Cargo.toml
 cargo clippy --all-targets -- -D warnings
 ```
 
-## 実 VM の確認範囲と残作業
+## 実 VM の確認（2026-10-08 追加）
 
-既存 `/Users/ast/.izanagi/images/debian-aarch64.qcow2` に対して、独立したテスト認証キー、ホスト共有なし、512 MB / 1 CPU、snapshot=on で `qemu_protocol_smoke` を実行した。
-ゲストは起動したが Hello 前に接続を閉じ、ホストは失敗して VM を停止した。
-ログには workspace.mount の失敗もあり、空の共有設定がイメージに合っていない。旧 agent / イメージとの不一致の可能性を示すエラーだが、原因の確定はしていない。
-したがって **最新 agent と eBPF を組み込んだ VM での Exec / Event / Shell の成功は未確認**。
+macOS arm64 / QEMU HVF、Debian 13 arm64 (Linux 6.12.74)、2 CPU / 2 GB で実行した。
+既存 Debian イメージを読み取り専用の backing とした専用 qcow2 overlay に、同じソースからビルドした Linux agent (`--features ebpf`) と eBPF オブジェクトを配置した。
+専用の一時 workspace と専用認証キーを使い、通常起動は snapshot=on、token + HMAC 認証を有効にした。
+元のイメージと開発プロジェクトの共有ファイルは変更していない。
 
-リリース前には同じリビジョンで agent・eBPF・ゲストイメージを再ビルドし、専用の一時ディレクトリを /workspace に共有して、次を確認する:
+| シナリオ | 結果 |
+| --- | --- |
+| 認証 Hello / Ready / TraceStarted、Exec と eBPF Event | 成功 |
+| コマンド PID と OpenAt パスの一致、パスのログ記録・suspicious_paths アラート | 修正後に成功 |
+| stdout / stderr 分離、終了コード 7 | 成功 |
+| guest 非 root (uid 1000)、/workspace の書き込みとホスト側反映 | 成功 |
+| 新規 shell、既存セッション shell、入力・出力・resize・連続出力 | 成功 |
+| 入力を閉じずに shell の exit 7 / exit 0、termios と O_NONBLOCK 復元 | 成功 |
+| 双方向 1 バイト分割 TCP プロキシ + SIGWINCH の反復 | 成功、約 10,000 回の 1 バイト書き込み |
+| up / down、セッション・PID・ロックの削除 | 成功 |
+| VM の SIGTERM 強制停止、待機中 exec・入力待ち shell・up の失敗 | 成功、約 0.35 秒でエラーと後片付け、端末設定復元 |
 
-1. 認証 Hello / Ready / TraceStarted が完了する。
-2. `echo` の stdout と終了コード、非ゼロ終了、許可外コマンドの拒否を確認する。
-3. ファイルアクセスを発生させ、対象 PID の Event とログを確認する。
-4. shell の入力・出力・resize・入力なし終了と、端末復元を確認する。
-5. 専用 VM の監視接続を切断し、exec / shell / up が失敗して VM・セッション状態を片付けることを確認する。
-6. 上記の分割フレーム + resize の再現テストが修正後に成功する。
+初回接続の handshake timeout は再試行され、起動後の認証と監視開始は成功した。
+新規 shell の flock ファイルは残るがロックは解放され、次の up が取得できた。up/down と監視異常終了はファイルも削除した。
+F_GETFL の値は PTY 書き込み後に 2 → 65538 となるが、CLI を使わない単純な os.write でも同じ差分が出た。[Apple XNU の FWASWRITTEN (0x10000)](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/fcntl.h) に対応し、O_NONBLOCK の変更ではない。
 
-Linux での追加シナリオも今回の PR の CI で成功した。実 VM での最新イメージの成功確認は未実施。
+### 実 VM で発見したパス取得の欠落 (#37)
+
+修正前は openat のイベントが届いてもパスが空で、/workspace/qa-file を作成・読取した 30,730 件のログにも対象パスがなかった。
+eBPF の emit_event が path_len を 0 にして submit しており、パス検知の入力がなかった。
+openat の第 2 引数、stat / access / execve の第 1 引数を bpf_probe_read_user_str_bytes で取得するよう修正した。
+バッファは 256 バイト、末尾 NUL は有効長に含めず、不正ポインタの読取失敗でもイベントを送信する。
+相対パスの絶対化、256 バイト以上のパスの完全取得、sys_enter からの実 syscall 戻り値取得はこの修正の対象外。
+
+qemu_protocol_smoke は背景イベントを受信するだけの判定から、実行コマンド自身の PID・OpenAt・パスが一致するイベントを要求する判定に強化した。
+修正した eBPF オブジェクトを実 guest にロードし、`authenticated v2 Exec and matching PID/path Event received` を確認した。
+
+実 VM は Debian イメージの IZANAGI_ALLOW_ALL_COMMANDS=1 を使っているため、agent の許可外コマンド拒否は今回の実 VM 検証範囲に含めない。
+
+検証バイナリの SHA-256:
+
+- host: `7e7b736b9e8f104e3719388b5e6de1f77a70d2837fc78a6dff83bb7b113f55e8`
+- Linux agent: `ee75f78c5a676870cb8dcce1717522c321da45a6518da7447ff6f6743f891276`
+- 修正後 eBPF: `42dff22781140140e93ee3439bf2897f87b91ae026bc43d7882a4a6a76e6b11c`
+
+ローカル検証: macOS 全 target 480 テスト成功、Clippy warnings=error 成功、eBPF nightly ビルド成功、実 guest で verifier / attach 成功。
