@@ -9,6 +9,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
+#[cfg(feature = "ebpf")]
+mod abi;
+#[cfg(feature = "ebpf")]
+mod observation;
 
 use crate::event::SyscallEvent;
 use crate::tracer::{TraceFilter, Tracer};
@@ -26,6 +30,15 @@ const DEFAULT_EBPF_OBJ_PATH: &str = "/opt/izanagi/izanagi-ebpf.o";
 pub struct EbpfTracer {
     #[cfg(all(target_os = "linux", feature = "ebpf"))]
     bpf: std::sync::Mutex<Option<aya::Ebpf>>,
+    #[cfg(all(target_os = "linux", feature = "ebpf"))]
+    observation: std::sync::Mutex<
+        Option<(
+            observation::Collector,
+            mpsc::Sender<izanagi_telemetry::schema::TelemetryEnvelope>,
+        )>,
+    >,
+    #[cfg(all(target_os = "linux", feature = "ebpf"))]
+    worker: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// eBPF オブジェクトファイルのパス。Linux 実装でのみ使用。
     #[cfg_attr(not(all(target_os = "linux", feature = "ebpf")), allow(dead_code))]
     ebpf_obj_path: PathBuf,
@@ -54,7 +67,44 @@ impl EbpfTracer {
         Self {
             #[cfg(all(target_os = "linux", feature = "ebpf"))]
             bpf: std::sync::Mutex::new(None),
+            #[cfg(all(target_os = "linux", feature = "ebpf"))]
+            observation: std::sync::Mutex::new(None),
+            #[cfg(all(target_os = "linux", feature = "ebpf"))]
+            worker: std::sync::Mutex::new(None),
             ebpf_obj_path: path.into(),
+        }
+    }
+}
+
+impl EbpfTracer {
+    pub async fn start_observation(
+        &self,
+        filter: &TraceFilter,
+        session_id: String,
+    ) -> anyhow::Result<(
+        mpsc::Receiver<Arc<SyscallEvent>>,
+        mpsc::Receiver<izanagi_telemetry::schema::TelemetryEnvelope>,
+    )> {
+        #[cfg(all(target_os = "linux", feature = "ebpf"))]
+        {
+            let (tx, rx) = mpsc::channel(256);
+            *self.observation.lock().expect("observation lock poisoned") =
+                Some((observation::Collector::new(session_id)?, tx));
+            match self.start(filter).await {
+                Ok(events) => Ok((events, rx)),
+                Err(error) => {
+                    self.observation
+                        .lock()
+                        .expect("observation lock poisoned")
+                        .take();
+                    Err(error)
+                }
+            }
+        }
+        #[cfg(not(all(target_os = "linux", feature = "ebpf")))]
+        {
+            let _ = (filter, session_id);
+            anyhow::bail!("Linux eBPF behavior observation is unavailable")
         }
     }
 }
@@ -93,7 +143,7 @@ impl TryFrom<izanagi_common::SyscallId> for crate::event::Syscall {
 #[cfg(all(target_os = "linux", feature = "ebpf"))]
 /// boot time のオフセットを計算する。
 ///
-/// `CLOCK_BOOTTIME` と `CLOCK_REALTIME` の差分から、
+/// `CLOCK_MONOTONIC` と `CLOCK_REALTIME` の差分から、
 /// `bpf_ktime_get_ns()` の値を UNIX epoch ベースに補正するためのオフセットを求める。
 fn boot_time_offset() -> anyhow::Result<std::time::Duration> {
     let mut boottime = libc::timespec {
@@ -108,9 +158,9 @@ fn boot_time_offset() -> anyhow::Result<std::time::Duration> {
     // Safety: libc::clock_gettime は有効な timespec ポインタに対して安全。
     // 戻り値 -1 はエラーを示す (#99)。
     unsafe {
-        if libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut boottime) == -1 {
+        if libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut boottime) == -1 {
             anyhow::bail!(
-                "clock_gettime(CLOCK_BOOTTIME) failed: {}",
+                "clock_gettime(CLOCK_MONOTONIC) failed: {}",
                 std::io::Error::last_os_error()
             );
         }
@@ -172,6 +222,14 @@ fn convert_raw_event(
 
     use crate::event::{Syscall, SyscallResult};
 
+    if raw.abi_version != izanagi_common::RAW_ABI_VERSION
+        || !matches!(
+            raw.kind,
+            izanagi_common::KIND_ENTER | izanagi_common::KIND_OPEN_EXIT
+        )
+    {
+        return None;
+    }
     // SyscallId → Syscall 変換
     let syscall_id = izanagi_common::SyscallId::try_from(raw.syscall_id).ok()?;
     let syscall = Syscall::try_from(syscall_id).ok()?;
@@ -205,7 +263,15 @@ fn convert_raw_event(
         process_name,
         syscall,
         args,
-        result: SyscallResult::Ok(0), // tracepoint enter では戻り値は未取得
+        result: if raw.kind == izanagi_common::KIND_OPEN_EXIT {
+            if raw.result < 0 {
+                SyscallResult::Err((-raw.result).min(i32::MAX as i64) as i32)
+            } else {
+                SyscallResult::Ok(raw.result)
+            }
+        } else {
+            SyscallResult::Unknown
+        },
     })
 }
 
@@ -223,8 +289,77 @@ impl Tracer for EbpfTracer {
         use aya::programs::TracePoint;
         use izanagi_common::RAW_EVENT_SIZE;
 
-        // eBPF プログラムのバイナリをロード。
-        let mut bpf = Ebpf::load_file(&self.ebpf_obj_path)?;
+        let bytes = std::fs::read(&self.ebpf_obj_path)?;
+        abi::validate_object(&bytes)?;
+        let mut bpf = Ebpf::load(&bytes)?;
+        let behavior = self
+            .observation
+            .lock()
+            .expect("observation lock poisoned")
+            .is_some();
+        let required: &[(&str, &str, &str, &[(&str, usize, usize)])] = &[
+            (
+                "sys_enter_openat",
+                "syscalls",
+                "sys_enter_openat",
+                &[("dfd", 16, 8), ("filename", 24, 8), ("flags", 32, 8)],
+            ),
+            (
+                "sys_exit_openat",
+                "syscalls",
+                "sys_exit_openat",
+                &[("ret", 16, 8)],
+            ),
+            (
+                "sched_process_fork",
+                "sched",
+                "sched_process_fork",
+                &[("parent_pid", 24, 4), ("child_pid", 44, 4)],
+            ),
+            ("sched_process_exec", "sched", "sched_process_exec", &[]),
+            ("sched_process_exit", "sched", "sched_process_exit", &[]),
+            (
+                "inet_sock_set_state",
+                "sock",
+                "inet_sock_set_state",
+                &[
+                    ("skaddr", 8, 8),
+                    ("newstate", 20, 4),
+                    ("sport", 24, 2),
+                    ("dport", 26, 2),
+                    ("family", 28, 2),
+                    ("protocol", 30, 2),
+                ],
+            ),
+        ];
+        if behavior {
+            for map in [
+                "EVENTS",
+                "DROPS",
+                "PROCESS_GENERATIONS",
+                "OPEN_ATTEMPTS",
+                "SOCKET_GENERATIONS",
+            ] {
+                anyhow::ensure!(bpf.map(map).is_some(), "required eBPF map missing: {map}");
+            }
+            for &(program, category, name, fields) in required {
+                abi::validate_tracepoint(category, name, fields)?;
+                let program: &mut TracePoint = bpf
+                    .program_mut(program)
+                    .ok_or_else(|| anyhow::anyhow!("required eBPF probe missing"))?
+                    .try_into()?;
+                program.load()?;
+                program.attach(category, name)?;
+            }
+        } else {
+            // Outcomes are also useful in the legacy stream.
+            let program: &mut TracePoint = bpf
+                .program_mut("sys_exit_openat")
+                .ok_or_else(|| anyhow::anyhow!("required open outcome probe missing"))?
+                .try_into()?;
+            program.load()?;
+            program.attach("syscalls", "sys_exit_openat")?;
+        }
 
         // Tracepoint をアタッチ。
         // 各 tracepoint に対応する eBPF プログラムをロードしてアタッチする。
@@ -248,12 +383,17 @@ impl Tracer for EbpfTracer {
             ("sys_enter_fork", "syscalls", "sys_enter_fork"),
         ];
 
+        let mut unavailable = 0u64;
         for &(prog_name, category, tp_name) in tracepoints {
+            if behavior && prog_name == "sys_enter_openat" {
+                continue;
+            }
             let program: &mut TracePoint = match bpf.program_mut(prog_name) {
                 Some(p) => match p.try_into() {
                     Ok(tp) => tp,
                     Err(e) => {
                         eprintln!("eBPF: skipping '{}' (not a tracepoint: {})", prog_name, e);
+                        unavailable += 1;
                         continue;
                     }
                 },
@@ -262,12 +402,14 @@ impl Tracer for EbpfTracer {
                         "eBPF: program '{}' not found in object, skipping",
                         prog_name
                     );
+                    unavailable += 1;
                     continue;
                 }
             };
             program.load()?;
             // tracepoint が存在しない場合はスキップ（aarch64 等で一部の syscall がないため）
             if let Err(e) = program.attach(category, tp_name) {
+                unavailable += 1;
                 eprintln!(
                     "eBPF: skipping tracepoint '{}/{}' (not available: {})",
                     category, tp_name, e
@@ -285,6 +427,16 @@ impl Tracer for EbpfTracer {
             .ok_or_else(|| anyhow::anyhow!("eBPF map 'EVENTS' not found"))?;
 
         let ring_buf = RingBuf::try_from(events_map)?;
+        let drop_map = bpf
+            .take_map("DROPS")
+            .ok_or_else(|| anyhow::anyhow!("required drop counter missing"))?;
+        let drops = aya::maps::PerCpuArray::<_, u64>::try_from(drop_map)?;
+        let boot_offset = boot_time_offset()?;
+        let mut observation = self
+            .observation
+            .lock()
+            .expect("observation lock poisoned")
+            .take();
 
         {
             let mut guard = self.bpf.lock().expect("EbpfTracer lock poisoned");
@@ -294,10 +446,29 @@ impl Tracer for EbpfTracer {
             *guard = Some(bpf);
         }
 
-        // boot time オフセットを事前計算 (ktime_ns → UNIX epoch 補正用)
-        let boot_offset = boot_time_offset()?;
-
-        tokio::spawn(async move {
+        let worker = tokio::spawn(async move {
+            use izanagi_telemetry::schema::{QualityIssue, TelemetryPayload};
+            let mut lost_pending = 0u64;
+            let mut kernel_losses = 0u64;
+            let mut checked = tokio::time::Instant::now();
+            if let Some((collector, tx)) = observation.as_mut() {
+                let event = collector.envelope(
+                    0,
+                    None,
+                    None,
+                    TelemetryPayload::CollectorHealth { healthy: true },
+                    vec![
+                        QualityIssue::MissingWriter,
+                        QualityIssue::UnsupportedProtocol,
+                    ],
+                );
+                if tx.try_send(event).is_err() {
+                    lost_pending += 1;
+                }
+                if unavailable > 0 {
+                    lost_pending += unavailable;
+                }
+            }
             let mut ring = ring_buf;
             // adaptive backoff: データがないときは 1ms から 10ms まで徐々にスリープ時間を増やす
             let mut backoff_ms: u64 = 1;
@@ -313,13 +484,23 @@ impl Tracer for EbpfTracer {
                 while let Some(item) = ring.next() {
                     got_event = true;
                     let data = &*item;
-                    if data.len() < RAW_EVENT_SIZE {
+                    if data.len() != RAW_EVENT_SIZE {
+                        lost_pending += 1;
                         continue;
                     }
 
                     // アライメントを検証してから読み取り (#2)
                     let raw = read_raw_event(data);
 
+                    if let Some((collector, telemetry)) = observation.as_mut()
+                        && raw.tgid != std::process::id()
+                    {
+                        for event in collector.convert(&raw) {
+                            if telemetry.try_send(event).is_err() {
+                                lost_pending += 1;
+                            }
+                        }
+                    }
                     // RawSyscallEvent → SyscallEvent 変換 (#93)
                     let event = match convert_raw_event(&raw, boot_offset) {
                         Some(e) => e,
@@ -343,6 +524,41 @@ impl Tracer for EbpfTracer {
                     }
                 }
 
+                if checked.elapsed() >= Duration::from_millis(100) {
+                    checked = tokio::time::Instant::now();
+                    match drops.get(&0, 0) {
+                        Ok(values) => {
+                            let total = values.iter().copied().sum::<u64>();
+                            lost_pending =
+                                lost_pending.saturating_add(total.saturating_sub(kernel_losses));
+                            kernel_losses = total;
+                        }
+                        Err(_) => {
+                            lost_pending += 1;
+                        }
+                    }
+                    if lost_pending > 0
+                        && let Some((collector, telemetry)) = observation.as_mut()
+                    {
+                        let timestamp = monotonic_ns();
+                        let event = collector.envelope(
+                            timestamp,
+                            None,
+                            None,
+                            TelemetryPayload::ObservationGap {
+                                dropped: lost_pending,
+                                reason: QualityIssue::EventLoss,
+                            },
+                            vec![QualityIssue::EventLoss],
+                        );
+                        if telemetry.try_send(event).is_ok() {
+                            lost_pending = 0;
+                        }
+                    }
+                }
+                if tx.is_closed() {
+                    return;
+                }
                 // adaptive backoff (#7): データがあればリセット、なければ増加
                 if got_event {
                     backoff_ms = MIN_BACKOFF_MS;
@@ -352,15 +568,30 @@ impl Tracer for EbpfTracer {
                 tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
             }
         });
-
+        *self.worker.lock().expect("worker lock poisoned") = Some(worker);
         Ok(rx)
     }
 
     async fn stop(&self) -> anyhow::Result<()> {
+        if let Some(worker) = self.worker.lock().expect("worker lock poisoned").take() {
+            worker.abort();
+        }
         // Ebpf を drop すると全プログラムがデタッチされる
         self.bpf.lock().expect("EbpfTracer lock poisoned").take();
         Ok(())
     }
+}
+
+#[cfg(all(target_os = "linux", feature = "ebpf"))]
+fn monotonic_ns() -> u64 {
+    let mut time = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut time) } != 0 {
+        return 0;
+    }
+    time.tv_sec as u64 * 1_000_000_000 + time.tv_nsec as u64
 }
 
 // ---------------------------------------------------------------------------
@@ -433,6 +664,24 @@ mod tests {
                 path_buf: [0u8; PATH_BUF_SIZE],
                 path_len: path.len() as u32,
                 _pad2: [0u8; 4],
+                abi_version: izanagi_common::RAW_ABI_VERSION,
+                kind: 0,
+                process_start_ns: 0,
+                exec_generation: 0,
+                parent_start_ns: 0,
+                parent_tgid: 0,
+                child_pid: 0,
+                result: 0,
+                attempt_ns: 0,
+                socket_address: 0,
+                socket_generation: 0,
+                socket_state: 0,
+                family: 0,
+                source_port: 0,
+                destination_port: 0,
+                flags: 0,
+                source_address: [0; 16],
+                destination_address: [0; 16],
             };
             let comm_len = comm.len().min(16);
             event.comm[..comm_len].copy_from_slice(&comm[..comm_len]);

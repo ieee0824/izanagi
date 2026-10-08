@@ -1,4 +1,9 @@
 pub mod apple_container_sandbox;
+pub mod behavior;
+pub mod behavior_classifier;
+pub mod behavior_cli;
+pub mod behavior_config;
+pub mod behavior_evaluation;
 pub mod config;
 pub mod crypto;
 pub mod detector;

@@ -12,6 +12,9 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1"
+izanagi-telemetry = { path = "../izanagi-telemetry" }
+serde_json = "1"
+libc = "0.2"
 chrono = "0.4"
 clap = { version = "4", features = ["derive"] }
 rcgen = { version = "0.14", features = ["pem"] }

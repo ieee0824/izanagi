@@ -123,6 +123,7 @@ fn format_result(result: SyscallResult) -> String {
     match result {
         SyscallResult::Ok(v) => v.to_string(),
         SyscallResult::Err(e) => format!("err={}", e),
+        SyscallResult::Unknown => "unknown (entry)".to_string(),
     }
 }
 

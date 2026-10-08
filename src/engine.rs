@@ -137,6 +137,7 @@ pub struct Engine {
     /// 監視ループ内で各イベントに対して呼ばれる。
     on_event: Option<EventHandler>,
     monitoring_failure: tokio::sync::watch::Receiver<Option<String>>,
+    behavior: Option<crate::behavior::BehaviorRuntime>,
 }
 
 /// アラート発生時のコールバック。
@@ -157,6 +158,7 @@ impl Engine {
             handle: None,
             on_event: None,
             monitoring_failure,
+            behavior: None,
         }
     }
 
@@ -164,6 +166,27 @@ impl Engine {
     /// `start()` 前に呼ぶこと。
     pub fn set_event_handler(&mut self, handler: EventHandler) {
         self.on_event = Some(handler);
+    }
+
+    /// Attach the optional advisory pipeline before tracing starts.
+    pub fn attach_behavior(
+        &mut self,
+        config: &crate::behavior_config::BehaviorSection,
+        allowed_hosts: Vec<String>,
+        audit_root: std::path::PathBuf,
+    ) -> anyhow::Result<()> {
+        if !config.enabled {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            self.behavior.is_none(),
+            "behavior pipeline already attached"
+        );
+        let runtime = crate::behavior::BehaviorRuntime::spawn(config, allowed_hosts, audit_root)?;
+        self.tracer
+            .set_behavior(runtime.start_config().clone(), runtime.sender());
+        self.behavior = Some(runtime);
+        Ok(())
     }
 
     /// pcap ライターを設定する。`start()` 前に呼ぶこと。
@@ -335,6 +358,9 @@ impl Engine {
         // tracer と sandbox は起動中の場合のみ停止。
         // 両方のエラーを収集し、最初のエラーを返す（片方の失敗がもう片方を妨げない）。
         let tracer_err = self.tracer.stop().await.err();
+        if let Some(mut behavior) = self.behavior.take() {
+            behavior.shutdown().await;
+        }
         let sandbox_err = if self.sandbox.status() == SandboxStatus::Running {
             self.sandbox.down().await.err()
         } else {

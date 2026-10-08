@@ -47,6 +47,11 @@ pub(crate) struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// 行動分析のローカル再生・監査表示・比較評価
+    Behavior {
+        #[command(subcommand)]
+        action: Box<izanagi::behavior_cli::BehaviorAction>,
+    },
     /// サンドボックスを起動
     Up {
         /// host <-> agent 間の通信を pcap 形式で記録するファイルパス
@@ -365,6 +370,13 @@ async fn start_engine(
     let event_error_logged = std::sync::atomic::AtomicBool::new(false);
 
     let mut engine = build_engine(config)?;
+    if config.behavior.enabled {
+        engine.attach_behavior(
+            &config.behavior,
+            config.detect.allowed_hosts.clone(),
+            default_log_dir().join("behavior"),
+        )?;
+    }
     engine.set_event_handler(Box::new(move |event: &izanagi::event::SyscallEvent| {
         if let Err(e) = event_storage.store_event(event)
             && !event_error_logged.swap(true, std::sync::atomic::Ordering::Relaxed)
@@ -429,6 +441,9 @@ async fn run() -> anyhow::Result<u8> {
 
 /// テスト可能なエントリポイント。`Cli::try_parse_from()` でテスト用引数を渡せる。
 pub(crate) async fn run_with(cli: Cli) -> anyhow::Result<u8> {
+    if let Commands::Behavior { action } = cli.command {
+        return izanagi::behavior_cli::run(*action, &default_log_dir().join("behavior")).await;
+    }
     // init / mcp は設定ファイルを必要としないため、ロード・バリデーションをスキップ
     if matches!(cli.command, Commands::Init) {
         return commands::cmd_init(cli.config.as_ref());
@@ -499,6 +514,9 @@ pub(crate) async fn run_with(cli: Cli) -> anyhow::Result<u8> {
     for warning in &warnings {
         eprintln!("{}", warning);
     }
+    if config.behavior.enabled && matches!(cli.command, Commands::Up { pcap: Some(_) }) {
+        anyhow::bail!("behavior analysis and raw --pcap capture cannot be enabled together");
+    }
 
     // シークレット設定の検証:
     // 1. IZANAGI_SECRET_FILE が設定されているなら読み込み失敗はハードエラー（require_auth に関係なく）
@@ -520,6 +538,7 @@ pub(crate) async fn run_with(cli: Cli) -> anyhow::Result<u8> {
 
     // サブコマンド分岐
     match cli.command {
+        Commands::Behavior { .. } => unreachable!("behavior is handled before config loading"),
         Commands::Up { pcap } => commands::cmd_up(&config, &config_path, pcap.as_deref()).await,
         Commands::Down => commands::cmd_down().await,
         Commands::Exec { cmd } => commands::cmd_exec(&config, &cmd).await,

@@ -40,6 +40,15 @@ variable "disk_size" {
   default = "4G"
 }
 
+variable "http_binary" {
+  type        = string
+  description = "Path to guest HTTP sidecar (aarch64-unknown-linux-gnu)"
+  validation {
+    condition     = length(var.http_binary) > 0
+    error_message = "Variable http_binary is required. Run 'make build-http-gnu' first."
+  }
+}
+
 variable "memory" {
   type    = number
   default = 2048
@@ -81,7 +90,7 @@ source "qemu" "debian" {
   disk_interface    = "virtio"
   boot_wait         = "60s"
   boot_key_interval = "100ms"
-  shutdown_command   = "shutdown -h now"
+  shutdown_command  = "shutdown -h now"
 
   # aarch64 では -boot once=d が使えないため無効化
   cd_files     = []
@@ -119,6 +128,11 @@ build {
   }
 
   # agent のセットアップ
+  provisioner "file" {
+    source      = var.http_binary
+    destination = "/usr/local/bin/izanagi-http-capture"
+  }
+
   provisioner "shell" {
     inline = [
       # systemd-resolved の起動を待つ (resolv.conf が有効になるまで)
@@ -161,6 +175,7 @@ build {
       "ln -sf /home/izanagi/.anyenv/envs/nodenv/shims/npm /usr/local/bin/npm",
 
       "chmod +x /usr/local/bin/izanagi-agent",
+      "chown root:root /usr/local/bin/izanagi-http-capture && chmod 0755 /usr/local/bin/izanagi-http-capture",
 
       # eBPF オブジェクトを配置
       "mkdir -p /opt/izanagi",

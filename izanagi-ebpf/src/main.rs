@@ -14,15 +14,92 @@
 
 use aya_ebpf::{
     macros::{map, tracepoint},
-    maps::RingBuf,
+    maps::{HashMap, PerCpuArray, RingBuf},
     programs::TracePointContext,
 };
+use izanagi_common::*;
 use izanagi_common::{RawSyscallEvent, SyscallCategoryId, SyscallId};
 
 /// ring buffer マップ。ユーザー空間とイベントデータを共有する。
 /// サイズは 256KB (65536 エントリ × 4 ページ)。
 #[map]
 static EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
+
+// The loader verifies this immutable ELF section before loading any probe.
+#[used]
+#[link_section = ".izanagi_abi"]
+static RAW_ABI: [u8; 16] = [
+    b'I',
+    b'Z',
+    b'A',
+    b'N',
+    b'A',
+    b'B',
+    b'I',
+    b'!',
+    RAW_ABI_VERSION as u8,
+    0,
+    0,
+    0,
+    (RAW_EVENT_SIZE & 255) as u8,
+    ((RAW_EVENT_SIZE >> 8) & 255) as u8,
+    0,
+    0,
+];
+
+#[derive(Clone, Copy)]
+struct Generation {
+    start: u64,
+    exec: u64,
+    parent_start: u64,
+    parent: u32,
+    _pad: u32,
+}
+#[derive(Clone, Copy)]
+struct SocketGeneration {
+    started: u64,
+    opaque: u64,
+    process: Generation,
+    tgid: u32,
+    tid: u32,
+}
+#[map]
+static PROCESS_GENERATIONS: HashMap<u32, Generation> = HashMap::with_max_entries(4096, 0);
+#[map]
+static OPEN_ATTEMPTS: HashMap<u64, u64> = HashMap::with_max_entries(4096, 0);
+#[map]
+static SOCKET_GENERATIONS: HashMap<u64, SocketGeneration> = HashMap::with_max_entries(4096, 0);
+#[map]
+static DROPS: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
+
+#[inline(always)]
+fn lost() {
+    unsafe {
+        if let Some(value) = DROPS.get_ptr_mut(0) {
+            *value += 1;
+        }
+    }
+}
+
+#[inline(always)]
+unsafe fn initialize(event: *mut RawSyscallEvent, kind: u32) {
+    for index in 0..core::mem::size_of::<RawSyscallEvent>() {
+        core::ptr::write_volatile(event.cast::<u8>().add(index), 0);
+    }
+    (*event).abi_version = RAW_ABI_VERSION;
+    (*event).kind = kind;
+    (*event).timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
+    let pid_tgid = aya_ebpf::helpers::bpf_get_current_pid_tgid();
+    (*event).pid = pid_tgid as u32;
+    (*event).tgid = (pid_tgid >> 32) as u32;
+    if let Some(generation) = PROCESS_GENERATIONS.get(&(*event).tgid) {
+        (*event).process_start_ns = generation.start;
+        (*event).exec_generation = generation.exec;
+        (*event).parent_start_ns = generation.parent_start;
+        (*event).parent_tgid = generation.parent;
+    }
+    aya_ebpf::helpers::gen::bpf_get_current_comm(core::ptr::addr_of_mut!((*event).comm).cast(), 16);
+}
 
 // ---------------------------------------------------------------------------
 // ヘルパー関数
@@ -41,24 +118,15 @@ fn emit_event(
     // ring buffer にエントリを予約
     let mut entry = match EVENTS.reserve::<RawSyscallEvent>(0) {
         Some(entry) => entry,
-        None => return Err(1), // ring buffer が満杯
+        None => {
+            lost();
+            return Err(1);
+        } // observable ring reservation loss
     };
 
     let event = entry.as_mut_ptr();
     unsafe {
-        // Initialize every byte (including padding) with BPF-compatible stores.
-        // LLVM must not replace the writes with an unsupported memset call.
-        for index in 0..core::mem::size_of::<RawSyscallEvent>() {
-            core::ptr::write_volatile(event.cast::<u8>().add(index), 0);
-        }
-        // bpf_ktime_get_ns() でタイムスタンプを取得
-        (*event).timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
-
-        // bpf_get_current_pid_tgid() の上位 32bit が tgid、下位 32bit が pid
-        let pid_tgid = aya_ebpf::helpers::bpf_get_current_pid_tgid();
-        (*event).pid = pid_tgid as u32;
-        (*event).tgid = (pid_tgid >> 32) as u32;
-
+        initialize(event, KIND_ENTER);
         (*event).syscall_id = syscall_id as u32;
         (*event).category = category as u8;
 
@@ -88,10 +156,22 @@ fn emit_event(
                 &mut (*event).path_buf,
             ) {
                 (*event).path_len = path.len() as u32;
+                if path.len() >= PATH_BUF_SIZE - 1 {
+                    (*event).flags |= FLAG_PATH_TRUNCATED;
+                }
+            } else {
+                (*event).flags |= FLAG_PATH_FAILED;
             }
         }
     }
 
+    if syscall_id == SyscallId::OpenAt {
+        let id = aya_ebpf::helpers::bpf_get_current_pid_tgid();
+        let now = unsafe { (*event).timestamp_ns };
+        if OPEN_ATTEMPTS.insert(&id, &now, 0).is_err() {
+            lost();
+        }
+    }
     entry.submit(0);
     Ok(())
 }
@@ -210,6 +290,211 @@ pub fn sys_enter_fork(ctx: TracePointContext) -> u32 {
         Ok(()) => 0,
         Err(_) => 1,
     }
+}
+
+/// sys_exit provides the actual return value; a missing entry is never success.
+#[tracepoint]
+pub fn sys_exit_openat(ctx: TracePointContext) -> u32 {
+    let id = aya_ebpf::helpers::bpf_get_current_pid_tgid();
+    let attempt = unsafe { OPEN_ATTEMPTS.get(&id).copied() };
+    let _ = OPEN_ATTEMPTS.remove(&id);
+    let Some(mut entry) = EVENTS.reserve::<RawSyscallEvent>(0) else {
+        lost();
+        return 1;
+    };
+    unsafe {
+        let event = entry.as_mut_ptr();
+        initialize(event, KIND_OPEN_EXIT);
+        (*event).syscall_id = SyscallId::OpenAt as u32;
+        (*event).result = match ctx.read_at::<i64>(16) {
+            Ok(value) => value,
+            Err(_) => {
+                entry.discard(0);
+                lost();
+                return 1;
+            }
+        };
+        if let Some(attempt) = attempt {
+            (*event).attempt_ns = attempt;
+        } else {
+            (*event).flags |= FLAG_STATE_MISSING;
+        }
+    }
+    entry.submit(0);
+    0
+}
+
+#[tracepoint]
+pub fn sched_process_fork(ctx: TracePointContext) -> u32 {
+    let child = match unsafe { ctx.read_at::<u32>(44) } {
+        Ok(value) => value,
+        Err(_) => {
+            lost();
+            return 1;
+        }
+    };
+    let now = unsafe { aya_ebpf::helpers::bpf_ktime_get_ns() };
+    let id = aya_ebpf::helpers::bpf_get_current_pid_tgid();
+    let parent = (id >> 32) as u32;
+    let parent_start = unsafe {
+        PROCESS_GENERATIONS
+            .get(&parent)
+            .map(|g| g.start)
+            .unwrap_or(0)
+    };
+    let generation = Generation {
+        start: now,
+        exec: 0,
+        parent_start,
+        parent,
+        _pad: 0,
+    };
+    if PROCESS_GENERATIONS.insert(&child, &generation, 0).is_err() {
+        lost();
+    }
+    // The child's first event confirms TGID. A fork tracepoint also covers threads;
+    // do not manufacture a ProcessKey for a child that is actually a TID.
+    0
+}
+
+#[tracepoint]
+pub fn sched_process_exec(_ctx: TracePointContext) -> u32 {
+    let id = aya_ebpf::helpers::bpf_get_current_pid_tgid();
+    let tgid = (id >> 32) as u32;
+    unsafe {
+        if let Some(pointer) = PROCESS_GENERATIONS.get_ptr_mut(&tgid) {
+            (*pointer).exec += 1;
+        }
+    }
+    let Some(mut entry) = EVENTS.reserve::<RawSyscallEvent>(0) else {
+        lost();
+        return 1;
+    };
+    unsafe {
+        initialize(entry.as_mut_ptr(), KIND_EXEC);
+    }
+    entry.submit(0);
+    0
+}
+
+#[tracepoint]
+pub fn sched_process_exit(_ctx: TracePointContext) -> u32 {
+    let id = aya_ebpf::helpers::bpf_get_current_pid_tgid();
+    let tid = id as u32;
+    let tgid = (id >> 32) as u32;
+    if tid == tgid {
+        if let Some(mut entry) = EVENTS.reserve::<RawSyscallEvent>(0) {
+            unsafe {
+                initialize(entry.as_mut_ptr(), KIND_EXIT);
+            }
+            entry.submit(0);
+        } else {
+            lost();
+        }
+        let _ = PROCESS_GENERATIONS.remove(&tgid);
+    } else {
+        let _ = PROCESS_GENERATIONS.remove(&tid);
+    }
+    let _ = OPEN_ATTEMPTS.remove(&id);
+    0
+}
+
+/// TCP SYN_SENT occurs in the connect caller. Other states may run in softirq:
+/// preserve the original connector rather than attributing the softirq current task.
+#[tracepoint]
+pub fn inet_sock_set_state(ctx: TracePointContext) -> u32 {
+    let address = match unsafe { ctx.read_at::<u64>(8) } {
+        Ok(v) => v,
+        Err(_) => {
+            lost();
+            return 1;
+        }
+    };
+    let state = match unsafe { ctx.read_at::<u32>(20) } {
+        Ok(v) => v,
+        Err(_) => {
+            lost();
+            return 1;
+        }
+    };
+    let protocol = unsafe { ctx.read_at::<u16>(30).unwrap_or(0) };
+    if protocol != 6 {
+        return 0;
+    }
+    let now = unsafe { aya_ebpf::helpers::bpf_ktime_get_ns() };
+    if state == 2 {
+        let id = aya_ebpf::helpers::bpf_get_current_pid_tgid();
+        let tgid = (id >> 32) as u32;
+        let process = unsafe { PROCESS_GENERATIONS.get(&tgid).copied() }.unwrap_or(Generation {
+            start: 0,
+            exec: 0,
+            parent_start: 0,
+            parent: 0,
+            _pad: 0,
+        });
+        // Opaque correlation ID, generated without exposing the kernel address.
+        let generation = SocketGeneration {
+            started: now,
+            opaque: address,
+            process,
+            tgid,
+            tid: id as u32,
+        };
+        if SOCKET_GENERATIONS.insert(&address, &generation, 0).is_err() {
+            lost();
+            return 1;
+        }
+    }
+    let generation = unsafe { SOCKET_GENERATIONS.get(&address).copied() };
+    let Some(generation) = generation else {
+        return 0;
+    }; // preexisting sockets remain unobserved
+    let Some(mut entry) = EVENTS.reserve::<RawSyscallEvent>(0) else {
+        lost();
+        return 1;
+    };
+    unsafe {
+        let event = entry.as_mut_ptr();
+        initialize(event, KIND_SOCKET);
+        (*event).timestamp_ns = now;
+        (*event).socket_address = generation.opaque;
+        (*event).socket_generation = generation.started;
+        (*event).socket_state = state;
+        (*event).pid = generation.tid;
+        (*event).tgid = generation.tgid;
+        (*event).process_start_ns = generation.process.start;
+        (*event).exec_generation = generation.process.exec;
+        (*event).parent_start_ns = generation.process.parent_start;
+        (*event).parent_tgid = generation.process.parent;
+        (*event).family = ctx.read_at::<u16>(28).unwrap_or(0);
+        (*event).source_port = ctx.read_at::<u16>(24).unwrap_or(0);
+        (*event).destination_port = ctx.read_at::<u16>(26).unwrap_or(0);
+        if (*event).family == 2 {
+            (&mut (*event).source_address)[..4]
+                .copy_from_slice(&ctx.read_at::<[u8; 4]>(32).unwrap_or([0; 4]));
+            (&mut (*event).destination_address)[..4]
+                .copy_from_slice(&ctx.read_at::<[u8; 4]>(36).unwrap_or([0; 4]));
+        } else if (*event).family == 10 {
+            // Scalar loads avoid LLVM generating unsupported BPF memset calls
+            // for the error branch of a 16-byte array read.
+            let source0 = ctx.read_at::<u64>(40).unwrap_or(0).to_ne_bytes();
+            let source1 = ctx.read_at::<u64>(48).unwrap_or(0).to_ne_bytes();
+            let destination0 = ctx.read_at::<u64>(56).unwrap_or(0).to_ne_bytes();
+            let destination1 = ctx.read_at::<u64>(64).unwrap_or(0).to_ne_bytes();
+            (&mut (*event).source_address)[..8].copy_from_slice(&source0);
+            (&mut (*event).source_address)[8..].copy_from_slice(&source1);
+            (&mut (*event).destination_address)[..8].copy_from_slice(&destination0);
+            (&mut (*event).destination_address)[8..].copy_from_slice(&destination1);
+        } else {
+            entry.discard(0);
+            return 0;
+        }
+    }
+    entry.submit(0);
+    if state == 7 {
+        let _ = SOCKET_GENERATIONS.remove(&address);
+    }
+    0
 }
 
 // ---------------------------------------------------------------------------

@@ -1,0 +1,114 @@
+{
+  "813d64e75708486b19205598d7ec8fbe587b840a2e76ef1c2149a3f81eed6b79": {
+    "answers": {
+      "result": {
+        "choice": "access_post_suspected",
+        "confidence": 0.3,
+        "probabilities": {
+          "access_post_suspected": 0.53,
+          "normal": 0.44,
+          "unknown": 0.03
+        },
+        "type": "choice"
+      }
+    },
+    "model": "jev-1.13.0",
+    "policy": {
+      "answers": {
+        "result": {
+          "disposition": "reevaluate",
+          "reason": "low_confidence"
+        }
+      },
+      "version": 1
+    },
+    "usage": {
+      "input_tokens": 633,
+      "output_tokens": 48
+    }
+  },
+  "06f7818496defce94d3fd9b9b58e97c33cd402f10e80b86cdb96af6d65b0b940": {
+    "answers": {
+      "result": {
+        "choice": "normal",
+        "confidence": 0.95,
+        "probabilities": {
+          "access_post_suspected": 0,
+          "normal": 0.97,
+          "unknown": 0.03
+        },
+        "type": "choice"
+      }
+    },
+    "model": "jev-1.13.0",
+    "policy": {
+      "answers": {
+        "result": {
+          "disposition": "accept",
+          "reason": "high_confidence"
+        }
+      },
+      "version": 1
+    },
+    "usage": {
+      "input_tokens": 623,
+      "output_tokens": 43
+    }
+  },
+  "63918ccb1be1124a4c38bee80eb252e506b9b77c48ac85df1a255a4fc6d760f0": {
+    "answers": {
+      "result": {
+        "choice": "unknown",
+        "confidence": 0.28,
+        "probabilities": {
+          "access_post_suspected": 0,
+          "normal": 0.47,
+          "unknown": 0.53
+        },
+        "type": "choice"
+      }
+    },
+    "model": "jev-1.13.0",
+    "policy": {
+      "answers": {
+        "result": {
+          "disposition": "reevaluate",
+          "reason": "open_choice_selected"
+        }
+      },
+      "version": 1
+    },
+    "usage": {
+      "input_tokens": 621,
+      "output_tokens": 43
+    }
+  },
+  "bb2313cadccf5270d6bf5b5a1250a8d06ea0337e1048c8f5f0240fdd6e3dab6a": {
+    "answers": {
+      "result": {
+        "choice": "unknown",
+        "confidence": 0.59,
+        "probabilities": {
+          "access_post_suspected": 0.02,
+          "normal": 0.25,
+          "unknown": 0.73
+        },
+        "type": "choice"
+      }
+    },
+    "model": "jev-1.13.0",
+    "policy": {
+      "answers": {
+        "result": {
+          "disposition": "reevaluate",
+          "reason": "open_choice_selected"
+        }
+      },
+      "version": 1
+    },
+    "usage": {
+      "input_tokens": 622,
+      "output_tokens": 43
+    }
+  }
+}

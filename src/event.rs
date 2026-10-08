@@ -167,6 +167,8 @@ fn redact_string(s: &str) -> String {
 pub enum SyscallResult {
     Ok(i64),
     Err(i32), // errno
+    /// Entry-only observation: the syscall has not returned yet.
+    Unknown,
 }
 
 /// Tracer から Detector へ流れる中心的なデータ型。

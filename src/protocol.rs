@@ -5,8 +5,8 @@
 //! ## ワイヤーフォーマット
 //!
 //! ```text
-//! magic (0xff) + version (2) + type (u8) + length (u32 LE) + body (postcard)
-//! Version 1 (bincode) is deliberately rejected; upgrade host and agent together.
+//! magic (0xff) + version (3) + type (u8) + length (u32 LE) + body (postcard)
+//! Older wire versions are deliberately rejected; upgrade host and agent together.
 //! ```
 
 use std::collections::HashMap;
@@ -38,6 +38,8 @@ pub enum MessageType {
     ShellClose = 10,
     ShellResize = 11,
     TraceStarted = 12,
+    Telemetry = 13,
+    StartBehavior = 14,
 }
 
 impl TryFrom<u8> for MessageType {
@@ -58,9 +60,20 @@ impl TryFrom<u8> for MessageType {
             10 => Ok(Self::ShellClose),
             11 => Ok(Self::ShellResize),
             12 => Ok(Self::TraceStarted),
+            13 => Ok(Self::Telemetry),
+            14 => Ok(Self::StartBehavior),
             _ => anyhow::bail!("unknown message type: {}", value),
         }
     }
+}
+
+/// Opt-in guest collector and proxy configuration. No credential fields exist.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BehaviorStartConfig {
+    pub session_id: String,
+    pub proxy_listen: String,
+    pub allowed_hosts: Vec<String>,
+    pub fixture_endpoint: Option<String>,
 }
 
 /// プロトコルメッセージ。
@@ -94,16 +107,32 @@ pub enum Message {
         stderr: Vec<u8>,
     },
     /// host → agent: 対話シェル起動要求。
-    Shell { rows: u16, cols: u16 },
+    Shell {
+        rows: u16,
+        cols: u16,
+    },
     /// 双方向: シェルデータストリーミング。
     /// `stream`: 0=stdin (host→agent), 1=stdout (agent→host), 2=stderr (agent→host)
-    ShellData { stream: u8, data: Vec<u8> },
+    ShellData {
+        stream: u8,
+        data: Vec<u8>,
+    },
     /// agent → host: シェル終了通知。
-    ShellClose { exit_code: i32 },
+    ShellClose {
+        exit_code: i32,
+    },
     /// host → agent: ターミナルリサイズ。
-    ShellResize { rows: u16, cols: u16 },
+    ShellResize {
+        rows: u16,
+        cols: u16,
+    },
     /// agent → host: tracing is active; emitted only after successful Start.
     TraceStarted,
+    Telemetry(Box<izanagi_telemetry::schema::TelemetryEnvelope>),
+    StartBehavior {
+        filter: crate::tracer::TraceFilter,
+        config: BehaviorStartConfig,
+    },
 }
 
 impl Message {
@@ -123,6 +152,8 @@ impl Message {
             Self::ShellClose { .. } => MessageType::ShellClose,
             Self::ShellResize { .. } => MessageType::ShellResize,
             Self::TraceStarted => MessageType::TraceStarted,
+            Self::Telemetry(_) => MessageType::Telemetry,
+            Self::StartBehavior { .. } => MessageType::StartBehavior,
         }
     }
 }
@@ -132,7 +163,7 @@ impl Message {
 /// これを超えるメッセージは不正とみなす。
 const MAX_BODY_SIZE: u32 = wire_codec::MAX_BODY_SIZE as u32;
 const WIRE_MAGIC: u8 = 0xff;
-const WIRE_VERSION: u8 = 2;
+pub const WIRE_VERSION: u8 = 3;
 
 /// シーケンス番号の最大許容ギャップ。これを超えるギャップはエラーとする。
 /// 本プロトコルは TCP 上の 1:1 接続で使用し、TCP が順序保証するため
@@ -553,21 +584,21 @@ mod tests {
     // --- encode/decode 単体テスト ---
 
     #[test]
-    fn v2_fixed_wire_fixtures() {
+    fn v3_fixed_wire_fixtures() {
         for (message, fixture) in [
-            (Message::Stop, vec![0xff, 2, 1, 1, 0, 0, 0, 1]),
-            (Message::Ready, vec![0xff, 2, 3, 1, 0, 0, 0, 3]),
-            (Message::TraceStarted, vec![0xff, 2, 12, 1, 0, 0, 0, 12]),
+            (Message::Stop, vec![0xff, 3, 1, 1, 0, 0, 0, 1]),
+            (Message::Ready, vec![0xff, 3, 3, 1, 0, 0, 0, 3]),
+            (Message::TraceStarted, vec![0xff, 3, 12, 1, 0, 0, 0, 12]),
             (
                 Message::Error("x".into()),
-                vec![0xff, 2, 4, 3, 0, 0, 0, 4, 1, b'x'],
+                vec![0xff, 3, 4, 3, 0, 0, 0, 4, 1, b'x'],
             ),
             (
                 Message::Hello {
                     authenticated: false,
                     token: None,
                 },
-                vec![0xff, 2, 5, 3, 0, 0, 0, 5, 0, 0],
+                vec![0xff, 3, 5, 3, 0, 0, 0, 5, 0, 0],
             ),
         ] {
             assert_eq!(encode_message(&message).unwrap(), fixture);
@@ -576,7 +607,7 @@ mod tests {
     }
 
     #[test]
-    fn roundtrip_every_v2_message_variant() {
+    fn roundtrip_every_v3_message_variant() {
         let messages = vec![
             make_start_message(),
             Message::Stop,

@@ -27,6 +27,7 @@ mod crypto;
 mod exec;
 mod security;
 mod shell;
+mod sidecar;
 
 use izanagi::protocol;
 use std::sync::Arc;

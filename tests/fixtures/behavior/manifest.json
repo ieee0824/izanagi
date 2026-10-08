@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "seed": 39,
+  "source_commit": "614d4861a9e495a97304deae799afc75d93de859",
+  "collector_commit": "614d4861a9e495a97304deae799afc75d93de859",
+  "vm_image_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "scenario_version": "synthetic-v1",
+  "baseline_version": "fixture-v1",
+  "model": "jev-1.13.0",
+  "question_version": 1,
+  "min_confidence": 0.6,
+  "distribution_tolerance": 0.001,
+  "confidence_tolerance": 0.01,
+  "correlated_eligibility": "confirmed_writer_complete_v1",
+  "network_eligibility": "network_complete_mask_v1",
+  "scenarios": [
+    {
+      "id": "normal",
+      "family": "normal",
+      "split": "development",
+      "events": "normal.jsonl",
+      "routine_workload": true,
+      "labels": [
+        {
+          "window_id": "fixture-normal:proxy:1",
+          "expected": "normal"
+        }
+      ],
+      "events_sha256": "086cc267c92abb45229b1eeff5f8372ab174155e0c11aa24e76a41a387ac56d2"
+    },
+    {
+      "id": "access-post",
+      "family": "access-post",
+      "split": "held_out",
+      "events": "access-post.jsonl",
+      "routine_workload": false,
+      "labels": [
+        {
+          "window_id": "fixture-access-post:proxy:1",
+          "expected": "suspicious"
+        }
+      ],
+      "events_sha256": "e4c367952d054991f5213438f92575477baae7bb5e1687d893d82f48e0ef740c"
+    },
+    {
+      "id": "event-loss",
+      "family": "event-loss",
+      "split": "held_out",
+      "events": "event-loss.jsonl",
+      "routine_workload": false,
+      "labels": [
+        {
+          "window_id": "fixture-event-loss:proxy:1",
+          "expected": "suspicious"
+        }
+      ],
+      "events_sha256": "7b20163941d1d395d72f1b55195a149f959f8c37a6457f3a67f8acfe09689d40"
+    }
+  ],
+  "feature_version": 1,
+  "host_policy_version": 1,
+  "promotion_policy": "audit_only_no_automatic_promotion_v1",
+  "mcp_commit": null
+}

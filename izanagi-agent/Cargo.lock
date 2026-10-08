@@ -556,6 +556,7 @@ dependencies = [
  "hex",
  "hmac",
  "izanagi-common",
+ "izanagi-telemetry",
  "libc",
  "postcard",
  "rand",
@@ -578,9 +579,11 @@ dependencies = [
  "chrono",
  "hex",
  "izanagi",
+ "izanagi-telemetry",
  "libc",
  "rand",
  "serde",
+ "serde_json",
  "sha2",
  "smallvec",
  "subtle",
@@ -590,6 +593,17 @@ dependencies = [
 [[package]]
 name = "izanagi-common"
 version = "0.1.0"
+
+[[package]]
+name = "izanagi-telemetry"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2",
+]
 
 [[package]]
 name = "js-sys"

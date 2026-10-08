@@ -12,6 +12,7 @@ AGENT_TARGET := $(AGENT_TARGET_MUSL)
 AGENT_BINARY := izanagi-agent/target/$(AGENT_TARGET)/release/izanagi-agent
 AGENT_BINARY_GNU := izanagi-agent/target/$(AGENT_TARGET_GNU)/release/izanagi-agent
 EBPF_BINARY := izanagi-ebpf/target/bpfel-unknown-none/release/izanagi-ebpf
+HTTP_BINARY_GNU := izanagi-http-capture/target/$(AGENT_TARGET_GNU)/release/izanagi-http-capture
 # Keep LLVM bitcode compatible with the macOS LLVM 22 BPF linker.
 EBPF_TOOLCHAIN ?= nightly-2026-02-12
 IMAGE_NAME := izanagi-vm
@@ -38,13 +39,17 @@ build-agent: ## agent を Linux musl クロスビルド (cargo-zigbuild 必要)
 build-agent-gnu: ## agent を Linux glibc クロスビルド (cargo-zigbuild 必要)
 	cd izanagi-agent && cargo zigbuild --target $(AGENT_TARGET_GNU) --release --features ebpf
 
+.PHONY: build-http-gnu
+build-http-gnu: ## guest HTTP sidecar を Linux glibc クロスビルド
+	cd izanagi-http-capture && cargo zigbuild --target $(AGENT_TARGET_GNU) --release --locked
+
 .PHONY: build-ebpf
 build-ebpf: ## eBPF プログラムをビルド (nightly + bpf-linker + LLVM 必要)
 	cd izanagi-ebpf && DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/opt/llvm/lib \
 		cargo +$(EBPF_TOOLCHAIN) build --target bpfel-unknown-none --release -Z build-std=core
 
 .PHONY: build-all
-build-all: build build-agent build-ebpf ## ホスト + agent + eBPF を全ビルド
+build-all: build build-agent build-ebpf build-http-gnu ## ホスト + agent + eBPF + HTTP sidecar を全ビルド
 
 # --- インストール ---
 
@@ -102,26 +107,29 @@ image-alpine-quick: ## Alpine コンテナイメージをビルド (既存 agent
 # --- QEMU イメージ ---
 
 .PHONY: qemu-image
-qemu-image: build-agent-gnu build-ebpf ## QEMU qcow2 イメージをビルド (Debian, Packer + agent + eBPF ビルド)
+qemu-image: build-agent-gnu build-ebpf build-http-gnu ## QEMU qcow2 イメージをビルド (Debian, agent + eBPF + HTTP sidecar)
 	cd $(PACKER_DIR) && packer init debian.pkr.hcl
 	rm -rf $(PACKER_DIR)/output-debian
 	cd $(PACKER_DIR) && PACKER_LOG=1 PACKER_LOG_PATH=packer.log packer build \
 		-var "agent_binary=../$(AGENT_BINARY_GNU)" \
 		-var "ebpf_binary=../$(EBPF_BINARY)" \
+		-var "http_binary=../$(HTTP_BINARY_GNU)" \
 		debian.pkr.hcl
 	mkdir -p $(QEMU_IMAGE_DIR)
 	cp $(PACKER_DIR)/output-debian/debian-aarch64.qcow2 $(QEMU_IMAGE_DIR)/
 	@echo "Done! QEMU image: $(QEMU_IMAGE_DIR)/debian-aarch64.qcow2"
 
 .PHONY: qemu-image-quick
-qemu-image-quick: ## QEMU qcow2 イメージをビルド (Debian, 既存 agent + eBPF バイナリを使用)
+qemu-image-quick: ## QEMU qcow2 イメージをビルド (Debian, 既存 agent + eBPF + HTTP sidecar)
 	@test -f $(AGENT_BINARY_GNU) || (echo "Error: $(AGENT_BINARY_GNU) not found. Run 'make build-agent-gnu' first." && exit 1)
 	@test -f $(EBPF_BINARY) || (echo "Error: $(EBPF_BINARY) not found. Run 'make build-ebpf' first." && exit 1)
+	@test -f $(HTTP_BINARY_GNU) || (echo "Error: $(HTTP_BINARY_GNU) not found. Run 'make build-http-gnu' first." && exit 1)
 	cd $(PACKER_DIR) && packer init debian.pkr.hcl
 	rm -rf $(PACKER_DIR)/output-debian
 	cd $(PACKER_DIR) && PACKER_LOG=1 PACKER_LOG_PATH=packer.log packer build \
 		-var "agent_binary=../$(AGENT_BINARY_GNU)" \
 		-var "ebpf_binary=../$(EBPF_BINARY)" \
+		-var "http_binary=../$(HTTP_BINARY_GNU)" \
 		debian.pkr.hcl
 	mkdir -p $(QEMU_IMAGE_DIR)
 	cp $(PACKER_DIR)/output-debian/debian-aarch64.qcow2 $(QEMU_IMAGE_DIR)/

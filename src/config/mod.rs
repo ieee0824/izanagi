@@ -40,6 +40,8 @@ pub enum TracerBackend {
 /// izanagi.toml のトップレベル構造体。
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
+    #[serde(default)]
+    pub behavior: crate::behavior_config::BehaviorSection,
     pub sandbox: SandboxSection,
     pub share: ShareSection,
     pub monitor: MonitorSection,
@@ -272,6 +274,16 @@ impl Config {
 
     /// プラットフォーム判定を引数として受け取るバリデーション。テストで各プラットフォームの挙動を検証可能。
     fn validate_for_platform(&self, is_linux: bool, is_macos: bool) -> anyhow::Result<Vec<String>> {
+        self.behavior.validate()?;
+        if self.behavior.enabled
+            && (self.sandbox.backend != SandboxBackend::Qemu
+                || self.sandbox.tracer != TracerBackend::VmAgent)
+        {
+            bail!("behavior PoC requires sandbox.backend=qemu and tracer=vm-agent");
+        }
+        if self.behavior.enabled && self.sandbox.require_auth == Some(false) {
+            bail!("behavior PoC requires token/HMAC authentication");
+        }
         // backend=qemu の場合は qemu セクションが必要
         if self.sandbox.backend == SandboxBackend::Qemu && self.sandbox.qemu.is_none() {
             bail!("sandbox.backend が \"qemu\" の場合、[sandbox.qemu] セクションが必要です");
