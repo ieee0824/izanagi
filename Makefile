@@ -17,12 +17,16 @@ IMAGE_DIR := image
 PACKER_DIR := packer
 INSTALL_DIR := $(HOME)/.izanagi/bin
 QEMU_IMAGE_DIR := $(HOME)/.izanagi/images
+HOST_FEATURES :=
+ifeq ($(shell uname -s),Linux)
+HOST_FEATURES := --features landlock,ebpf
+endif
 
 # --- ビルド ---
 
 .PHONY: build
 build: ## ホスト側バイナリをビルド
-	cargo build --release
+	cargo build --release $(HOST_FEATURES)
 
 .PHONY: build-agent
 build-agent: ## agent を Linux musl クロスビルド (cargo-zigbuild 必要)
@@ -144,7 +148,7 @@ qemu-image-alpine-quick: ## Alpine QEMU qcow2 イメージをビルド (既存 a
 
 .PHONY: test
 test: ## テスト実行
-	cargo test
+	cargo test $(HOST_FEATURES)
 
 .PHONY: test-all
 test-all: test test-agent ## 全クレートのテスト実行
@@ -155,7 +159,7 @@ test-agent: ## agent のテスト実行
 
 .PHONY: lint
 lint: ## clippy + fmt チェック
-	cargo clippy -- -D warnings
+	cargo clippy $(HOST_FEATURES) -- -D warnings
 	cargo fmt -- --check
 
 # --- コンテナ起動 ---

@@ -1,8 +1,13 @@
 use std::collections::HashMap;
+#[cfg(unix)]
+use std::future::Future;
+use std::io;
 use std::path::Path;
 use std::sync::Arc;
 
 use izanagi::config::Config;
+use izanagi::engine::Engine;
+use izanagi::log_storage::LogStorage;
 use izanagi::pcap_writer::PcapWriter;
 use izanagi::proxy_manager::ProxyManager;
 use izanagi::session::{self, Session};
@@ -43,21 +48,24 @@ pub async fn cmd_up(
         }
     }
 
-    // PID ファイルを書き込む
-    write_pid_file()?;
-
-    // セッション情報を保存（exec/shell から接続するため）
     let iza_dir = izanagi_dir();
-    if let Some(backend) = engine.sandbox().session_backend() {
-        let sess = Session {
-            backend,
-            pid: std::process::id(),
-            started_at: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-        };
-        session::save_session(&iza_dir, &sess)?;
+    let runtime_state_result = persist_runtime_state(
+        &iza_dir,
+        engine.sandbox().session_backend(),
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+        write_pid_file,
+    );
+    if let Err(startup_error) = runtime_state_result {
+        if let Err(e) =
+            cleanup_running_resources(&mut proxy_manager, &mut engine, &log_storage, &iza_dir).await
+        {
+            eprintln!("警告: 起動失敗後のクリーンアップにも失敗しました: {}", e);
+        }
+        return Err(startup_error);
     }
 
     println!(
@@ -68,10 +76,10 @@ pub async fn cmd_up(
     // Ctrl+C を待ちつつ、定期的に LogStorage をフラッシュする。
     // logs -f (別プロセス) がリアルタイムでログを読めるようにするため。
     let mut flush_interval = tokio::time::interval(std::time::Duration::from_secs(1));
-    let ctrl_c = tokio::signal::ctrl_c();
-    tokio::pin!(ctrl_c);
+    let shutdown_signal = wait_for_shutdown_signal();
+    tokio::pin!(shutdown_signal);
     let mut flush_error_warned = false;
-    loop {
+    let wait_result = loop {
         tokio::select! {
             _ = flush_interval.tick() => {
                 let storage = log_storage.clone();
@@ -91,25 +99,97 @@ pub async fn cmd_up(
                     }
                 }
             }
-            _ = &mut ctrl_c => {
-                break;
+            result = &mut shutdown_signal => {
+                break result;
             }
         }
-    }
+    };
 
     println!("\nシャットダウン中...");
-    // クリーンアップは stop/flush の成否に関わらず必ず実行する
+    let cleanup_result =
+        cleanup_running_resources(&mut proxy_manager, &mut engine, &log_storage, &iza_dir).await;
+    wait_result?;
+    cleanup_result?;
+    println!("サンドボックスを停止しました。");
+
+    Ok(0)
+}
+
+fn persist_runtime_state<F>(
+    iza_dir: &Path,
+    backend: Option<izanagi::session::SessionBackend>,
+    pid: u32,
+    started_at: u64,
+    write_pid: F,
+) -> anyhow::Result<()>
+where
+    F: FnOnce() -> anyhow::Result<()>,
+{
+    write_pid()?;
+    if let Some(backend) = backend {
+        let sess = Session {
+            backend,
+            pid,
+            started_at,
+        };
+        session::save_session(iza_dir, &sess)?;
+    }
+    Ok(())
+}
+
+/// 起動済みリソースを停止し、状態ファイルを必ず削除する。
+///
+/// 停止やflushの失敗は警告として記録する。起動途中の本来のエラーを上書きせず、
+/// 可能なクリーンアップを最後まで継続するためである。
+async fn cleanup_running_resources(
+    proxy_manager: &mut ProxyManager,
+    engine: &mut Engine,
+    log_storage: &LogStorage,
+    iza_dir: &Path,
+) -> anyhow::Result<()> {
     proxy_manager.stop().await;
     let stop_result = engine.stop().await;
     let flush_result = log_storage.flush();
-    session::remove_session(&iza_dir);
+    session::remove_session(iza_dir);
     remove_pid_file();
     remove_lock_file();
     stop_result?;
     flush_result?;
-    println!("サンドボックスを停止しました。");
+    Ok(())
+}
 
-    Ok(0)
+/// Ctrl+C (SIGINT) または SIGTERM の最初の受信まで待機する。
+///
+/// `izanagi down` は SIGTERM を送信するため、SIGINT と同じ正常終了経路へ流して
+/// sandbox・proxy・状態ファイルを確実にクリーンアップする。
+#[cfg(unix)]
+async fn wait_for_shutdown_signal() -> io::Result<()> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut terminate = signal(SignalKind::terminate())?;
+    wait_for_first_shutdown_signal(tokio::signal::ctrl_c(), async move {
+        let _ = terminate.recv().await;
+    })
+    .await
+}
+
+#[cfg(not(unix))]
+async fn wait_for_shutdown_signal() -> io::Result<()> {
+    tokio::signal::ctrl_c().await
+}
+
+#[cfg(unix)]
+async fn wait_for_first_shutdown_signal<C, T>(ctrl_c: C, terminate: T) -> io::Result<()>
+where
+    C: Future<Output = io::Result<()>>,
+    T: Future<Output = ()>,
+{
+    tokio::pin!(ctrl_c);
+    tokio::pin!(terminate);
+    tokio::select! {
+        result = &mut ctrl_c => result,
+        _ = &mut terminate => Ok(()),
+    }
 }
 
 /// CA 証明書をサンドボックス内にインストールする。
@@ -200,5 +280,73 @@ async fn install_ca_cert(sandbox: &dyn izanagi::sandbox::Sandbox, ca_path: &Path
                 "[proxy] CA 証明書の信頼ストア更新に失敗: {e} — 手動で update-ca-certificates を実行してください"
             );
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::{persist_runtime_state, wait_for_first_shutdown_signal};
+    use izanagi::session::{self, SessionBackend};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn test_dir() -> std::path::PathBuf {
+        let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+        std::env::temp_dir().join(format!("izanagi-up-test-{}-{}", std::process::id(), id))
+    }
+
+    #[tokio::test]
+    async fn shutdown_waiter_accepts_sigint_path() {
+        let ctrl_c = std::future::ready(Ok(()));
+        let terminate = std::future::pending();
+        wait_for_first_shutdown_signal(ctrl_c, terminate)
+            .await
+            .expect("SIGINT path should complete successfully");
+    }
+
+    #[tokio::test]
+    async fn shutdown_waiter_accepts_sigterm_path() {
+        let ctrl_c = std::future::pending();
+        let terminate = std::future::ready(());
+        wait_for_first_shutdown_signal(ctrl_c, terminate)
+            .await
+            .expect("SIGTERM path should complete successfully");
+    }
+
+    #[tokio::test]
+    async fn shutdown_waiter_propagates_sigint_handler_error() {
+        let ctrl_c = std::future::ready(Err(std::io::Error::other("signal error")));
+        let terminate = std::future::pending();
+        assert!(
+            wait_for_first_shutdown_signal(ctrl_c, terminate)
+                .await
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn runtime_state_stops_when_pid_write_fails() {
+        let dir = test_dir();
+        let result = persist_runtime_state(&dir, None, 1, 1, || anyhow::bail!("pid write failed"));
+        assert!(result.is_err());
+        assert!(!session::session_file_path(&dir).exists());
+    }
+
+    #[test]
+    fn runtime_state_reports_session_write_failure() {
+        let parent = test_dir();
+        std::fs::create_dir_all(&parent).expect("create temporary directory");
+        let invalid_dir = parent.join("not-a-directory");
+        std::fs::write(&invalid_dir, "file blocks directory creation")
+            .expect("create blocking file");
+        let backend = SessionBackend::Qemu {
+            host_port: 9001,
+            token_hash: None,
+        };
+
+        let result = persist_runtime_state(&invalid_dir, Some(backend), 1, 1, || Ok(()));
+        assert!(result.is_err());
+        let _ = std::fs::remove_dir_all(parent);
     }
 }

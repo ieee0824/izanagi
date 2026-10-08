@@ -422,7 +422,10 @@ mod tests {
             let mut event = RawSyscallEvent {
                 timestamp_ns: 1_000_000_000,
                 pid: 42,
+                tgid: 42,
                 syscall_id,
+                category: 0,
+                _pad: [0u8; 3],
                 arg0: 0,
                 arg1: 0,
                 arg2: 0,

@@ -20,6 +20,14 @@ use crate::util::sha256_hex;
 
 /// Config の `sandbox.backend` からプラットフォームに応じた Sandbox 実装を選択する。
 pub fn select_sandbox(config: &Config) -> anyhow::Result<Box<dyn Sandbox>> {
+    #[cfg(all(target_os = "linux", not(feature = "landlock")))]
+    if config.sandbox.backend == SandboxBackend::Native {
+        bail!(
+            "Linux の native サンドボックスには landlock feature が必要です。\
+             `cargo build --release --features landlock,ebpf` で再ビルドしてください"
+        );
+    }
+
     select_sandbox_for_platform(config, cfg!(target_os = "linux"), cfg!(target_os = "macos"))
 }
 
@@ -51,6 +59,17 @@ fn select_sandbox_for_platform(
 
 /// Config の `sandbox.tracer` からプラットフォームに応じた Tracer 実装を選択する。
 pub fn select_tracer(config: &Config) -> anyhow::Result<Box<dyn Tracer>> {
+    #[cfg(all(target_os = "linux", not(feature = "ebpf")))]
+    if config.sandbox.tracer == TracerBackend::Ebpf
+        || (config.sandbox.tracer == TracerBackend::Auto
+            && config.sandbox.backend == SandboxBackend::Native)
+    {
+        bail!(
+            "Linux の eBPF トレーサーには ebpf feature が必要です。\
+             `cargo build --release --features landlock,ebpf` で再ビルドしてください"
+        );
+    }
+
     select_tracer_for_platform(config, cfg!(target_os = "linux"), cfg!(target_os = "macos"))
 }
 
