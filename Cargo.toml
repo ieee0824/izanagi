@@ -39,4 +39,4 @@ izanagi-common = { path = "izanagi-common", features = ["user"], optional = true
 landlock = { version = "0.4", optional = true }
 
 [dev-dependencies]
-serial_test = "3"
+serial_test = "4"
