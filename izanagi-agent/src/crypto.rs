@@ -5,25 +5,15 @@ pub(crate) fn sha256_hex(input: &str) -> String {
     hex::encode(hash)
 }
 
-/// HMAC ベースの定数時間比較。
-/// 両方の入力を HMAC に通して結果を比較することで、
-/// タイミング攻撃を防ぐ。
+/// SHA256 ダイジェストの定数時間比較。秘密鍵・固定鍵は不要。
+/// ハッシュ計算時間は入力長に依存するが、比較は内容による早期終了をしない。
 pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    use hmac::{Hmac, KeyInit, Mac};
-    use sha2::Sha256;
+    use sha2::{Digest, Sha256};
+    use subtle::ConstantTimeEq;
 
-    type HmacSha256 = Hmac<Sha256>;
-    // 固定キーで a の HMAC を計算し、b の HMAC と verify で比較する。
-    // verify は内部で subtle::ConstantTimeEq を使い、定数時間比較を保証する。
-    let key = b"izanagi-constant-time-compare";
-    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC can take key of any size");
-    mac.update(a);
-
-    let mut mac_b = HmacSha256::new_from_slice(key).expect("HMAC can take key of any size");
-    mac_b.update(b);
-    let tag_b = mac_b.finalize().into_bytes();
-
-    mac.verify(&tag_b).is_ok()
+    let digest_a = Sha256::digest(a);
+    let digest_b = Sha256::digest(b);
+    bool::from(digest_a.as_slice().ct_eq(digest_b.as_slice()))
 }
 
 #[cfg(test)]
@@ -64,5 +54,15 @@ mod tests {
     #[test]
     fn constant_time_eq_different_length() {
         assert!(!constant_time_eq(b"short", b"longer string"));
+    }
+
+    #[test]
+    fn constant_time_eq_rejects_changes_at_every_position() {
+        let input = [42u8; 64];
+        for index in 0..input.len() {
+            let mut changed = input;
+            changed[index] ^= 1;
+            assert!(!constant_time_eq(&input, &changed));
+        }
     }
 }

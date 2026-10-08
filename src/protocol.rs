@@ -742,7 +742,7 @@ mod tests {
 
     #[tokio::test]
     async fn authenticated_roundtrip_all_message_types() {
-        let key = b"test-hmac-signing-key-1234567890";
+        let key = &rand::random::<[u8; 32]>();
         let messages = vec![
             make_start_message(),
             Message::Stop,
@@ -781,8 +781,10 @@ mod tests {
 
     #[tokio::test]
     async fn authenticated_rejects_wrong_key() {
-        let key = b"correct-hmac-key-for-testing-abc";
-        let wrong_key = b"wrong-hmac-key-for-testing-1234";
+        let key = &rand::random::<[u8; 32]>();
+        let mut wrong_key_bytes = *key;
+        wrong_key_bytes[0] ^= 1;
+        let wrong_key = &wrong_key_bytes;
 
         let (mut client, mut server) = tokio::io::duplex(4096);
 
@@ -805,7 +807,7 @@ mod tests {
 
     #[tokio::test]
     async fn authenticated_rejects_tampered_body() {
-        let key = b"test-hmac-key-for-tamper-detect";
+        let key = &rand::random::<[u8; 32]>();
 
         let encoded = encode_message_authenticated(&Message::Ready, key, 0).unwrap();
         // ボディを改竄 (type バイトを変更)
@@ -820,7 +822,7 @@ mod tests {
 
     #[tokio::test]
     async fn authenticated_rejects_body_tamper() {
-        let key = b"test-hmac-key-for-body-tamper-00";
+        let key = &rand::random::<[u8; 32]>();
 
         // body を持つメッセージをエンコード
         let msg = Message::Error("hello world".to_string());
@@ -848,7 +850,7 @@ mod tests {
 
     #[tokio::test]
     async fn authenticated_rejects_replayed_sequence() {
-        let key = b"test-hmac-key-for-replay-detect";
+        let key = &rand::random::<[u8; 32]>();
 
         // sequence=0 のメッセージをエンコード
         let encoded = encode_message_authenticated(&Message::Ready, key, 0).unwrap();
@@ -876,7 +878,7 @@ mod tests {
 
     #[tokio::test]
     async fn authenticated_rejects_skipped_sequence() {
-        let key = b"test-hmac-key-for-skip-sequence";
+        let key = &rand::random::<[u8; 32]>();
 
         // sequence=5 のメッセージをエンコード（0〜4 をスキップ）
         let encoded = encode_message_authenticated(&Message::Ready, key, 5).unwrap();
@@ -1000,7 +1002,7 @@ mod tests {
 
     #[tokio::test]
     async fn authenticated_write_rejects_sequence_overflow() {
-        let secret = b"test-secret-for-overflow-check!";
+        let secret = &rand::random::<[u8; 32]>();
         let (_client, server) = tokio::io::duplex(4096);
         let (_reader, mut writer) = tokio::io::split(server);
         let mut seq = u64::MAX;
