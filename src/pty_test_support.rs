@@ -3,6 +3,13 @@ use izanagi::{protocol::Message, protocol_client::ProtocolClient};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::process::CommandExt;
 
+struct TestKeyFile(std::path::PathBuf);
+impl Drop for TestKeyFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 pub(crate) fn exercise(probe: &str, mode: &'static str) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -18,6 +25,9 @@ pub(crate) fn exercise(probe: &str, mode: &'static str) {
         .open(&key_path)
         .unwrap();
     key_file.write_all(&auth_key).unwrap();
+    let _key_cleanup = TestKeyFile(key_path.clone());
+    let (resize, resize_rx) = std::sync::mpsc::channel();
+    let (input, input_rx) = std::sync::mpsc::channel();
     let server = std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -31,8 +41,8 @@ pub(crate) fn exercise(probe: &str, mode: &'static str) {
                     .await
                     .unwrap()
                     .unwrap();
-            let (reader, writer) = stream.into_split();
-            let mut peer = ProtocolClient::new(reader, writer, Some(auth_key));
+            let (mut reader, mut writer) = stream.into_split();
+            let mut peer = ProtocolClient::new(&mut reader, &mut writer, Some(auth_key.clone()));
             peer.recv_message().await.unwrap();
             peer.send_message(&Message::Hello {
                 authenticated: true,
@@ -56,9 +66,89 @@ pub(crate) fn exercise(probe: &str, mode: &'static str) {
                     .send_message(&Message::Error("shell test error".into()))
                     .await
                     .unwrap(),
+                "nonzero" => peer
+                    .send_message(&Message::ShellClose { exit_code: 42 })
+                    .await
+                    .unwrap(),
+                "unexpected" => peer.send_message(&Message::Ready).await.unwrap(),
+                "roundtrip" => {
+                    peer.send_message(&Message::ShellData {
+                        stream: 1,
+                        data: b"shell-output-marker".to_vec(),
+                    })
+                    .await
+                    .unwrap();
+                    input.send(()).unwrap();
+                    let mut got_input = false;
+                    let mut got_resize = false;
+                    while !got_input || !got_resize {
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(2),
+                            peer.recv_message(),
+                        )
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        {
+                            Some(Message::ShellData { stream: 0, data }) => {
+                                assert_eq!(data, b"echo qa\n");
+                                got_input = true;
+                            }
+                            Some(Message::ShellResize {
+                                rows: 43,
+                                cols: 119,
+                            }) => got_resize = true,
+                            other => panic!("unexpected roundtrip input: {other:?}"),
+                        }
+                    }
+                    peer.send_message(&Message::ShellClose { exit_code: 0 })
+                        .await
+                        .unwrap();
+                }
                 "disconnect" => {}
                 "cancel" => {
                     assert!(peer.recv_message().await.unwrap().is_none());
+                }
+                "fragment-resize" => {
+                    drop(peer);
+                    let mut frame = Vec::new();
+                    let mut sequence = 2; // Hello and Ready already sent.
+                    izanagi::protocol::write_message_authenticated(
+                        &mut frame,
+                        &Message::ShellData {
+                            stream: 1,
+                            data: b"fragment-output".to_vec(),
+                        },
+                        &auth_key,
+                        &mut sequence,
+                    )
+                    .await
+                    .unwrap();
+                    use tokio::io::AsyncWriteExt;
+                    writer.write_all(&frame[..1]).await.unwrap();
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    resize.send(()).unwrap();
+                    // Wait for actual resize processing, rather than relying on scheduling.
+                    assert!(matches!(
+                        izanagi::protocol::read_message_authenticated(
+                            &mut reader,
+                            &auth_key,
+                            &mut 2
+                        )
+                        .await
+                        .unwrap(),
+                        Some(Message::ShellResize { .. })
+                    ));
+                    writer.write_all(&frame[1..]).await.unwrap();
+                    // Host can disconnect after the framing failure; avoid obscuring
+                    // the child's success assertion with a secondary BrokenPipe.
+                    let _ = izanagi::protocol::write_message_authenticated(
+                        &mut writer,
+                        &Message::ShellClose { exit_code: 0 },
+                        &auth_key,
+                        &mut sequence,
+                    )
+                    .await;
                 }
                 _ => unreachable!(),
             }
@@ -133,6 +223,23 @@ pub(crate) fn exercise(probe: &str, mode: &'static str) {
         if unsafe { libc::tcgetattr(slave.as_raw_fd(), &mut current) } == 0 {
             saw_raw_mode |= current.c_lflag & (libc::ICANON | libc::ECHO) == 0;
         }
+        if resize_rx.try_recv().is_ok() {
+            assert_eq!(unsafe { libc::kill(child.id() as _, libc::SIGWINCH) }, 0);
+        }
+        if input_rx.try_recv().is_ok() {
+            master.write_all(b"echo qa\n").unwrap();
+            let size = libc::winsize {
+                ws_row: 43,
+                ws_col: 119,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            };
+            assert_eq!(
+                unsafe { libc::ioctl(slave.as_raw_fd(), libc::TIOCSWINSZ, &size) },
+                0
+            );
+            assert_eq!(unsafe { libc::kill(child.id() as _, libc::SIGWINCH) }, 0);
+        }
         if let Some(status) = child.try_wait().unwrap() {
             break status;
         }
@@ -153,6 +260,12 @@ pub(crate) fn exercise(probe: &str, mode: &'static str) {
         String::from_utf8_lossy(&output)
     );
     assert!(saw_raw_mode, "probe must have actually entered raw mode");
+    if mode == "roundtrip" {
+        assert!(
+            String::from_utf8_lossy(&output).contains("shell-output-marker"),
+            "shell output was not relayed"
+        );
+    }
     // macOS revokes the slave on session-leader exit. The child asserts exact
     // termios restoration before exiting; Linux can additionally inspect it here.
     #[cfg(target_os = "linux")]
@@ -172,7 +285,6 @@ pub(crate) fn exercise(probe: &str, mode: &'static str) {
     );
     drop(master);
     server.join().unwrap();
-    std::fs::remove_file(key_path).unwrap();
 }
 
 pub(crate) fn terminal_snapshot() -> (libc::termios, libc::c_int) {

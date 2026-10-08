@@ -1,6 +1,6 @@
 //! PTY forwarding and bounded child-process cleanup.
 use crate::connection::{recv_message, send_message};
-use izanagi::protocol::Message;
+use izanagi::protocol::{Message, MessageReader};
 
 /// Owns the shell until it has been reaped, including on task cancellation.
 pub(crate) struct ShellChild {
@@ -123,7 +123,7 @@ impl Drop for ShellChild {
 }
 
 pub(crate) async fn relay_shell<R, W>(
-    reader: &mut R,
+    reader: &mut MessageReader<R>,
     writer: &mut W,
     auth_key: Option<&[u8]>,
     send_seq: &mut u64,
@@ -247,7 +247,7 @@ where
 
 #[cfg(all(test, target_os = "linux"))]
 mod shell_cleanup {
-    use super::{ShellChild, relay_shell};
+    use super::{MessageReader, ShellChild, relay_shell};
     use izanagi::protocol::{self, Message};
     use std::os::fd::FromRawFd;
     use tokio::io::AsyncWriteExt;
@@ -327,7 +327,8 @@ mod shell_cleanup {
             let auth_key = rand::random::<[u8; 32]>();
             let (host, agent) = tokio::io::duplex(8192);
             let (mut host_reader, mut host_writer) = tokio::io::split(host);
-            let (mut reader, mut writer) = tokio::io::split(agent);
+            let (reader, mut writer) = tokio::io::split(agent);
+            let mut reader = MessageReader::new(reader);
             let task = tokio::spawn(async move {
                 relay_shell(
                     &mut reader,
@@ -400,7 +401,8 @@ mod shell_cleanup {
     async fn cleanup_kills_group_members_after_shell_has_exited() {
         let (master, child, pid) = shell("trap '' HUP TERM; sleep 60 & printf '%s' \"$!\"; exit 0");
         let (mut host, agent) = tokio::io::duplex(8192);
-        let (mut reader, mut writer) = tokio::io::split(agent);
+        let (reader, mut writer) = tokio::io::split(agent);
+        let mut reader = MessageReader::new(reader);
         let task = tokio::spawn(async move {
             relay_shell(
                 &mut reader,
@@ -455,7 +457,8 @@ mod shell_cleanup {
             shell("trap '' HUP TERM; printf ready; while :; do sleep 1; done");
         let (mut host, mut agent) = tokio::io::duplex(8192);
         let task = tokio::spawn(async move {
-            let (mut reader, mut writer) = tokio::io::split(&mut agent);
+            let (reader, mut writer) = tokio::io::split(&mut agent);
+            let mut reader = MessageReader::new(reader);
             relay_shell(
                 &mut reader,
                 &mut writer,
@@ -514,7 +517,8 @@ mod shell_cleanup {
     async fn shell_send_error_reaps_child() {
         let (master, child, pid) =
             shell("trap '' HUP TERM; printf ready; while :; do sleep 1; done");
-        let (_host, mut reader) = tokio::io::duplex(64);
+        let (_host, reader) = tokio::io::duplex(64);
+        let mut reader = MessageReader::new(reader);
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             relay_shell(
@@ -531,5 +535,68 @@ mod shell_cleanup {
         .unwrap();
         assert!(result.is_err());
         assert_reaped(pid);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shell_output_does_not_discard_partial_host_frame() {
+        for authenticated in [false, true] {
+            let (master, child, pid) = shell("sleep 0.1; printf ready; while :; do sleep 1; done");
+            let auth_key = authenticated.then(|| rand::random::<[u8; 32]>());
+            let (host, agent) = tokio::io::duplex(8192);
+            let (mut host_reader, mut host_writer) = tokio::io::split(host);
+            let (reader, mut writer) = tokio::io::split(agent);
+            let mut reader = MessageReader::new(reader);
+            let task = tokio::spawn(async move {
+                relay_shell(
+                    &mut reader,
+                    &mut writer,
+                    auth_key.as_ref().map(|key| &key[..]),
+                    &mut 0,
+                    &mut 0,
+                    master,
+                    child,
+                )
+                .await
+            });
+            let mut frame = Vec::new();
+            match auth_key.as_ref() {
+                Some(key) => {
+                    protocol::write_message_authenticated(&mut frame, &Message::Stop, key, &mut 0)
+                        .await
+                        .unwrap()
+                }
+                None => protocol::write_message(&mut frame, &Message::Stop)
+                    .await
+                    .unwrap(),
+            }
+            host_writer.write_all(&frame[..1]).await.unwrap();
+            // Receiving PTY output proves the competing select branch ran while
+            // the host Stop frame was incomplete.
+            let mut host_reader = MessageReader::new(&mut host_reader);
+            let mut sequence = 0;
+            let output = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                host_reader.recv(auth_key.as_ref().map(|key| &key[..]), &mut sequence),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(matches!(output, Some(Message::ShellData { data, .. }) if data == b"ready"));
+            host_writer.write_all(&frame[1..]).await.unwrap();
+            let close = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                host_reader.recv(auth_key.as_ref().map(|key| &key[..]), &mut sequence),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(matches!(close, Some(Message::ShellClose { .. })));
+            tokio::time::timeout(std::time::Duration::from_secs(5), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_reaped(pid);
+        }
     }
 }

@@ -75,3 +75,13 @@ There is no fallback to accepting Ready or an Event as a tracing acknowledgement
 With monitoring enabled, exec/shell are interrupted when the event stream fails,
 and the CLI stops the sandbox. `up` also stops the sandbox and removes its session
 state on monitoring loss. `--tracer none` deliberately opts out of this policy.
+
+## Cancellable receives
+
+Host clients and agent connections keep a `MessageReader` for the lifetime of
+the connection, including handshake, tracing and shell transitions. A cancelled
+receive preserves its partial header, body and authentication trailer; the next
+receive resumes the same frame. Receive sequence numbers advance only after full
+authentication and message validation. Malformed/truncated frames require closing
+the connection. The existing one-shot `read_message*` APIs require closing the
+connection if their future is cancelled. This changes no protocol bytes or version.

@@ -101,6 +101,21 @@ mod tests {
     }
 
     #[test]
+    fn existing_session_shell_survives_fragmented_output_and_resize() {
+        crate::pty_test_support::exercise(
+            "commands::shell::tests::shell_runtime_probe",
+            "fragment-resize",
+        );
+    }
+
+    #[test]
+    fn existing_session_shell_roundtrip_resize_exit_status_and_invalid_response() {
+        for mode in ["roundtrip", "nonzero", "unexpected"] {
+            crate::pty_test_support::exercise("commands::shell::tests::shell_runtime_probe", mode);
+        }
+    }
+
+    #[test]
     fn shell_runtime_probe() {
         let Ok(port) = std::env::var("IZANAGI_PTY_TEST_PORT") else {
             return;
@@ -123,7 +138,14 @@ mod tests {
             }
         });
         match mode.as_str() {
-            "close" => assert_eq!(result.unwrap(), 0),
+            "close" | "fragment-resize" | "roundtrip" => assert_eq!(result.unwrap(), 0),
+            "nonzero" => assert_eq!(result.unwrap(), 42),
+            "unexpected" => assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("unexpected shell response")
+            ),
             "disconnect" => assert!(
                 result
                     .unwrap_err()
