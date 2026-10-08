@@ -24,6 +24,34 @@ impl ShellChild {
     }
 
     fn try_reap(&mut self) -> std::io::Result<Option<i32>> {
+        // Peek without reaping so the PID/process-group ID cannot be reused
+        // before we kill any surviving group members (the shell may exit first).
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                self.pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if result < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ECHILD) {
+                self.reaped = true;
+            }
+            return if error.raw_os_error() == Some(libc::EINTR) {
+                Ok(None)
+            } else {
+                Err(error)
+            };
+        }
+        if unsafe { info.si_pid() } == 0 {
+            return Ok(None);
+        }
+        unsafe {
+            libc::kill(-self.pid, libc::SIGKILL);
+        }
         let mut status = 0;
         let result = unsafe { libc::waitpid(self.pid, &mut status, libc::WNOHANG) };
         if result == self.pid {
@@ -366,6 +394,59 @@ mod shell_cleanup {
             }
             assert_reaped(pid);
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cleanup_kills_group_members_after_shell_has_exited() {
+        let (master, child, pid) = shell("trap '' HUP TERM; sleep 60 & printf '%s' \"$!\"; exit 0");
+        let (mut host, agent) = tokio::io::duplex(8192);
+        let (mut reader, mut writer) = tokio::io::split(agent);
+        let task = tokio::spawn(async move {
+            relay_shell(
+                &mut reader,
+                &mut writer,
+                None,
+                &mut 0,
+                &mut 0,
+                master,
+                child,
+            )
+            .await
+        });
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            protocol::read_message(&mut host),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        let Message::ShellData { data, .. } = output else {
+            panic!("expected descendant PID");
+        };
+        let descendant: libc::pid_t = std::str::from_utf8(&data).unwrap().parse().unwrap();
+        // Give the leader time to exit while its signal-resistant descendant holds the PTY.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        protocol::write_message(&mut host, &Message::Stop)
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_reaped(pid);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match std::fs::read_to_string(format!("/proc/{descendant}/stat")) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                    Ok(stat) if stat.split_once(") ").unwrap().1.starts_with('Z') => break,
+                    _ => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+                }
+            }
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test(flavor = "current_thread")]
