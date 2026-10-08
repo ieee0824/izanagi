@@ -74,8 +74,22 @@ fn emit_event(
             16,
         );
 
-        // パスバッファは初期化のみ (tracepoint ごとに個別に読み取る)
-        (*event).path_len = 0;
+        // Read only arguments whose syscall ABI defines a userspace pathname.
+        // Never dereference the pointer directly: the helper bounds the copy,
+        // omits the trailing NUL, and reports inaccessible memory as an error.
+        let path_ptr = match syscall_id {
+            SyscallId::OpenAt => Some((*event).arg1),
+            SyscallId::Stat | SyscallId::Access | SyscallId::Execve => Some((*event).arg0),
+            _ => None,
+        };
+        if let Some(path_ptr) = path_ptr {
+            if let Ok(path) = aya_ebpf::helpers::bpf_probe_read_user_str_bytes(
+                path_ptr as *const u8,
+                &mut (*event).path_buf,
+            ) {
+                (*event).path_len = path.len() as u32;
+            }
+        }
     }
 
     entry.submit(0);
