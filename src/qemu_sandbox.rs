@@ -225,7 +225,7 @@ pub fn build_qemu_args(params: &QemuArgsParams<'_>) -> Vec<String> {
 
 /// セッショントークン（32 バイト = 64 文字 hex）を生成する。
 fn generate_token() -> String {
-    use rand::Rng;
+    use rand::RngExt;
     let mut rng = rand::rng();
     let bytes: [u8; 32] = rng.random();
     hex::encode(bytes)

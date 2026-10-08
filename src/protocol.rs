@@ -287,7 +287,7 @@ const HMAC_SIZE: usize = 32;
 /// 共有シークレットから HMAC-SHA256 を計算する。
 /// `parts` はスライスのスライスで、連結せずに順次 `update` する。
 fn compute_hmac(secret: &[u8], parts: &[&[u8]]) -> [u8; HMAC_SIZE] {
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     use sha2::Sha256;
 
     type HmacSha256 = Hmac<Sha256>;
@@ -302,7 +302,7 @@ fn compute_hmac(secret: &[u8], parts: &[&[u8]]) -> [u8; HMAC_SIZE] {
 /// HMAC を検証する。
 /// `parts` はスライスのスライスで、連結せずに順次 `update` する。
 fn verify_hmac(secret: &[u8], parts: &[&[u8]], expected: &[u8; HMAC_SIZE]) -> bool {
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     use sha2::Sha256;
 
     type HmacSha256 = Hmac<Sha256>;

@@ -9,7 +9,7 @@ pub(crate) fn sha256_hex(input: &str) -> String {
 /// 両方の入力を HMAC に通して結果を比較することで、
 /// タイミング攻撃を防ぐ。
 pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     use sha2::Sha256;
 
     type HmacSha256 = Hmac<Sha256>;

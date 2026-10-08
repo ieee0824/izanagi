@@ -15,8 +15,6 @@ pub struct CaAuthority {
     cert_der: CertificateDer<'static>,
     /// CA のキーペア（rcgen で証明書署名に使用）。
     key_pair: KeyPair,
-    /// rcgen の CA 証明書オブジェクト（sign_server_cert で再利用）。
-    ca_cert: rcgen::Certificate,
 }
 
 impl CaAuthority {
@@ -36,7 +34,6 @@ impl CaAuthority {
             cert_pem,
             cert_der,
             key_pair,
-            ca_cert,
         })
     }
 
@@ -66,7 +63,6 @@ impl CaAuthority {
             cert_pem,
             cert_der,
             key_pair,
-            ca_cert,
         })
     }
 
@@ -97,9 +93,10 @@ impl CaAuthority {
         params.not_before = now - time::Duration::minutes(5);
         params.not_after = now + time::Duration::days(1);
 
-        // 保持した CA 証明書オブジェクトで署名（毎回の再構築を回避）
+        // CA と同じパラメータ・鍵を持つ issuer で署名する。
+        let issuer = rcgen::Issuer::new(Self::ca_params(), &self.key_pair);
         let cert = params
-            .signed_by(&server_key, &self.ca_cert, &self.key_pair)
+            .signed_by(&server_key, &issuer)
             .context("サーバー証明書の署名に失敗")?;
 
         let cert_der = CertificateDer::from(cert.der().to_vec());
