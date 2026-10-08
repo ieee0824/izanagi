@@ -96,9 +96,7 @@ async fn handle_message(input: &str) -> Option<JsonRpcResponse> {
     };
 
     // notification: id が None の場合はレスポンス不要
-    let Some(id) = request.id else {
-        return None;
-    };
+    let id = request.id?;
 
     // JSON-RPC 2.0 バージョン検証
     if request.jsonrpc != JSONRPC_VERSION {

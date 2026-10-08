@@ -72,17 +72,17 @@ fn validate_target_pid() -> anyhow::Result<u32> {
     }
 
     // セッション情報との整合性チェック
-    if let Ok(Some(sess)) = session::load_session(&izanagi_dir()) {
-        if sess.pid != pid {
-            session::remove_session(&izanagi_dir());
-            remove_pid_file();
-            remove_lock_file();
-            anyhow::bail!(
-                "PID ファイル ({}) とセッション情報 ({}) の PID が一致しません。stale ファイルを削除しました。",
-                pid,
-                sess.pid
-            );
-        }
+    if let Ok(Some(sess)) = session::load_session(&izanagi_dir())
+        && sess.pid != pid
+    {
+        session::remove_session(&izanagi_dir());
+        remove_pid_file();
+        remove_lock_file();
+        anyhow::bail!(
+            "PID ファイル ({}) とセッション情報 ({}) の PID が一致しません。stale ファイルを削除しました。",
+            pid,
+            sess.pid
+        );
     }
 
     // プロセスが存在するか確認

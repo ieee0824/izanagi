@@ -24,9 +24,9 @@ impl SecretMap {
 
     /// "DUMMY=REAL" 形式の文字列からマッピングを追加する。
     pub fn add_from_str(&mut self, s: &str) -> anyhow::Result<()> {
-        let (dummy, real) = s
-            .split_once('=')
-            .ok_or_else(|| anyhow::anyhow!("無効な secret-map 形式: '{}' (DUMMY=REAL が必要)", s))?;
+        let (dummy, real) = s.split_once('=').ok_or_else(|| {
+            anyhow::anyhow!("無効な secret-map 形式: '{}' (DUMMY=REAL が必要)", s)
+        })?;
         if dummy.is_empty() {
             anyhow::bail!("ダミー値が空です: '{}'", s);
         }
@@ -37,10 +37,11 @@ impl SecretMap {
             .push((dummy.to_string(), real.to_string()));
         // 長い順にソート（部分文字列の誤置換を防ぐ: "KEY_LONG" を "KEY" より先に置換）
         // 同じ長さの場合は辞書順で決定的に並べる
-        self.sorted_mappings.sort_by(|a, b| match b.0.len().cmp(&a.0.len()) {
-            std::cmp::Ordering::Equal => a.0.cmp(&b.0),
-            other => other,
-        });
+        self.sorted_mappings
+            .sort_by(|a, b| match b.0.len().cmp(&a.0.len()) {
+                std::cmp::Ordering::Equal => a.0.cmp(&b.0),
+                other => other,
+            });
         Ok(())
     }
 
@@ -78,7 +79,9 @@ impl SecretMap {
 
     /// 登録されているダミー値のいずれかが含まれているかチェックする。
     pub fn contains_dummy(&self, s: &str) -> bool {
-        self.sorted_mappings.iter().any(|(dummy, _)| s.contains(dummy.as_str()))
+        self.sorted_mappings
+            .iter()
+            .any(|(dummy, _)| s.contains(dummy.as_str()))
     }
 }
 

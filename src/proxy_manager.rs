@@ -165,14 +165,14 @@ struct TempFileGuard {
 
 impl Drop for TempFileGuard {
     fn drop(&mut self) {
-        if let Err(e) = std::fs::remove_file(&self.path) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                eprintln!(
-                    "警告: 一時ファイルの削除に失敗: {}: {}",
-                    self.path.display(),
-                    e
-                );
-            }
+        if let Err(e) = std::fs::remove_file(&self.path)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!(
+                "警告: 一時ファイルの削除に失敗: {}: {}",
+                self.path.display(),
+                e
+            );
         }
     }
 }
@@ -208,12 +208,12 @@ fn write_secret_map_file(maps: &[String]) -> anyhow::Result<(PathBuf, TempFileGu
 /// 2. `PATH` 環境変数から検索 (シェル非経由、自前パース)
 fn find_binary(name: &str) -> anyhow::Result<PathBuf> {
     // 同一ディレクトリ (開発時: cargo target、リリース時: インストール先)
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let candidate = dir.join(name);
-            if candidate.is_file() {
-                return Ok(candidate);
-            }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        let candidate = dir.join(name);
+        if candidate.is_file() {
+            return Ok(candidate);
         }
     }
 

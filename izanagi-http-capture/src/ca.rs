@@ -52,8 +52,7 @@ impl CaAuthority {
         let key_pem = std::fs::read_to_string(key_path)
             .with_context(|| format!("CA 秘密鍵の読み込みに失敗: {}", key_path.display()))?;
 
-        let key_pair =
-            KeyPair::from_pem(&key_pem).context("CA 秘密鍵の PEM パースに失敗")?;
+        let key_pair = KeyPair::from_pem(&key_pem).context("CA 秘密鍵の PEM パースに失敗")?;
 
         // 同じキーペアで CA 証明書を再構築する。
         // cert_pem / cert_der / ca_cert の一貫性を保証する。

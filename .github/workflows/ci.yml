@@ -1,0 +1,91 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_VERSION: "1.93.1"
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            features: landlock,ebpf
+          - os: macos-latest
+            features: ""
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Test
+        shell: bash
+        run: |
+          if [[ -n "${{ matrix.features }}" ]]; then
+            cargo test --locked --all-targets --features "${{ matrix.features }}"
+          else
+            cargo test --locked --all-targets
+          fi
+
+  component-tests:
+    name: Test component (${{ matrix.manifest }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        manifest:
+          - izanagi-common/Cargo.toml
+          - izanagi-agent/Cargo.toml
+          - izanagi-dns-proxy/Cargo.toml
+          - izanagi-http-capture/Cargo.toml
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Test component
+        shell: bash
+        run: |
+          if [[ "${{ matrix.manifest }}" == "izanagi-common/Cargo.toml" ]]; then
+            cargo test --all-targets --manifest-path "${{ matrix.manifest }}"
+          else
+            cargo test --locked --all-targets --manifest-path "${{ matrix.manifest }}"
+          fi
+
+  quality:
+    name: Format and Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: clippy,rustfmt
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Check formatting
+        shell: bash
+        run: |
+          cargo fmt --all -- --check
+          for manifest in izanagi-common/Cargo.toml izanagi-agent/Cargo.toml izanagi-dns-proxy/Cargo.toml izanagi-http-capture/Cargo.toml; do
+            cargo fmt --manifest-path "$manifest" -- --check
+          done
+      - name: Run Clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings

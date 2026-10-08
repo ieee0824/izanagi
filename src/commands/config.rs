@@ -58,7 +58,8 @@ fn cmd_config_mitm(config: &Config, config_path: &Path) -> anyhow::Result<u8> {
             .with_prompt("DNS プロキシのリッスンアドレス")
             .default(current)
             .validate_with(|input: &String| -> Result<(), String> {
-                input.parse::<std::net::SocketAddr>()
+                input
+                    .parse::<std::net::SocketAddr>()
                     .map(|_| ())
                     .map_err(|_| "無効なアドレスです (例: 127.0.0.1:15353)".to_string())
             })
@@ -88,9 +89,8 @@ fn cmd_config_mitm(config: &Config, config_path: &Path) -> anyhow::Result<u8> {
             .with_prompt("HTTP リッスンアドレス")
             .default(current_http)
             .interact_text()?;
-        let listen_http: std::net::SocketAddr = listen_http_str
-            .parse()
-            .context("無効なアドレスです")?;
+        let listen_http: std::net::SocketAddr =
+            listen_http_str.parse().context("無効なアドレスです")?;
 
         let current_https = config
             .http_capture
@@ -101,9 +101,8 @@ fn cmd_config_mitm(config: &Config, config_path: &Path) -> anyhow::Result<u8> {
             .with_prompt("HTTPS (TLS MITM) リッスンアドレス")
             .default(current_https)
             .interact_text()?;
-        let listen_https: std::net::SocketAddr = listen_https_str
-            .parse()
-            .context("無効なアドレスです")?;
+        let listen_https: std::net::SocketAddr =
+            listen_https_str.parse().context("無効なアドレスです")?;
 
         let current_ca = config
             .http_capture
@@ -190,8 +189,7 @@ fn cmd_config_mitm(config: &Config, config_path: &Path) -> anyhow::Result<u8> {
 /// Config を TOML として設定ファイルに書き出す。
 /// パーミッションは作成時に 0o600 を設定し、TOCTOU を防止する。
 fn write_config(path: &Path, config: &Config) -> anyhow::Result<()> {
-    let toml_str =
-        toml::to_string_pretty(config).context("設定の TOML シリアライズに失敗")?;
+    let toml_str = toml::to_string_pretty(config).context("設定の TOML シリアライズに失敗")?;
 
     if let Some(parent) = path.parent() {
         let parent_existed = parent.exists();

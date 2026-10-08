@@ -28,10 +28,10 @@ pub async fn cmd_shell(config: &Config) -> anyhow::Result<u8> {
         Ok(()) => Ok(0),
         Err(e) => {
             let msg = e.to_string();
-            if let Some(code_str) = msg.strip_prefix("shell exited with code ") {
-                if let Ok(code) = code_str.trim().parse::<u8>() {
-                    return Ok(code);
-                }
+            if let Some(code_str) = msg.strip_prefix("shell exited with code ")
+                && let Ok(code) = code_str.trim().parse::<u8>()
+            {
+                return Ok(code);
             }
             Err(e)
         }

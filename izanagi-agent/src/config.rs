@@ -59,7 +59,9 @@ pub(crate) fn log_env_summary() {
     }
     // 矛盾チェック: allowlist が設定済みなのに ALLOW_ALL_COMMANDS=1
     if !allowed_cmds.is_empty() && allow_all == "1" {
-        eprintln!("  WARNING: IZANAGI_ALLOWED_COMMANDS and IZANAGI_ALLOW_ALL_COMMANDS=1 are both set. The allowlist takes precedence; ALLOW_ALL will be ignored.");
+        eprintln!(
+            "  WARNING: IZANAGI_ALLOWED_COMMANDS and IZANAGI_ALLOW_ALL_COMMANDS=1 are both set. The allowlist takes precedence; ALLOW_ALL will be ignored."
+        );
     }
     eprintln!("---");
 }

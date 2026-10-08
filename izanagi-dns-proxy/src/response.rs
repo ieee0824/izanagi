@@ -97,7 +97,10 @@ mod tests {
         assert_eq!(resp.answers().len(), 1);
 
         let answer = &resp.answers()[0];
-        assert_eq!(answer.name(), &Name::from_ascii("evil.example.com").unwrap());
+        assert_eq!(
+            answer.name(),
+            &Name::from_ascii("evil.example.com").unwrap()
+        );
         assert_eq!(answer.ttl(), 60);
         assert_eq!(answer.data(), &RData::A(A(Ipv4Addr::new(127, 0, 0, 1))));
     }

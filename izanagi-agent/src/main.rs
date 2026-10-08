@@ -59,9 +59,13 @@ async fn main() -> anyhow::Result<()> {
     if expected_token.is_some() {
         eprintln!("fw_cfg token authentication enabled");
     } else if require_token {
-        anyhow::bail!("fw_cfg token not found. Set IZANAGI_ALLOW_NO_TOKEN=1 to allow (not recommended).");
+        anyhow::bail!(
+            "fw_cfg token not found. Set IZANAGI_ALLOW_NO_TOKEN=1 to allow (not recommended)."
+        );
     } else {
-        eprintln!("WARNING: fw_cfg token not found, running without token authentication (IZANAGI_ALLOW_NO_TOKEN=1)");
+        eprintln!(
+            "WARNING: fw_cfg token not found, running without token authentication (IZANAGI_ALLOW_NO_TOKEN=1)"
+        );
     }
 
     // 環境変数設定のサマリをログ出力
@@ -84,7 +88,9 @@ async fn main() -> anyhow::Result<()> {
         let secret = secret.clone();
         let expected_token = Arc::clone(&expected_token);
         tokio::spawn(async move {
-            if let Err(e) = connection::handle_connection(stream, secret.as_deref(), &expected_token).await {
+            if let Err(e) =
+                connection::handle_connection(stream, secret.as_deref(), &expected_token).await
+            {
                 eprintln!("connection error: {}", e);
             }
         });

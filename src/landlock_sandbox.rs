@@ -164,10 +164,10 @@ mod inner {
         // source チェーンを辿って io::Error の raw_os_error を取得
         let mut source: Option<&(dyn Error + 'static)> = Some(&e);
         while let Some(err) = source {
-            if let Some(io_err) = err.downcast_ref::<std::io::Error>() {
-                if let Some(code) = io_err.raw_os_error() {
-                    return std::io::Error::from_raw_os_error(code);
-                }
+            if let Some(io_err) = err.downcast_ref::<std::io::Error>()
+                && let Some(code) = io_err.raw_os_error()
+            {
+                return std::io::Error::from_raw_os_error(code);
             }
             source = err.source();
         }
@@ -209,6 +209,7 @@ mod inner {
 
     /// `ShareConfig` から Landlock ルールセットを構築して self_restrict する。
     /// テストや単純な呼び出し用の便利関数。
+    #[allow(dead_code)]
     pub fn apply_landlock(share: &ShareConfig, abi: ABI) -> anyhow::Result<()> {
         let ruleset = build_ruleset(share, abi)?;
         apply_ruleset(ruleset)?;

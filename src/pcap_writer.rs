@@ -88,7 +88,7 @@ impl PcapWriter {
         let mut guard = self
             .inner
             .lock()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| io::Error::other(e.to_string()))?;
 
         // Packet Header (16 bytes)
         guard.write_all(&ts_sec.to_le_bytes())?;

@@ -105,7 +105,12 @@ mod tests {
     }
 
     fn allowlist_of(hosts: &[&str]) -> Arc<HashSet<String>> {
-        Arc::new(hosts.iter().map(|h| h.to_ascii_lowercase().to_string()).collect())
+        Arc::new(
+            hosts
+                .iter()
+                .map(|h| h.to_ascii_lowercase().to_string())
+                .collect(),
+        )
     }
 
     #[test]
@@ -137,9 +142,7 @@ mod tests {
             .map(|i| {
                 let cache = cache.clone();
                 std::thread::spawn(move || {
-                    cache
-                        .get_or_create(&format!("host{}.com", i % 3))
-                        .unwrap()
+                    cache.get_or_create(&format!("host{}.com", i % 3)).unwrap()
                 })
             })
             .collect();
@@ -184,7 +187,10 @@ mod tests {
 
         let key1 = cache.get_or_create("Example.COM").unwrap();
         let key2 = cache.get_or_create("example.com").unwrap();
-        assert!(Arc::ptr_eq(&key1, &key2), "大文字小文字が異なる SNI は同じ証明書を返すべき");
+        assert!(
+            Arc::ptr_eq(&key1, &key2),
+            "大文字小文字が異なる SNI は同じ証明書を返すべき"
+        );
     }
 
     #[test]
@@ -195,7 +201,10 @@ mod tests {
         let cache = CertCache::new(ca, allowlist_of(&["example.com"]));
         let key1 = cache.get_or_create("evil.example.com").unwrap();
         let key2 = cache.get_or_create("evil.example.com").unwrap();
-        assert!(!Arc::ptr_eq(&key1, &key2), "許可リスト外はキャッシュされない");
+        assert!(
+            !Arc::ptr_eq(&key1, &key2),
+            "許可リスト外はキャッシュされない"
+        );
     }
 
     #[test]

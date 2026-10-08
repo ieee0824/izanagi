@@ -35,10 +35,7 @@ impl DnsProxy {
             .await
             .with_context(|| format!("{} への TCP バインドに失敗", self.listen_addr))?;
 
-        eprintln!(
-            "DNS プロキシを起動しました: {} (UDP+TCP)",
-            self.listen_addr
-        );
+        eprintln!("DNS プロキシを起動しました: {} (UDP+TCP)", self.listen_addr);
         if self.allowlist.is_empty() {
             eprintln!("警告: allowed_hosts が空です。すべての DNS クエリをブロックします。");
         }
@@ -259,7 +256,8 @@ async fn handle_query(
                 // answers, additionals, name_servers の全セクションを検証する。
                 // クライアント実装によっては additional セクションの A/AAAA レコードを
                 // 利用するため、answers のみの検証ではバイパスされる可能性がある。
-                let all_records = resp_msg.answers()
+                let all_records = resp_msg
+                    .answers()
                     .iter()
                     .chain(resp_msg.additionals().iter())
                     .chain(resp_msg.name_servers().iter());

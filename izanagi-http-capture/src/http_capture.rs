@@ -112,14 +112,20 @@ pub(crate) async fn parse_http_request<S: AsyncRead + Unpin>(
 
     loop {
         if total >= buf.len() {
-            anyhow::bail!("HTTP ヘッダーが {} バイトを超えました（\\r\\n\\r\\n が見つかりません）", buf.len());
+            anyhow::bail!(
+                "HTTP ヘッダーが {} バイトを超えました（\\r\\n\\r\\n が見つかりません）",
+                buf.len()
+            );
         }
         let n = stream.read(&mut buf[total..]).await?;
         if n == 0 {
             if total == 0 {
                 anyhow::bail!("クライアントが接続を閉じました（データなし）");
             }
-            anyhow::bail!("HTTP ヘッダーが不完全です（\\r\\n\\r\\n が見つかりません、{} バイト受信）", total);
+            anyhow::bail!(
+                "HTTP ヘッダーが不完全です（\\r\\n\\r\\n が見つかりません、{} バイト受信）",
+                total
+            );
         }
         total += n;
 
