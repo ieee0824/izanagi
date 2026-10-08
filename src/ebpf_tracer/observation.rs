@@ -43,6 +43,21 @@ impl Collector {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn fixture() -> Self {
+        Self {
+            session: "s".into(),
+            boot: "b".into(),
+            source: "c".into(),
+            pid_namespace: 1,
+            net_namespace: 2,
+            sequence: 0,
+            seen: BTreeSet::new(),
+            sockets: BTreeMap::new(),
+            socket_sequence: 0,
+        }
+    }
+
     fn key(&self, tgid: u32, start: u64) -> Option<ProcessKey> {
         if tgid == 0 || start == 0 {
             return None;
@@ -336,17 +351,7 @@ fn file_role(path: &str) -> FileRole {
 mod tests {
     use super::*;
     fn collector() -> Collector {
-        Collector {
-            session: "s".into(),
-            boot: "b".into(),
-            source: "c".into(),
-            pid_namespace: 1,
-            net_namespace: 2,
-            sequence: 0,
-            seen: BTreeSet::new(),
-            sockets: BTreeMap::new(),
-            socket_sequence: 0,
-        }
+        Collector::fixture()
     }
     fn raw() -> RawSyscallEvent {
         let mut raw: RawSyscallEvent = unsafe { std::mem::zeroed() };

@@ -2,10 +2,6 @@ src/apple_container_sandbox.rs	build_run_args	141	77
 src/apple_container_sandbox.rs	up	344	113
 src/apple_container_sandbox.rs	stop_container	562	51
 src/commands/config.rs	cmd_config_mitm	36	139
-src/commands/mcp/exec_capture.rs	exec_on_session_capture	27	92
-src/commands/mcp/mod.rs	handle_message	73	86
-src/commands/mcp/tools.rs	handle_sandbox_exec_with_dir	88	56
-src/commands/mcp/tools.rs	handle_sandbox_shell_with_dir	152	55
 src/commands/up.rs	cmd_up	20	99
 src/commands/up.rs	install_ca_cert	202	85
 src/config/mod.rs	validate_for_platform	276	71

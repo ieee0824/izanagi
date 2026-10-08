@@ -94,9 +94,7 @@ pub(super) async fn handle_sandbox_exec_with_dir(
         Ok(v) => v,
         Err(e) => {
             let result = ToolCallResult::error(e);
-            let value =
-                serde_json::to_value(result).expect("ToolCallResult のシリアライズは常に成功する");
-            return JsonRpcResponse::success(id, value);
+            return tool_response(id, result);
         }
     };
 
@@ -105,15 +103,11 @@ pub(super) async fn handle_sandbox_exec_with_dir(
         Ok(Some(s)) if session::is_session_alive(&s) => s,
         Ok(_) => {
             let result = ToolCallResult::error("sandbox is not running");
-            let value =
-                serde_json::to_value(result).expect("ToolCallResult のシリアライズは常に成功する");
-            return JsonRpcResponse::success(id, value);
+            return tool_response(id, result);
         }
         Err(e) => {
             let result = ToolCallResult::error(format!("failed to load session: {e}"));
-            let value =
-                serde_json::to_value(result).expect("ToolCallResult のシリアライズは常に成功する");
-            return JsonRpcResponse::success(id, value);
+            return tool_response(id, result);
         }
     };
 
@@ -129,15 +123,11 @@ pub(super) async fn handle_sandbox_exec_with_dir(
             } else {
                 ToolCallResult::error(text)
             };
-            let value =
-                serde_json::to_value(result).expect("ToolCallResult のシリアライズは常に成功する");
-            JsonRpcResponse::success(id, value)
+            tool_response(id, result)
         }
         Err(e) => {
             let result = ToolCallResult::error(format!("exec failed: {e}"));
-            let value =
-                serde_json::to_value(result).expect("ToolCallResult のシリアライズは常に成功する");
-            JsonRpcResponse::success(id, value)
+            tool_response(id, result)
         }
     }
 }
@@ -159,15 +149,11 @@ pub(super) async fn handle_sandbox_shell_with_dir(
         Some(Value::Object(obj)) => obj,
         Some(_) => {
             let result = ToolCallResult::error("arguments must be an object");
-            let value =
-                serde_json::to_value(result).expect("ToolCallResult のシリアライズは常に成功する");
-            return JsonRpcResponse::success(id, value);
+            return tool_response(id, result);
         }
         None => {
             let result = ToolCallResult::error("missing required argument: command");
-            let value =
-                serde_json::to_value(result).expect("ToolCallResult のシリアライズは常に成功する");
-            return JsonRpcResponse::success(id, value);
+            return tool_response(id, result);
         }
     };
 
@@ -175,21 +161,15 @@ pub(super) async fn handle_sandbox_shell_with_dir(
         Some(Value::String(s)) if !s.is_empty() => s.clone(),
         Some(Value::String(_)) => {
             let result = ToolCallResult::error("command must not be empty");
-            let value =
-                serde_json::to_value(result).expect("ToolCallResult のシリアライズは常に成功する");
-            return JsonRpcResponse::success(id, value);
+            return tool_response(id, result);
         }
         Some(_) => {
             let result = ToolCallResult::error("command must be a string");
-            let value =
-                serde_json::to_value(result).expect("ToolCallResult のシリアライズは常に成功する");
-            return JsonRpcResponse::success(id, value);
+            return tool_response(id, result);
         }
         None => {
             let result = ToolCallResult::error("missing required argument: command");
-            let value =
-                serde_json::to_value(result).expect("ToolCallResult のシリアライズは常に成功する");
-            return JsonRpcResponse::success(id, value);
+            return tool_response(id, result);
         }
     };
 
@@ -203,6 +183,11 @@ pub(super) async fn handle_sandbox_shell_with_dir(
     };
 
     handle_sandbox_exec_with_dir(id, &shell_params, izanagi_dir).await
+}
+
+fn tool_response(id: Value, result: ToolCallResult) -> JsonRpcResponse {
+    let value = serde_json::to_value(result).expect("ToolCallResult のシリアライズは常に成功する");
+    JsonRpcResponse::success(id, value)
 }
 
 /// フォーマットされた実行結果テキストを返す。

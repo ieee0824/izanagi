@@ -108,6 +108,22 @@ still rewind, overlong incomplete lines are discarded, severity filtering and
 truncation text are unchanged. Two new log regressions verify the partial-line
 retry/filter path and the overlong discard cursor. Binary tests now total 74.
 
+### MCP command handling
+
+All four original MCP candidates and new production helpers are below 50 lines.
+JSON/schema parsing, tool-call parameter validation and protocol response
+serialization are separate from dispatch. Container execution uses the same
+bounded capture/drain operation independently for stdout and stderr, preserving
+the timeout, kill/reap and kill-on-drop behavior. All 31 existing MCP tests pass;
+a new duplex regression verifies concurrent oversized output is drained on both
+streams while only the output prefix is retained. Linux cross-target all-feature
+Clippy passes.
+
+The first Linux run for the host-tracing commit exposed a test-fixture permission
+assumption: `/proc/1/ns/pid` is inaccessible to the CI user. Forwarding tests now
+use the existing fixed collector fixture, avoiding privileged machine state.
+Production namespace validation remains unchanged. Rerun CI is required.
+
 ## Outstanding work
 
 The remaining inventory is work to complete, except explicitly documented

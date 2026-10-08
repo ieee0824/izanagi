@@ -376,7 +376,7 @@ mod tests {
 
     #[tokio::test]
     async fn lost_observations_are_retained_until_the_gap_can_be_sent() {
-        let collector = observation::Collector::new("test-session".into()).unwrap();
+        let collector = observation::Collector::fixture();
         let (telemetry, mut events) = mpsc::channel(1);
         let mut forwarder = Forwarder {
             observation: Some((collector, telemetry)),
@@ -409,7 +409,7 @@ mod tests {
 
     #[tokio::test]
     async fn agent_events_skip_telemetry_but_keep_the_legacy_stream() {
-        let collector = observation::Collector::new("test-session".into()).unwrap();
+        let collector = observation::Collector::fixture();
         let (telemetry, mut events) = mpsc::channel(1);
         let mut forwarder = Forwarder {
             observation: Some((collector, telemetry)),
