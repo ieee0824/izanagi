@@ -173,18 +173,19 @@ pub(crate) async fn execute_command(
         }
         Ok(Err(e)) => {
             // 内部エラーの詳細をログに出して、抽象化されたメッセージを返す
-            eprintln!("exec internal error: {}", e);
+            let _ = e;
+            eprintln!("exec internal error");
             anyhow::bail!(EXEC_ERROR_PREFIX);
         }
         Err(_) => {
             // タイムアウト: プロセスグループ全体を kill して孫プロセスも含めて停止する
             #[cfg(unix)]
-            if let Some(pid) = child.id() {
-                if let Ok(pid_i32) = i32::try_from(pid) {
-                    // 負の PID でプロセスグループ全体に SIGKILL を送信
-                    unsafe {
-                        libc::kill(-pid_i32, libc::SIGKILL);
-                    }
+            if let Some(pid) = child.id()
+                && let Ok(pid_i32) = i32::try_from(pid)
+            {
+                // 負の PID でプロセスグループ全体に SIGKILL を送信
+                unsafe {
+                    libc::kill(-pid_i32, libc::SIGKILL);
                 }
                 // i32 変換失敗時は child.kill() にフォールバック
             }
@@ -245,7 +246,7 @@ fn check_command_allowlist(cmd: &str) -> Result<()> {
     if allowed {
         Ok(())
     } else {
-        eprintln!("WARNING: command '{}' not in allowlist", cmd_name);
+        eprintln!("WARNING: command not in allowlist");
         anyhow::bail!("{}: not allowed", EXEC_ERROR_PREFIX)
     }
 }

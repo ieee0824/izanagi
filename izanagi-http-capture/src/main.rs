@@ -1,3 +1,4 @@
+mod behavior_forward;
 mod ca;
 mod cert_cache;
 mod http_capture;
@@ -29,6 +30,14 @@ use crate::secret_map::SecretMap;
 #[derive(Parser)]
 #[command(name = "izanagi-http-capture", version, about)]
 struct Cli {
+    /// Metadata-only HTTP/1.1 forward mode for the opt-in guest behavior collector.
+    #[arg(long, requires = "telemetry_socket")]
+    behavior_forward: bool,
+    #[arg(long, requires = "behavior_forward")]
+    telemetry_socket: Option<PathBuf>,
+    /// Exact loopback receiver in an isolated test guest; production IP checks remain enabled.
+    #[arg(long, requires = "behavior_forward")]
+    fixture_endpoint: Option<SocketAddr>,
     /// HTTP リッスンアドレス
     #[arg(long, default_value = "127.0.0.1:80")]
     listen_http: SocketAddr,
@@ -78,6 +87,26 @@ struct Cli {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+
+    if cli.behavior_forward {
+        return behavior_forward::run(
+            behavior_forward::ForwardConfig {
+                listen: cli.listen_http,
+                allowed_hosts: cli
+                    .allowed_hosts
+                    .into_iter()
+                    .map(|s| s.to_ascii_lowercase())
+                    .collect(),
+                fixture_endpoint: cli.fixture_endpoint,
+                timeout: std::time::Duration::from_secs(cli.timeout_secs),
+                max_connections: cli.max_connections,
+            },
+            cli.telemetry_socket
+                .as_deref()
+                .expect("clap requires telemetry socket"),
+        )
+        .await;
+    }
 
     // CA の生成またはロード
     let ca = if let (Some(cert_path), Some(key_path)) = (&cli.ca_cert, &cli.ca_key) {

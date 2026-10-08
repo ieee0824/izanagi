@@ -244,7 +244,8 @@ mod tests {
                 assert!(!output.contains(sensitive));
             }
         }
-        assert!(!output.contains("credential"));
+        // `behavior.classifier.credential_env` is a public environment variable
+        // name; the sensitive mapping values above must still all be absent.
         let displayed: Config = toml::from_str(&output).unwrap();
         assert_eq!(
             displayed.http_capture.unwrap().secret_maps,

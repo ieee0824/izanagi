@@ -1,0 +1,55 @@
+{
+  "scenario": "legitimate-upload",
+  "measurement": "connected_mcp_round_trip_ms",
+  "elapsed_ms": 427,
+  "input_digest": "9437242735fc0dde98c757984984ab770b5f47c9b87f21e6e8b315bd0bea5d2e",
+  "projection": {
+    "feature_version": 1,
+    "binding": "confirmed_writer",
+    "credential_access_attempts": 1,
+    "credential_open_succeeded": 1,
+    "credential_open_failed": 0,
+    "access_to_post_ns": 2000000000,
+    "method": "post",
+    "policy": "allowed",
+    "novelty": "known",
+    "declared_content_length": 42,
+    "client_bytes_received": 42,
+    "upstream_bytes_written": 42,
+    "response_bytes_received": 0,
+    "transfer_outcome": "completed",
+    "quality": {
+      "issues": []
+    },
+    "mode": "correlated"
+  },
+  "response": {
+    "answers": {
+      "result": {
+        "choice": "normal",
+        "confidence": 0.71,
+        "probabilities": {
+          "access_post_suspected": 0.18,
+          "normal": 0.81,
+          "unknown": 0.01
+        },
+        "type": "choice"
+      }
+    },
+    "model": "jev-1.13.0",
+    "policy": {
+      "answers": {
+        "result": {
+          "disposition": "verify",
+          "reason": "moderate_confidence"
+        }
+      },
+      "version": 1
+    },
+    "usage": {
+      "input_tokens": 632,
+      "output_tokens": 43
+    }
+  },
+  "isError": false
+}

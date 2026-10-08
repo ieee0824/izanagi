@@ -7,6 +7,7 @@ rustup toolchain install nightly-2026-02-12 --profile minimal --component rust-s
 cargo install bpf-linker --locked
 make build-agent-gnu
 make build-ebpf
+make build-http-gnu
 make qemu-image-quick
 ```
 
@@ -14,7 +15,9 @@ eBPF の既定ツールチェーンは LLVM 22 のリンカーと互換性があ
 `nightly-2026-02-12`。別の環境では `EBPF_TOOLCHAIN` を指定できる。
 Debian ISO のバージョンと SHA256 は `debian.pkr.hcl` で固定している。
 既存イメージを置き換える前に、停止した VM のイメージを退避すること。
-プロトコルv2ではホストとイメージ内のagentを同時更新する必要がある。
+プロトコル v3 と eBPF raw ABI ではホスト・agent・eBPF object を同時更新する必要がある。
+Debian イメージは root 所有の HTTP sidecar も配置するが、行動分析は既定で無効。
+直接 `packer build` する場合は `agent_binary`、`ebpf_binary`、`http_binary` を指定する。
 
 実通信スモークテスト:
 
@@ -40,10 +43,10 @@ Alpine Linux + izanagi-agent の QEMU qcow2 イメージを自動ビルドする
 ```bash
 # プラグインをインストール（初回のみ）
 cd packer
-packer init .
+packer init alpine.pkr.hcl
 
 # イメージをビルド
-packer build -var "agent_binary=/tmp/izanagi-agent" .
+packer build -var "agent_binary=/tmp/izanagi-agent" alpine.pkr.hcl
 ```
 
 ビルド完了後、`output/alpine-aarch64.qcow2` が生成される。

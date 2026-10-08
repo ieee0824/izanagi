@@ -8,6 +8,54 @@ use crate::exec::{EXEC_USER, execute_command};
 use crate::security::sanitize_anyhow_error;
 use crate::shell::{ShellChild, relay_shell};
 
+// Rotate data-source priority while leaving control messages first in the outer select.
+async fn next_forwarded<L, T>(
+    legacy: &mut tokio::sync::mpsc::Receiver<L>,
+    kernel: &mut Option<tokio::sync::mpsc::Receiver<T>>,
+    http: &mut Option<tokio::sync::mpsc::Receiver<T>>,
+    round: u8,
+    kernel_available: bool,
+    http_available: bool,
+) -> Forwarded<L, T> {
+    let legacy_event = legacy.recv();
+    let kernel_event = async {
+        match kernel.as_mut() {
+            Some(rx) => rx.recv().await,
+            None => std::future::pending().await,
+        }
+    };
+    let http_event = async {
+        match http.as_mut() {
+            Some(rx) => rx.recv().await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::pin!(legacy_event, kernel_event, http_event);
+    match round % 3 {
+        0 => tokio::select! { biased;
+            event = &mut legacy_event => Forwarded::Legacy(event),
+            event = &mut kernel_event, if kernel_available => Forwarded::Kernel(event.map(Box::new)),
+            event = &mut http_event, if http_available => Forwarded::Http(event.map(Box::new)),
+        },
+        1 => tokio::select! { biased;
+            event = &mut kernel_event, if kernel_available => Forwarded::Kernel(event.map(Box::new)),
+            event = &mut http_event, if http_available => Forwarded::Http(event.map(Box::new)),
+            event = &mut legacy_event => Forwarded::Legacy(event),
+        },
+        _ => tokio::select! { biased;
+            event = &mut http_event, if http_available => Forwarded::Http(event.map(Box::new)),
+            event = &mut legacy_event => Forwarded::Legacy(event),
+            event = &mut kernel_event, if kernel_available => Forwarded::Kernel(event.map(Box::new)),
+        },
+    }
+}
+
+enum Forwarded<L, T> {
+    Legacy(Option<L>),
+    Kernel(Option<Box<T>>),
+    Http(Option<Box<T>>),
+}
+
 /// 1 つのホスト接続を処理する。
 pub(crate) async fn handle_connection<S>(
     stream: S,
@@ -71,7 +119,8 @@ where
             }
         }
         Some(other) => {
-            anyhow::bail!("expected Hello message, got {:?}", other);
+            let _ = other;
+            anyhow::bail!("expected Hello message");
         }
         None => {
             anyhow::bail!("host disconnected before Hello");
@@ -101,7 +150,7 @@ where
     // メッセージループ: Start (トレース) または Exec (コマンド実行) を処理
     loop {
         match recv_message(&mut reader, secret, &mut recv_seq).await? {
-            Some(Message::Exec { cmd, env }) => {
+            Some(Message::Exec { cmd, mut env }) => {
                 if !authenticated {
                     send_message(
                         &mut writer,
@@ -112,7 +161,15 @@ where
                     .await?;
                     continue;
                 }
-                eprintln!("received Exec: {:?}", cmd);
+                eprintln!("received Exec");
+                if let Some(proxy) = crate::sidecar::proxy_environment() {
+                    for key in ["http_proxy", "HTTP_PROXY"] {
+                        env.insert(key.into(), proxy.clone());
+                    }
+                    for key in ["no_proxy", "NO_PROXY"] {
+                        env.insert(key.into(), String::new());
+                    }
+                }
                 let result = execute_command(&cmd, &env).await;
                 match result {
                     Ok((exit_code, stdout, stderr)) => {
@@ -131,7 +188,7 @@ where
                     }
                     Err(e) => {
                         // 内部詳細はログのみに出力し、クライアントにはサニタイズ済みメッセージを返す
-                        eprintln!("exec error: {}", e);
+                        eprintln!("exec error: {}", sanitize_anyhow_error(&e));
                         let sanitized_msg = sanitize_anyhow_error(&e);
                         send_message(
                             &mut writer,
@@ -147,13 +204,36 @@ where
                     }
                 }
             }
-            Some(Message::Start(filter)) => {
-                eprintln!("received Start with filter: {:?}", filter);
+            Some(message @ (Message::Start(_) | Message::StartBehavior { .. })) => {
+                let (filter, behavior) = match message {
+                    Message::Start(filter) => (filter, None),
+                    Message::StartBehavior { filter, config } => (filter, Some(config)),
+                    _ => unreachable!(),
+                };
+                if behavior.is_some() && !authenticated {
+                    send_message(
+                        &mut writer,
+                        &Message::Error("behavior requires authenticated session".into()),
+                        secret,
+                        &mut send_seq,
+                    )
+                    .await?;
+                    continue;
+                }
+                eprintln!("received Start");
 
                 // eBPF Tracer を起動してイベントを転送する。
                 let tracer = izanagi::ebpf_tracer::EbpfTracer::new();
-                let mut rx = match tracer.start(&filter).await {
-                    Ok(rx) => rx,
+                let start = if let Some(config) = &behavior {
+                    tracer
+                        .start_observation(&filter, config.session_id.clone())
+                        .await
+                        .map(|(rx, telemetry)| (rx, Some(telemetry)))
+                } else {
+                    tracer.start(&filter).await.map(|rx| (rx, None))
+                };
+                let (mut rx, mut telemetry) = match start {
+                    Ok(channels) => channels,
                     Err(e) => {
                         eprintln!("eBPF tracer start failed: {}", e);
                         let err_msg = format!("eBPF tracer start failed: {}", e);
@@ -163,6 +243,29 @@ where
                     }
                 };
 
+                let (mut sidecar, mut http_events) = if let Some(config) = &behavior {
+                    match crate::sidecar::Sidecar::start(config).await {
+                        Ok((sidecar, events)) => (Some(sidecar), Some(events)),
+                        Err(_) => {
+                            tracer.stop().await?;
+                            send_message(
+                                &mut writer,
+                                &Message::Error("behavior sidecar startup failed".into()),
+                                secret,
+                                &mut send_seq,
+                            )
+                            .await?;
+                            continue;
+                        }
+                    }
+                } else {
+                    (None, None)
+                };
+                let mut health_tick = tokio::time::interval(std::time::Duration::from_secs(1));
+                let mut telemetry_budget = tokio::time::Instant::now();
+                let mut sent_kernel = 0usize;
+                let mut sent_http = 0usize;
+                let mut forwarding_round = 0u8;
                 let transfer_result: anyhow::Result<()> = async {
                 send_message(&mut writer, &Message::TraceStarted, secret, &mut send_seq).await?;
 
@@ -176,30 +279,38 @@ where
                 // tokio ワーカースレッドも同じ tgid を持つため正確にフィルタできる。
                 let my_pid = std::process::id();
                 loop {
+                    if telemetry_budget.elapsed()>=std::time::Duration::from_secs(1) { telemetry_budget=tokio::time::Instant::now();sent_kernel=0;sent_http=0; }
                     tokio::select! {
-                        event = rx.recv() => {
-                            match event {
-                                Some(event) if !is_agent_event(&event, my_pid) => {
-                                    let msg = Message::Event((*event).clone());
-                                    send_message(&mut writer, &msg, secret, &mut send_seq).await?;
-                                }
-                                Some(_) => {
-                                    // agent 自身の syscall はスキップ
-                                }
-                                None => {
-                                    send_message(&mut writer, &Message::Error("trace event stream ended unexpectedly".into()), secret, &mut send_seq).await?;
-                                    break;
-                                }
+                        biased;
+                        result = recv_message(&mut reader, secret, &mut recv_seq) => {
+                            match result? { Some(Message::Stop)|None=>break,Some(_)=>{} }
+                        }
+                        _ = health_tick.tick() => {
+                            if sidecar.as_mut().is_some_and(crate::sidecar::Sidecar::failed) {
+                                // No direct-route fallback; applications retain a dead proxy.
+                                send_message(&mut writer,&Message::Error("behavior proxy stopped unexpectedly".into()),secret,&mut send_seq).await?;
+                                break;
                             }
                         }
-                        result = recv_message(&mut reader, secret, &mut recv_seq) => {
-                            match result? {
-                                Some(Message::Stop) => {
-                                    eprintln!("received Stop");
-                                    break;
+                        event = next_forwarded(&mut rx, &mut telemetry, &mut http_events, forwarding_round, sent_kernel < 96, sent_http < 32) => {
+                            forwarding_round = (forwarding_round + 1) % 3;
+                            match event {
+                                Forwarded::Kernel(Some(event)) => {
+                                    sent_kernel += 1;
+                                    send_message(&mut writer, &Message::Telemetry(event), secret, &mut send_seq).await?;
                                 }
-                                Some(_) => {}
-                                None => {
+                                Forwarded::Http(Some(event)) => {
+                                    sent_http += 1;
+                                    send_message(&mut writer, &Message::Telemetry(event), secret, &mut send_seq).await?;
+                                }
+                                Forwarded::Kernel(None) => telemetry = None,
+                                Forwarded::Http(None) => http_events = None,
+                                Forwarded::Legacy(Some(event)) if !is_agent_event(&event, my_pid) => {
+                                    send_message(&mut writer, &Message::Event((*event).clone()), secret, &mut send_seq).await?;
+                                }
+                                Forwarded::Legacy(Some(_)) => {}
+                                Forwarded::Legacy(None) => {
+                                    send_message(&mut writer, &Message::Error("trace event stream ended unexpectedly".into()), secret, &mut send_seq).await?;
                                     break;
                                 }
                             }
@@ -209,6 +320,7 @@ where
                     Ok(())
                 }.await;
                 tracer.stop().await?;
+                drop(sidecar);
                 transfer_result?;
             }
             Some(Message::Shell { rows, cols }) => {
@@ -239,7 +351,8 @@ where
                 break;
             }
             Some(other) => {
-                eprintln!("unexpected message: {:?}", other);
+                let _ = other;
+                eprintln!("unexpected message type");
             }
             None => {
                 break;
@@ -322,52 +435,91 @@ where
     // 環境変数を fork 前に CString で構築する。
     // execve の envp 配列として渡すため、CString の Vec + NULL 終端ポインタ配列を用意する。
     // NUL バイトを含む値は安全でないためエラーにする (silent drop しない)。
-    let env_vars: Vec<std::ffi::CString> = [
+    let mut shell_env = vec![
         format!("HOME={}", home_dir),
         format!("USER={}", EXEC_USER),
         "TERM=xterm-256color".to_string(),
         "PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin".to_string(),
-    ]
-    .iter()
-    .map(|s| {
-        std::ffi::CString::new(s.as_str())
-            .map_err(|_| anyhow::anyhow!("environment variable contains interior NUL byte: {}", s))
-    })
-    .collect::<anyhow::Result<Vec<std::ffi::CString>>>()?;
+    ];
+    if let Some(proxy) = crate::sidecar::proxy_environment() {
+        for key in ["http_proxy", "HTTP_PROXY"] {
+            shell_env.push(format!("{key}={proxy}"));
+        }
+        for key in ["no_proxy", "NO_PROXY"] {
+            shell_env.push(format!("{key}="));
+        }
+    }
+    let env_vars: Vec<std::ffi::CString> = shell_env
+        .iter()
+        .map(|s| {
+            std::ffi::CString::new(s.as_str()).map_err(|_| {
+                anyhow::anyhow!("environment variable contains interior NUL byte: {}", s)
+            })
+        })
+        .collect::<anyhow::Result<Vec<std::ffi::CString>>>()?;
 
     // execve の envp / argv をスタック上に構築する (ヒープ確保なし)。
     // env_vars は固定 4 要素 + NULL 終端 = 5 要素。
-    assert_eq!(env_vars.len(), 4, "env_vars must have exactly 4 elements");
-    let envp: [*const libc::c_char; 5] = [
-        env_vars[0].as_ptr(),
-        env_vars[1].as_ptr(),
-        env_vars[2].as_ptr(),
-        env_vars[3].as_ptr(),
-        std::ptr::null(),
-    ];
+    let (pid, master_fd) = {
+        let mut envp: Vec<*const libc::c_char> =
+            env_vars.iter().map(|value| value.as_ptr()).collect();
+        envp.push(std::ptr::null());
 
-    let shell = std::ffi::CString::new("/bin/bash").expect("static string");
-    let argv0 = std::ffi::CString::new("-bash").expect("static string");
-    let argv: [*const libc::c_char; 2] = [argv0.as_ptr(), std::ptr::null()];
+        let shell = std::ffi::CString::new("/bin/bash").expect("static string");
+        let argv0 = std::ffi::CString::new("-bash").expect("static string");
+        let argv: [*const libc::c_char; 2] = [argv0.as_ptr(), std::ptr::null()];
 
-    // chdir 先を fork 前に確保
-    let workdir = std::ffi::CString::new("/workspace").expect("static string");
+        // chdir 先を fork 前に確保
+        let workdir = std::ffi::CString::new("/workspace").expect("static string");
 
-    // PTY を確保
-    let mut winsize = libc::winsize {
-        ws_row: rows,
-        ws_col: cols,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    };
-    let mut master_fd: libc::c_int = -1;
-    let pid = unsafe {
-        libc::forkpty(
-            &mut master_fd,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            &mut winsize,
-        )
+        // PTY を確保
+        let mut winsize = libc::winsize {
+            ws_row: rows,
+            ws_col: cols,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        let mut master_fd: libc::c_int = -1;
+        let pid = unsafe {
+            libc::forkpty(
+                &mut master_fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut winsize,
+            )
+        };
+
+        if pid == 0 {
+            // 子プロセス: async-signal-safe な操作のみ実行する。
+            // すべてのヒープ確保・ライブラリ呼び出しは fork 前に完了済み。
+            // 環境変数は execve の envp 引数で渡すため clearenv/putenv は不要。
+            // envp / argv は fork 前にスタック上で構築済み。子プロセス内はヒープ確保なし。
+            unsafe {
+                if libc::setgid(gid) != 0 {
+                    libc::_exit(126);
+                }
+                if libc::setuid(uid) != 0 {
+                    libc::_exit(126);
+                }
+
+                if libc::chdir(workdir.as_ptr()) != 0 {
+                    libc::_exit(126);
+                }
+
+                // /proc/self/environ のパーミッションを制限し、
+                // シェルプロセスが自身の環境変数を /proc 経由で読めないようにする。
+                #[cfg(target_os = "linux")]
+                if libc::prctl(libc::PR_SET_DUMPABLE, 0 as libc::c_ulong) != 0 {
+                    libc::_exit(126);
+                }
+
+                // execve で環境変数を envp 経由で渡す。親プロセスの環境を継承しない。
+                libc::execve(shell.as_ptr(), argv.as_ptr(), envp.as_ptr());
+                libc::_exit(127);
+            }
+        }
+
+        (pid, master_fd)
     };
 
     if pid < 0 {
@@ -380,36 +532,6 @@ where
         )
         .await?;
         return Ok(());
-    }
-
-    if pid == 0 {
-        // 子プロセス: async-signal-safe な操作のみ実行する。
-        // すべてのヒープ確保・ライブラリ呼び出しは fork 前に完了済み。
-        // 環境変数は execve の envp 引数で渡すため clearenv/putenv は不要。
-        // envp / argv は fork 前にスタック上で構築済み。子プロセス内はヒープ確保なし。
-        unsafe {
-            if libc::setgid(gid) != 0 {
-                libc::_exit(126);
-            }
-            if libc::setuid(uid) != 0 {
-                libc::_exit(126);
-            }
-
-            if libc::chdir(workdir.as_ptr()) != 0 {
-                libc::_exit(126);
-            }
-
-            // /proc/self/environ のパーミッションを制限し、
-            // シェルプロセスが自身の環境変数を /proc 経由で読めないようにする。
-            #[cfg(target_os = "linux")]
-            if libc::prctl(libc::PR_SET_DUMPABLE, 0 as libc::c_ulong) != 0 {
-                libc::_exit(126);
-            }
-
-            // execve で環境変数を envp 経由で渡す。親プロセスの環境を継承しない。
-            libc::execve(shell.as_ptr(), argv.as_ptr(), envp.as_ptr());
-            libc::_exit(127);
-        }
     }
 
     // Own the child before any fallible parent-side setup.
@@ -455,7 +577,46 @@ pub(crate) async fn recv_message<R: tokio::io::AsyncRead + Unpin>(
 #[cfg(test)]
 mod tests {
     #[tokio::test]
-    async fn v2_host_and_real_agent_handshake_over_tcp() {
+    async fn ready_sources_rotate_and_have_independent_budgets() {
+        use super::{Forwarded, next_forwarded};
+        let (legacy_tx, mut legacy) = tokio::sync::mpsc::channel(16);
+        let (kernel_tx, kernel_rx) = tokio::sync::mpsc::channel(16);
+        let (http_tx, http_rx) = tokio::sync::mpsc::channel(16);
+        let mut kernel = Some(kernel_rx);
+        let mut http = Some(http_rx);
+        for _ in 0..8 {
+            legacy_tx.send(1u8).await.unwrap();
+            kernel_tx.send(2u8).await.unwrap();
+            http_tx.send(3u8).await.unwrap();
+        }
+        for round in 0..6 {
+            let event =
+                next_forwarded(&mut legacy, &mut kernel, &mut http, round, true, true).await;
+            assert!(matches!(
+                (round % 3, event),
+                (0, Forwarded::Legacy(Some(1)))
+                    | (1, Forwarded::Kernel(Some(_)))
+                    | (2, Forwarded::Http(Some(_)))
+            ));
+        }
+        assert!(matches!(
+            next_forwarded(&mut legacy, &mut kernel, &mut http, 1, false, true).await,
+            Forwarded::Http(Some(_))
+        ));
+        assert!(matches!(
+            next_forwarded(&mut legacy, &mut kernel, &mut http, 2, true, false).await,
+            Forwarded::Legacy(Some(1))
+        ));
+        kernel = None;
+        http = None;
+        assert!(matches!(
+            next_forwarded(&mut legacy, &mut kernel, &mut http, 1, true, true).await,
+            Forwarded::Legacy(Some(1))
+        ));
+    }
+
+    #[tokio::test]
+    async fn v3_host_and_real_agent_handshake_over_tcp() {
         use izanagi::protocol::{Message, read_message};
         use izanagi::protocol_client::ProtocolClient;
         use tokio::net::{TcpListener, TcpStream};

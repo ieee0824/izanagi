@@ -680,6 +680,7 @@ dependencies = [
  "glob",
  "hex",
  "hmac",
+ "izanagi-telemetry",
  "libc",
  "postcard",
  "rand",
@@ -702,6 +703,17 @@ dependencies = [
  "hickory-proto",
  "izanagi",
  "tokio",
+]
+
+[[package]]
+name = "izanagi-telemetry"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]
