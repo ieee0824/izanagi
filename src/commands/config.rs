@@ -117,10 +117,7 @@ fn cmd_config_mitm(config: &Config, config_path: &Path) -> anyhow::Result<u8> {
             .unwrap_or_default();
 
         if !secret_maps.is_empty() {
-            println!(
-                "現在のシークレットマッピング: {} 件 (内容は非表示)",
-                secret_maps.len()
-            );
+            println!("シークレットマッピングは登録済みです (内容は非表示)");
         }
 
         println!("シークレットマッピングを追加 (DUMMY=REAL 形式、空行で終了):");
