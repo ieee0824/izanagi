@@ -1,8 +1,7 @@
 use anyhow::Context;
 use izanagi::config::Config;
-use izanagi::protocol::{Message, load_shared_secret_from_env};
+use izanagi::protocol::load_shared_secret_from_env;
 use izanagi::session::{self, Session, SessionBackend};
-use tokio::io::AsyncReadExt;
 
 use super::{acquire_instance_lock, izanagi_dir, start_engine, stop_engine};
 
@@ -19,7 +18,7 @@ pub async fn cmd_shell(config: &Config) -> anyhow::Result<u8> {
 
     let (engine, log_storage) = start_engine(config, None).await?;
 
-    let shell_result = engine.sandbox().shell().await;
+    let shell_result = engine.shell().await;
 
     stop_engine(engine, &log_storage).await;
 
@@ -88,106 +87,60 @@ async fn qemu_interactive_shell(host_port: u16, token_hash: Option<&str>) -> any
         .handshake_and_wait_ready(token_hash.map(|s| s.to_string()))
         .await?;
 
-    // ターミナルサイズ取得
-    let (rows, cols) = get_terminal_size();
+    let code = izanagi::terminal_shell::interactive_shell(&mut client).await?;
+    Ok(code.try_into().unwrap_or(1))
+}
 
-    // Shell メッセージ送信
-    client.send_message(&Message::Shell { rows, cols }).await?;
-
-    // raw mode
-    let _raw_guard = RawModeGuard::enable()?;
-
-    let mut stdin = tokio::io::stdin();
-    let mut stdin_buf = vec![0u8; 1024];
-    let mut sigwinch =
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())?;
-
-    let mut exit_code: u8 = 0;
-
-    loop {
-        tokio::select! {
-            n = stdin.read(&mut stdin_buf) => {
-                match n {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        let msg = Message::ShellData {
-                            stream: 0,
-                            data: stdin_buf[..n].to_vec(),
-                        };
-                        client.send_message(&msg).await?;
-                    }
-                    Err(_) => break,
-                }
-            }
-            result = client.recv_message() => {
-                match result? {
-                    Some(Message::ShellData { data, .. }) => {
-                        use std::io::Write;
-                        std::io::stdout().write_all(&data)?;
-                        std::io::stdout().flush()?;
-                    }
-                    Some(Message::ShellClose { exit_code: code }) => {
-                        exit_code = code.try_into().unwrap_or(1);
-                        break;
-                    }
-                    Some(Message::Error(e)) => {
-                        anyhow::bail!("agent error: {}", e);
-                    }
-                    None => break,
-                    _ => {}
-                }
-            }
-            _ = sigwinch.recv() => {
-                let (rows, cols) = get_terminal_size();
-                client.send_message(&Message::ShellResize { rows, cols }).await?;
-            }
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn existing_session_shell_exits_and_restores_terminal_without_input() {
+        for mode in ["close", "disconnect", "error", "cancel"] {
+            crate::pty_test_support::exercise("commands::shell::tests::shell_runtime_probe", mode);
         }
     }
 
-    Ok(exit_code)
-}
-
-/// ターミナルサイズを取得する。
-fn get_terminal_size() -> (u16, u16) {
-    unsafe {
-        let mut ws: libc::winsize = std::mem::zeroed();
-        if libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) == 0
-            && ws.ws_row > 0
-            && ws.ws_col > 0
-        {
-            (ws.ws_row, ws.ws_col)
-        } else {
-            (24, 80)
-        }
-    }
-}
-
-/// RAII でターミナルを raw mode に設定し、ドロップ時に復元する。
-struct RawModeGuard {
-    original: libc::termios,
-}
-
-impl RawModeGuard {
-    fn enable() -> anyhow::Result<Self> {
-        unsafe {
-            let mut original: libc::termios = std::mem::zeroed();
-            if libc::tcgetattr(libc::STDIN_FILENO, &mut original) != 0 {
-                anyhow::bail!("tcgetattr failed: {}", std::io::Error::last_os_error());
+    #[test]
+    fn shell_runtime_probe() {
+        let Ok(port) = std::env::var("IZANAGI_PTY_TEST_PORT") else {
+            return;
+        };
+        let mode = std::env::var("IZANAGI_PTY_TEST_MODE").unwrap();
+        let original = crate::pty_test_support::terminal_snapshot();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = runtime.block_on(async {
+            let shell = super::qemu_interactive_shell(port.parse().unwrap(), None);
+            if mode == "cancel" {
+                tokio::time::timeout(std::time::Duration::from_millis(200), shell)
+                    .await
+                    .map_err(anyhow::Error::from)?
+            } else {
+                shell.await
             }
-            let mut raw = original;
-            libc::cfmakeraw(&mut raw);
-            if libc::tcsetattr(libc::STDIN_FILENO, libc::TCSAFLUSH, &raw) != 0 {
-                anyhow::bail!("tcsetattr failed: {}", std::io::Error::last_os_error());
-            }
-            Ok(Self { original })
+        });
+        match mode.as_str() {
+            "close" => assert_eq!(result.unwrap(), 0),
+            "disconnect" => assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("agent disconnected during shell")
+            ),
+            "error" => assert!(result.unwrap_err().to_string().contains("shell test error")),
+            "cancel" => assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("deadline has elapsed")
+            ),
+            _ => unreachable!(),
         }
-    }
-}
-
-impl Drop for RawModeGuard {
-    fn drop(&mut self) {
-        unsafe {
-            libc::tcsetattr(libc::STDIN_FILENO, libc::TCSAFLUSH, &self.original);
-        }
+        // Runtime destruction is part of the test: a blocking stdin task used to hang here.
+        drop(runtime);
+        crate::pty_test_support::assert_terminal_restored(&original);
     }
 }

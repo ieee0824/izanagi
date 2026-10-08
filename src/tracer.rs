@@ -36,6 +36,16 @@ pub const EVENT_CHANNEL_CAPACITY: usize = 4096;
 /// `&self` とすることで、trait object を `Arc` 経由で共有可能にする。
 #[async_trait::async_trait]
 pub trait Tracer: Send + Sync {
+    /// Whether losing the event channel is a monitoring failure.
+    fn requires_live_monitoring(&self) -> bool {
+        true
+    }
+
+    /// Last transport/backend failure, recorded before closing the event channel.
+    fn failure_reason(&self) -> Option<String> {
+        None
+    }
+
     /// トレースを開始し、イベントを受信するチャネルを返す。
     async fn start(
         &self,
@@ -81,6 +91,9 @@ impl NullTracer {
 
 #[async_trait::async_trait]
 impl Tracer for NullTracer {
+    fn requires_live_monitoring(&self) -> bool {
+        false
+    }
     async fn start(
         &self,
         _filter: &TraceFilter,

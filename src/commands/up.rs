@@ -44,7 +44,7 @@ pub async fn cmd_up(
         && http_capture.enabled
         && let Some(ref ca_path) = http_capture.ca_cert_out
     {
-        install_ca_cert(engine.sandbox(), ca_path).await;
+        install_ca_cert(&engine, ca_path).await;
     }
 
     let iza_dir = izanagi_dir();
@@ -97,6 +97,9 @@ pub async fn cmd_up(
                         }
                     }
                 }
+            }
+            error = engine.wait_for_monitoring_failure() => {
+                break Err(std::io::Error::other(error.to_string()));
             }
             result = &mut shutdown_signal => {
                 break result;
@@ -196,7 +199,7 @@ where
 /// heredoc (シングルクォートデリミタ) で PEM をサンドボックス内に書き込み、
 /// `update-ca-certificates` で信頼ストアを更新する。
 /// 失敗しても致命的ではないため、警告のみ出力して続行する。
-async fn install_ca_cert(sandbox: &dyn izanagi::sandbox::Sandbox, ca_path: &Path) {
+async fn install_ca_cert(engine: &Engine, ca_path: &Path) {
     // izanagi-http-capture が CA 証明書を書き出す前に読み取りを試みると
     // 一時的に ENOENT となる可能性があるため、短時間リトライする。
     let ca_pem = {
@@ -239,7 +242,7 @@ async fn install_ca_cert(sandbox: &dyn izanagi::sandbox::Sandbox, ca_path: &Path
             ca_pem.trim()
         ),
     ];
-    match sandbox.exec(&write_cmd, &env).await {
+    match engine.exec(&write_cmd, &env).await {
         Ok(output) if output.exit_code == 0 => {}
         Ok(output) => {
             eprintln!(
@@ -263,7 +266,7 @@ async fn install_ca_cert(sandbox: &dyn izanagi::sandbox::Sandbox, ca_path: &Path
         "-c".to_string(),
         "update-ca-certificates 2>/dev/null".to_string(),
     ];
-    match sandbox.exec(&update_cmd, &env).await {
+    match engine.exec(&update_cmd, &env).await {
         Ok(output) if output.exit_code == 0 => {
             eprintln!("[proxy] CA 証明書をサンドボックス内にインストールしました");
         }

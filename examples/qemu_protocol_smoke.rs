@@ -24,10 +24,10 @@ async fn main() -> anyhow::Result<()> {
         let mut client = ProtocolClient::new(reader, writer, Some(secret));
         client.handshake_and_wait_ready(Some(token_hash)).await?;
         client
-            .send_message(&Message::Start(TraceFilter {
+            .start_tracing(&TraceFilter {
                 categories: vec![izanagi::event::SyscallCategory::File],
                 pids: None,
-            }))
+            })
             .await?;
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         let output = sandbox

@@ -165,6 +165,9 @@ where
                     }
                 };
 
+                let transfer_result: anyhow::Result<()> = async {
+                send_message(&mut writer, &Message::TraceStarted, secret, &mut send_seq).await?;
+
                 // イベント転送ループ
                 // agent 自身の syscall をプロセス名でフィルタして転送量を削減する。
                 // eBPF の pid フィールドは TID (スレッドID) であり std::process::id() (TGID)
@@ -186,6 +189,7 @@ where
                                     // agent 自身の syscall はスキップ
                                 }
                                 None => {
+                                    send_message(&mut writer, &Message::Error("trace event stream ended unexpectedly".into()), secret, &mut send_seq).await?;
                                     break;
                                 }
                             }
@@ -204,7 +208,10 @@ where
                         }
                     }
                 }
+                    Ok(())
+                }.await;
                 tracer.stop().await?;
+                transfer_result?;
             }
             Some(Message::Shell { rows, cols }) => {
                 if !authenticated {

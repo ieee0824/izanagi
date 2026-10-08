@@ -27,7 +27,7 @@ pub async fn cmd_exec(config: &Config, cmd: &[String]) -> anyhow::Result<u8> {
         let env = build_sandbox_env();
 
         tokio::select! {
-            result = engine.sandbox().exec(cmd, &env) => {
+            result = engine.exec(cmd, &env) => {
                 match result {
                     Ok(output) => {
                         if !output.stdout.is_empty() {

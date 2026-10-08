@@ -61,3 +61,17 @@ then create a new session. A live connection cannot be migrated between versions
 - RustSec scans all lockfiles without the bincode maintenance warning; CodeQL passes.
 - Before release, smoke-test the rebuilt QEMU image: authenticated Hello/Ready,
   Exec, Shell and Event forwarding, and rejection of an old-image/new-host pair.
+
+## Tracing readiness and failure handling
+
+`Start` now requires `TraceStarted` (message type and postcard variant 12), sent
+only after the agent tracer has initialized successfully. `Ready` confirms the
+connection handshake, not tracing readiness. The host waits up to 15 seconds for
+Hello/Ready/TraceStarted and refuses to run commands when initialization fails or
+monitoring ends unexpectedly. Rebuild the agent and guest image together with the
+host; an older agent without this acknowledgement cannot satisfy tracing startup.
+There is no fallback to accepting Ready or an Event as a tracing acknowledgement.
+
+With monitoring enabled, exec/shell are interrupted when the event stream fails,
+and the CLI stops the sandbox. `up` also stops the sandbox and removes its session
+state on monitoring loss. `--tracer none` deliberately opts out of this policy.

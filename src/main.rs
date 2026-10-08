@@ -14,6 +14,8 @@ use izanagi::log_storage::LogStorage;
 use std::os::unix::io::AsRawFd;
 
 mod commands;
+#[cfg(test)]
+mod pty_test_support;
 
 /// Izanagi — サプライチェーン攻撃から開発環境を守るサンドボックスツール
 #[derive(Parser)]

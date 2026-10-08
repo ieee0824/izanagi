@@ -82,6 +82,20 @@ where
         }
     }
 
+    /// Start is successful only after the agent confirms its tracer is active.
+    pub async fn start_tracing(
+        &mut self,
+        filter: &crate::tracer::TraceFilter,
+    ) -> anyhow::Result<()> {
+        self.send_message(&Message::Start(filter.clone())).await?;
+        match self.recv_message().await? {
+            Some(Message::TraceStarted) => Ok(()),
+            Some(Message::Error(error)) => anyhow::bail!("agent failed to start tracing: {error}"),
+            None => anyhow::bail!("agent disconnected before TraceStarted"),
+            other => anyhow::bail!("expected TraceStarted acknowledgement, got {other:?}"),
+        }
+    }
+
     /// メッセージを送信する。認証モードに応じて HMAC 署名を付与する。
     pub async fn send_message(&mut self, msg: &Message) -> anyhow::Result<()> {
         match self.secret.as_deref() {
