@@ -1,31 +1,25 @@
 use std::path::Path;
 
 use anyhow::Context;
-use dialoguer::{Confirm, Input};
+use dialoguer::{Confirm, Input, Password};
 use izanagi::config::{Config, DnsProxySection, HttpCaptureSection};
 
 use super::ConfigAction;
 
+/// Mapping strings may contain credentials even when malformed or on the dummy side.
+/// Never include any part of them in terminal output.
+fn redacted_config_toml(config: &Config) -> anyhow::Result<String> {
+    let mut display_config = config.clone();
+    if let Some(ref mut hc) = display_config.http_capture {
+        hc.secret_maps = vec!["[REDACTED]".to_string(); hc.secret_maps.len()];
+    }
+    toml::to_string_pretty(&display_config).context("設定の TOML シリアライズに失敗")
+}
+
 pub fn cmd_config(action: ConfigAction, config: &Config, config_path: &Path) -> anyhow::Result<u8> {
     match action {
         ConfigAction::Show => {
-            // secret_maps の REAL 側をマスクしてから出力
-            let mut display_config = config.clone();
-            if let Some(ref mut hc) = display_config.http_capture {
-                hc.secret_maps = hc
-                    .secret_maps
-                    .iter()
-                    .map(|m| {
-                        if let Some(pos) = m.find('=') {
-                            format!("{}=***", &m[..pos])
-                        } else {
-                            m.clone()
-                        }
-                    })
-                    .collect();
-            }
-            let toml_str = toml::to_string_pretty(&display_config)
-                .context("設定の TOML シリアライズに失敗")?;
+            let toml_str = redacted_config_toml(config)?;
             println!("{}", toml_str);
         }
         ConfigAction::Path => {
@@ -123,22 +117,18 @@ fn cmd_config_mitm(config: &Config, config_path: &Path) -> anyhow::Result<u8> {
             .unwrap_or_default();
 
         if !secret_maps.is_empty() {
-            println!("現在のシークレットマッピング:");
-            for m in &secret_maps {
-                if let Some(pos) = m.find('=') {
-                    println!("  {}=***", &m[..pos]);
-                } else {
-                    println!("  {}", m);
-                }
-            }
+            println!(
+                "現在のシークレットマッピング: {} 件 (内容は非表示)",
+                secret_maps.len()
+            );
         }
 
         println!("シークレットマッピングを追加 (DUMMY=REAL 形式、空行で終了):");
         loop {
-            let input: String = Input::new()
+            let input: String = Password::new()
                 .with_prompt("追加するマッピング")
-                .allow_empty(true)
-                .interact_text()?;
+                .allow_empty_password(true)
+                .interact()?;
             if input.is_empty() {
                 break;
             }
@@ -184,6 +174,53 @@ fn cmd_config_mitm(config: &Config, config_path: &Path) -> anyhow::Result<u8> {
 
     println!("設定を保存しました: {}", config_path.display());
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_display_hides_all_mapping_content_without_mutating_config() {
+        let mappings = vec![
+            "dummy=real-credential".to_string(),
+            "malformed-credential".to_string(),
+            "credential-on-left=value=with=equals".to_string(),
+            "=empty-dummy-credential".to_string(),
+            String::new(),
+        ];
+        let mut config = Config::default();
+        config.http_capture = Some(HttpCaptureSection {
+            enabled: true,
+            listen_http: "127.0.0.1:18080".parse().unwrap(),
+            listen_https: "127.0.0.1:18443".parse().unwrap(),
+            ca_cert_out: None,
+            secret_maps: mappings.clone(),
+        });
+
+        let output = redacted_config_toml(&config).unwrap();
+        for sensitive in &mappings {
+            if !sensitive.is_empty() {
+                assert!(!output.contains(sensitive));
+            }
+        }
+        assert!(!output.contains("credential"));
+        let displayed: Config = toml::from_str(&output).unwrap();
+        assert_eq!(
+            displayed.http_capture.unwrap().secret_maps,
+            vec!["[REDACTED]"; mappings.len()]
+        );
+        assert_eq!(config.http_capture.unwrap().secret_maps, mappings);
+    }
+
+    #[test]
+    fn config_display_without_http_capture_is_unchanged() {
+        let config = Config::default();
+        assert_eq!(
+            redacted_config_toml(&config).unwrap(),
+            toml::to_string_pretty(&config).unwrap()
+        );
+    }
 }
 
 /// Config を TOML として設定ファイルに書き出す。
