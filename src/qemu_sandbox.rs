@@ -176,6 +176,32 @@ pub fn build_qemu_args(params: &QemuArgsParams<'_>) -> Vec<String> {
         format!("file={},format=qcow2,snapshot=on", image_path.display()),
     ]);
 
+    push_qemu_share(&mut args, share);
+
+    push_qemu_network(&mut args, *host_port, *dns_proxy);
+
+    // ヘッドレスモード
+    args.push("-nographic".to_string());
+
+    push_qemu_auth_files(&mut args, *token, *secret);
+
+    args
+}
+
+fn push_qemu_network(args: &mut Vec<String>, host_port: u16, dns_proxy: Option<&str>) {
+    // ネットワーク (TCP ポートフォワーディング + DNS プロキシ)
+    let mut netdev = format!("user,id=net0,hostfwd=tcp::{}-:{}", host_port, AGENT_PORT);
+    if let Some(dns_ip) = dns_proxy {
+        netdev.push_str(&format!(",dns={}", dns_ip));
+    }
+    args.extend_from_slice(&["-netdev".to_string(), netdev]);
+    args.extend_from_slice(&[
+        "-device".to_string(),
+        "virtio-net-pci,netdev=net0".to_string(),
+    ]);
+}
+
+fn push_qemu_share(args: &mut Vec<String>, share: &ShareConfig) {
     // virtio-9p ファイル共有 (#37)
     if let Some(host_path) = share.host_paths.first() {
         args.extend_from_slice(&[
@@ -190,21 +216,9 @@ pub fn build_qemu_args(params: &QemuArgsParams<'_>) -> Vec<String> {
             "virtio-9p-pci,fsdev=fs0,mount_tag=workspace".to_string(),
         ]);
     }
+}
 
-    // ネットワーク (TCP ポートフォワーディング + DNS プロキシ)
-    let mut netdev = format!("user,id=net0,hostfwd=tcp::{}-:{}", host_port, AGENT_PORT);
-    if let Some(dns_ip) = dns_proxy {
-        netdev.push_str(&format!(",dns={}", dns_ip));
-    }
-    args.extend_from_slice(&["-netdev".to_string(), netdev]);
-    args.extend_from_slice(&[
-        "-device".to_string(),
-        "virtio-net-pci,netdev=net0".to_string(),
-    ]);
-
-    // ヘッドレスモード
-    args.push("-nographic".to_string());
-
+fn push_qemu_auth_files(args: &mut Vec<String>, token: Option<&str>, secret: Option<&str>) {
     // fw_cfg でゲストにトークン・シークレットを渡す (#115, #161)
     // Agent は /sys/firmware/qemu_fw_cfg/by_name/opt/izanagi.{token,secret}/raw から読み取る
     // file= 形式で渡すことで ps にトークンが表示されない
@@ -220,8 +234,6 @@ pub fn build_qemu_args(params: &QemuArgsParams<'_>) -> Vec<String> {
             format!("name=opt/izanagi.secret,file={}", secret_file),
         ]);
     }
-
-    args
 }
 
 /// セッショントークン（32 バイト = 64 文字 hex）を生成する。

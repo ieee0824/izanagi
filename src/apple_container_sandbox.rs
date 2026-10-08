@@ -155,47 +155,11 @@ pub fn build_run_args(
         container_name.to_string(),
     ];
 
-    // ポートフォワード: --network none と非互換。
-    // Config::validate() でガードされているが、防御的にここでもチェックする。
-    if network.is_none() {
-        // 127.0.0.1 にバインドし、ホスト外部からの接続を防ぐ
-        args.extend_from_slice(&[
-            "-p".to_string(),
-            format!("127.0.0.1:{}:{}", host_port, AGENT_PORT),
-        ]);
-    }
+    push_container_port(&mut args, host_port, network);
 
-    // コンテナ環境には fw_cfg がないため、トークン認証をスキップする。
-    // コマンド実行はホスト側で HMAC 認証済みのため、agent 側は全コマンドを許可する。
-    // ポートは 127.0.0.1 にバインドされるため、外部からの接続は不可。
-    args.extend_from_slice(&[
-        "-e".to_string(),
-        "IZANAGI_ALLOW_NO_TOKEN=1".to_string(),
-        "-e".to_string(),
-        "IZANAGI_ALLOW_ALL_COMMANDS=1".to_string(),
-    ]);
+    push_container_agent_env(&mut args, env_file);
 
-    // シークレットは --env-file 経由で渡す
-    if let Some(path) = env_file {
-        args.extend_from_slice(&["--env-file".to_string(), path.to_string()]);
-    }
-
-    // ボリュームマウント（最初のパスのみマウント）
-    if let Some(host_path) = share.host_paths.first() {
-        let path_str = host_path.to_string_lossy();
-        let abs_path = if path_str.starts_with('~') {
-            let home = std::env::var("HOME").unwrap_or_default();
-            PathBuf::from(path_str.replacen('~', &home, 1))
-        } else if host_path.is_relative() {
-            std::env::current_dir().unwrap_or_default().join(host_path)
-        } else {
-            host_path.clone()
-        };
-        args.extend_from_slice(&[
-            "--volume".to_string(),
-            format!("{}:{}", abs_path.display(), share.mount_point.display()),
-        ]);
-    }
+    push_container_share(&mut args, share);
 
     // DNS プロキシ
     if let Some(dns_ip) = dns_proxy {
@@ -214,6 +178,58 @@ pub fn build_run_args(
     args.push(image.to_string());
 
     args
+}
+
+fn push_container_agent_env(args: &mut Vec<String>, env_file: Option<&str>) {
+    // コンテナ環境には fw_cfg がないため、トークン認証をスキップする。
+    // コマンド実行はホスト側で HMAC 認証済みのため、agent 側は全コマンドを許可する。
+    // ポートは 127.0.0.1 にバインドされるため、外部からの接続は不可。
+    args.extend_from_slice(&[
+        "-e".to_string(),
+        "IZANAGI_ALLOW_NO_TOKEN=1".to_string(),
+        "-e".to_string(),
+        "IZANAGI_ALLOW_ALL_COMMANDS=1".to_string(),
+    ]);
+
+    // シークレットは --env-file 経由で渡す
+    if let Some(path) = env_file {
+        args.extend_from_slice(&["--env-file".to_string(), path.to_string()]);
+    }
+}
+
+fn push_container_port(
+    args: &mut Vec<String>,
+    host_port: u16,
+    network: Option<crate::config::ContainerNetworkMode>,
+) {
+    // ポートフォワード: --network none と非互換。
+    // Config::validate() でガードされているが、防御的にここでもチェックする。
+    if network.is_none() {
+        // 127.0.0.1 にバインドし、ホスト外部からの接続を防ぐ
+        args.extend_from_slice(&[
+            "-p".to_string(),
+            format!("127.0.0.1:{}:{}", host_port, AGENT_PORT),
+        ]);
+    }
+}
+
+fn push_container_share(args: &mut Vec<String>, share: &ShareConfig) {
+    // ボリュームマウント（最初のパスのみマウント）
+    if let Some(host_path) = share.host_paths.first() {
+        let path_str = host_path.to_string_lossy();
+        let abs_path = if path_str.starts_with('~') {
+            let home = std::env::var("HOME").unwrap_or_default();
+            PathBuf::from(path_str.replacen('~', &home, 1))
+        } else if host_path.is_relative() {
+            std::env::current_dir().unwrap_or_default().join(host_path)
+        } else {
+            host_path.clone()
+        };
+        args.extend_from_slice(&[
+            "--volume".to_string(),
+            format!("{}:{}", abs_path.display(), share.mount_point.display()),
+        ]);
+    }
 }
 
 /// `container exec` コマンドの引数を構築する。
@@ -559,6 +575,34 @@ impl Sandbox for AppleContainerSandbox {
 
 impl AppleContainerSandbox {
     /// コンテナを停止・削除する。
+    async fn remove_container(&self, name: &str) {
+        // --rm 付きで起動しているが、異常終了時に残留する場合があるため明示的に削除
+        let rm_output = Command::new(&self.container_binary)
+            .args(["rm", "-f", name])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .await;
+
+        // rm -f の結果もチェック (#218)
+        match rm_output {
+            Ok(output) if !output.status.success() => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let stderr_lower = stderr.to_ascii_lowercase();
+                // コンテナが既に存在しない場合は正常
+                if !stderr_lower.contains("not found")
+                    && !stderr_lower.contains("no such container")
+                {
+                    eprintln!("警告: container rm failed: {}", stderr);
+                }
+            }
+            Err(e) => {
+                eprintln!("警告: container rm の実行に失敗: {}", e);
+            }
+            _ => {}
+        }
+    }
+
     async fn stop_container(&mut self) -> anyhow::Result<()> {
         if let Some(ref name) = self.container_name {
             // コンテナを停止（--rm で既に削除済みの場合はエラーを無視）
@@ -581,31 +625,7 @@ impl AppleContainerSandbox {
                 }
             }
 
-            // --rm 付きで起動しているが、異常終了時に残留する場合があるため明示的に削除
-            let rm_output = Command::new(&self.container_binary)
-                .args(["rm", "-f", name])
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output()
-                .await;
-
-            // rm -f の結果もチェック (#218)
-            match rm_output {
-                Ok(output) if !output.status.success() => {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    let stderr_lower = stderr.to_ascii_lowercase();
-                    // コンテナが既に存在しない場合は正常
-                    if !stderr_lower.contains("not found")
-                        && !stderr_lower.contains("no such container")
-                    {
-                        eprintln!("警告: container rm failed: {}", stderr);
-                    }
-                }
-                Err(e) => {
-                    eprintln!("警告: container rm の実行に失敗: {}", e);
-                }
-                _ => {}
-            }
+            self.remove_container(name).await;
         }
         self.container_name = None;
         Ok(())

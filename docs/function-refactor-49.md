@@ -189,6 +189,18 @@ All existing binary tests pass; regressions cover lock-file contents on reopen
 and config-path dispatch without an existing configuration. Linux cross-target
 all-target/all-feature Clippy passes.
 
+### Sandbox command construction and container removal
+
+QEMU and Apple Container argument construction are split into shared-volume,
+network/port and agent authentication-file/environment responsibilities. All
+three completed candidates (both argument builders and container stop) and new
+helpers are below 50 lines. Exact argument ordering, first-share-only behavior,
+snapshot protection and file-based secrets remain unchanged. Container removal
+keeps its advisory diagnostics after stop, and state is cleared at the same point.
+
+All 12 QEMU argument tests, nine Apple argument tests and the full Apple Container
+test group pass. Linux cross-target all-target/all-feature Clippy passes.
+
 ## Outstanding work
 
 The remaining inventory is work to complete, except explicitly documented
