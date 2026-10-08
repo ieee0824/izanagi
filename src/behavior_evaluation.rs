@@ -59,6 +59,10 @@ pub struct EvaluationScenario {
 #[serde(deny_unknown_fields)]
 pub struct EvaluationManifest {
     pub schema_version: u16,
+    pub feature_version: u16,
+    pub host_policy_version: u16,
+    /// The PoC remains advisory regardless of measured classification accuracy.
+    pub promotion_policy: String,
     pub seed: u64,
     pub source_commit: String,
     pub collector_commit: String,
@@ -66,6 +70,8 @@ pub struct EvaluationManifest {
     pub scenario_version: String,
     pub baseline_version: String,
     pub model: String,
+    /// Operator-declared MCP revision; null records that it was not independently verified.
+    pub mcp_commit: Option<String>,
     pub question_version: u16,
     pub min_confidence: f64,
     pub distribution_tolerance: f64,
@@ -82,7 +88,13 @@ impl EvaluationManifest {
             value.len() == len && value.bytes().all(|b| b.is_ascii_hexdigit())
         };
         if self.schema_version != 1
+            || self.feature_version != izanagi_telemetry::FEATURE_VERSION
+            || self.host_policy_version != 1
+            || self.promotion_policy != "audit_only_no_automatic_promotion_v1"
             || self.model != PINNED_MODEL
+            || self.mcp_commit.as_ref().is_some_and(|commit| {
+                commit.len() != 40 || !commit.bytes().all(|b| b.is_ascii_hexdigit())
+            })
             || self.question_version != QUESTION_VERSION
             || !hex(&self.source_commit, 40)
             || !hex(&self.collector_commit, 40)
@@ -361,6 +373,7 @@ pub async fn evaluate_manifest(
     }
     if let Some(config) = classifier.configuration()
         && (config.model != manifest.model
+            || config.mcp_commit != manifest.mcp_commit
             || config.min_confidence != manifest.min_confidence
             || config.confidence_tolerance != manifest.confidence_tolerance
             || config.distribution_tolerance != manifest.distribution_tolerance)

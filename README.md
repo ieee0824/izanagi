@@ -204,7 +204,9 @@ izanagi behavior evaluate --manifest tests/fixtures/behavior/manifest.json \
 
 ライブ収集は `[behavior] enabled = true` で明示的に有効化します。Jev のライブ送信には `[behavior.classifier] provider = "jev-mcp"` と `allow_export = true` が必要です。設定例は [configs/default.toml](configs/default.toml)、設計と検証は [行動分析設計](docs/jev-behavior-analysis-design.md)・[検証記録](docs/jev-behavior-validation.md) を参照してください。行動分析と raw `--pcap` の併用は拒否します。
 
-guest には同じ版の `izanagi-agent` と eBPF object に加え、root 所有・非特権ユーザーから書き換え不能な `/usr/local/bin/izanagi-http-capture` が必要です。guest exec/shell に `http_proxy` / `HTTP_PROXY` を設定しますが、proxy を使用しない通信はこの PoC の対象外です。現在の kernel 観測は connector を識別し、writer / namespace の証明が不足するライブ window を明示的に棄権します。実モデルの小規模試験でも D に対する改善は確認できていないため、運用判定へ昇格させていません。
+guest には同じ版の `izanagi-agent` と eBPF object に加え、root 所有・非特権ユーザーから書き換え不能な `/usr/local/bin/izanagi-http-capture` が必要です。guest exec/shell に `http_proxy` / `HTTP_PROXY` を設定しますが、proxy を使用しない通信はこの PoC の対象外です。現在の kernel 観測は connector を識別し、writer / namespace の証明が不足するライブ window を明示的に棄権します。実モデルの小規模試験でも D に対する改善は確認できていないため、運用判定へ昇格させていません。評価 manifest に feature/host policy 版と監査専用の昇格方針を保存し、応答には質問 digest と usage を残します。MCP commit は operator が別途確認した版を `--mcp-commit` / `behavior.classifier.mcp_commit` で指定でき、未確認の場合は null と記録します。
+
+境界 fixture の比較は `tests/fixtures/behavior/boundary-manifest.json`、実 VM での再検証手順は [tests/manual/README.md](tests/manual/README.md) を参照してください。
 
 ### MCP Server
 
@@ -528,26 +530,28 @@ cargo build --release --features landlock,ebpf
 | `make build` | ホスト側バイナリをビルド |
 | `make build-agent-gnu` | agent を Linux glibc クロスビルド (Debian VM 向け) |
 | `make build-agent` | agent を Linux musl クロスビルド (Alpine VM 向け) |
+| `make build-http-gnu` | guest HTTP sidecar を Linux glibc クロスビルド |
 | `make build-ebpf` | eBPF プログラムをビルド (nightly + LLVM 必要) |
-| `make build-all` | ホスト + agent + eBPF を全ビルド |
+| `make build-all` | ホスト + agent + eBPF + HTTP sidecar を全ビルド |
 | `make install` | ホスト側バイナリを `~/.izanagi/bin` にインストール |
-| `make qemu-image` | QEMU qcow2 イメージをビルド (Debian, agent + eBPF 含む) |
-| `make qemu-image-quick` | 既存の agent + eBPF バイナリで QEMU イメージをビルド |
+| `make qemu-image` | QEMU qcow2 イメージをビルド (Debian, agent + eBPF + HTTP sidecar 含む) |
+| `make qemu-image-quick` | 既存の agent + eBPF + HTTP sidecar で QEMU イメージをビルド |
 | `make image` | コンテナイメージをビルド (Debian) |
 | `make test` | テスト実行 |
 | `make lint` | clippy + fmt チェック |
 
 ### QEMU VM イメージの作成
 
-agent バイナリと eBPF オブジェクトを Packer で qcow2 イメージにベイクする。
+agent・eBPF object・HTTP sidecar を Packer で qcow2 イメージに配置する。
 
 ```bash
-# フルビルド (agent + eBPF + Packer を一括実行)
+# フルビルド (agent + eBPF + HTTP sidecar + Packer)
 make qemu-image
 
 # 個別ビルド後にイメージ作成
 make build-agent-gnu
 make build-ebpf
+make build-http-gnu
 make qemu-image-quick
 
 # Alpine イメージ（軽量、eBPF なし）

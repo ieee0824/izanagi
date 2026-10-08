@@ -82,6 +82,13 @@ pub struct ClassificationAudit {
     pub window_id: String,
     pub revision: u32,
     pub projection_digest: String,
+    pub feature_version: u16,
+    pub question_version: u16,
+    pub host_policy_version: u16,
+    pub question_digest: String,
+    pub mcp_commit: Option<String>,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
     pub status: ClassificationStatus,
     pub class: Option<ThreatClass>,
     pub reason: Option<ClassificationReason>,
@@ -117,6 +124,14 @@ impl ClassificationAudit {
                 .projection_digest
                 .bytes()
                 .all(|b| b.is_ascii_hexdigit())
+            || self.feature_version != crate::FEATURE_VERSION
+            || self.question_version != 1
+            || self.host_policy_version != 1
+            || self.question_digest.len() != 64
+            || !self.question_digest.bytes().all(|b| b.is_ascii_hexdigit())
+            || self.mcp_commit.as_ref().is_some_and(|commit| {
+                commit.len() != 40 || !commit.bytes().all(|b| b.is_ascii_hexdigit())
+            })
             || !valid_model(&self.requested_model)
             || self
                 .returned_model

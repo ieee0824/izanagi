@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
   "seed": 39,
-  "source_commit": "eb14149b5b508c1814ee84a7358d855d63b1dbec",
-  "collector_commit": "eb14149b5b508c1814ee84a7358d855d63b1dbec",
+  "source_commit": "614d4861a9e495a97304deae799afc75d93de859",
+  "collector_commit": "614d4861a9e495a97304deae799afc75d93de859",
   "vm_image_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
   "scenario_version": "synthetic-v1",
   "baseline_version": "fixture-v1",
@@ -56,5 +56,9 @@
       ],
       "events_sha256": "7b20163941d1d395d72f1b55195a149f959f8c37a6457f3a67f8acfe09689d40"
     }
-  ]
+  ],
+  "feature_version": 1,
+  "host_policy_version": 1,
+  "promotion_policy": "audit_only_no_automatic_promotion_v1",
+  "mcp_commit": null
 }

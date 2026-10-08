@@ -270,10 +270,10 @@ impl Sidecar {
 }
 impl Drop for Sidecar {
     fn drop(&mut self) {
-        if let Ok(mut active) = ACTIVE.get_or_init(|| Mutex::new(None)).lock() {
-            if active.as_ref().is_some_and(|(id, _)| id == &self.id) {
-                *active = None;
-            }
+        if let Ok(mut active) = ACTIVE.get_or_init(|| Mutex::new(None)).lock()
+            && active.as_ref().is_some_and(|(id, _)| id == &self.id)
+        {
+            *active = None;
         }
         let _ = self.child.start_kill();
         for task in &self.tasks {

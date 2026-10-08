@@ -26,6 +26,7 @@ use tokio::{
 #[derive(Default)]
 struct Counters {
     requested_model: String,
+    mcp_commit: Option<String>,
     events: AtomicU64,
     invalid: AtomicU64,
     storage_failed: AtomicU64,
@@ -145,6 +146,7 @@ impl BehaviorRuntime {
         )?;
         let store = Arc::new(Mutex::new(store));
         let counters = Arc::new(Counters {
+            mcp_commit: config.classifier.mcp_commit.clone(),
             requested_model: if config.classifier.provider == "mock" {
                 "mock-v1".into()
             } else {
@@ -176,7 +178,7 @@ impl BehaviorRuntime {
             counters.clone(),
         ));
         eprintln!(
-            "behavior audit session: {session_id} (advisory, classifier={})",
+            "behavior audit started (advisory, classifier={})",
             config.classifier.provider
         );
         Ok(Self {
@@ -273,6 +275,16 @@ async fn ingest(
         let snapshots = tokio::select! {
             biased;
             _=stop.changed(), if !closing=> { rx.close(); closing=true; Vec::new() },
+            _=tick.tick(), if !closing=> {
+                let mut snapshots=Vec::new();
+                for (domain,(observed,received,uncertainty)) in &clocks {
+                    // Guest and host monotonic clocks have different epochs. Advance only
+                    // by elapsed host duration since an actual same-domain guest event.
+                    let elapsed=received.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+                    snapshots.extend(correlator.advance_clock_uncertain(domain,observed.saturating_add(elapsed),uncertainty.saturating_add(5_000_000)));
+                }
+                snapshots
+            },
             event=rx.recv()=> {
                 let Some(mut event)=event else { break; };
                 if event.session_id!=session || event.validate().is_err() {
@@ -288,7 +300,10 @@ async fn ingest(
                 if pending_gap { event.quality.issues.push(QualityIssue::EventLoss); }
                 if clocks.len()<16 || clocks.contains_key(&event.clock_domain) {
                     let clock=clocks.entry(event.clock_domain.clone()).or_insert((event.observed_monotonic_ns,Instant::now(),event.clock_uncertainty_ns));
-                    if event.observed_monotonic_ns>=clock.0 { *clock=(event.observed_monotonic_ns,Instant::now(),event.clock_uncertainty_ns); }
+                    // Delayed source events must not reset the live clock estimate backwards.
+                    let estimate=clock.0.saturating_add(clock.1.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+                    if event.observed_monotonic_ns>=estimate { *clock=(event.observed_monotonic_ns,Instant::now(),event.clock_uncertainty_ns); }
+                    else { clock.2=clock.2.max(event.clock_uncertainty_ns); }
                 } else { event.quality.issues.push(QualityIssue::ClockUnknown); }
                 let result=store.lock().expect("audit lock").append_event(&event,unix_secs());
                 let storage_bad=!result.as_ref().is_ok_and(|r|!r.storage_gap);
@@ -296,16 +311,6 @@ async fn ingest(
                 if storage_bad { event.quality.issues.push(QualityIssue::StorageGap); }
                 match correlator.ingest(event) { Ok(s)=>s,Err(_)=>{ counters.invalid.fetch_add(1,Ordering::Relaxed); pending_gap=true; Vec::new() } }
             },
-            _=tick.tick(), if !closing=> {
-                let mut snapshots=Vec::new();
-                for (domain,(observed,received,uncertainty)) in &clocks {
-                    // Guest and host monotonic clocks have different epochs. Advance only
-                    // by elapsed host duration since an actual same-domain guest event.
-                    let elapsed=received.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-                    snapshots.extend(correlator.advance_clock_uncertain(domain,observed.saturating_add(elapsed),uncertainty.saturating_add(5_000_000)));
-                }
-                snapshots
-            }
         };
         for snapshot in snapshots {
             enqueue(snapshot, &queue, &store, &latest, &counters);
@@ -413,9 +418,18 @@ async fn classify(
             }
         } else {
             let projection = pending.snapshot.projection(FeatureMode::Correlated);
+            let classifier = classifier.clone();
+            // JoinSet aborts its invocation on timeout, shutdown, or worker drop.
+            // A provider panic becomes an audit failure; ingestion keeps running.
+            let mut invocation = tokio::task::JoinSet::new();
+            invocation.spawn(async move { classifier.classify(&projection).await });
             tokio::select! { biased;
                 _=stop.changed()=> { record(&pending.snapshot,ClassificationOutcome::Skipped{reason:SkipReason::SessionEnded},&store,&counters); break; },
-                outcome=tokio::time::timeout(Duration::from_secs(config.classifier.deadline_secs),classifier.classify(&projection))=>outcome.unwrap_or(ClassificationOutcome::Failed{kind:crate::behavior_classifier::ClassificationErrorKind::Timeout}),
+                outcome=tokio::time::timeout(Duration::from_secs(config.classifier.deadline_secs),invocation.join_next())=>match outcome {
+                    Ok(Some(Ok(outcome)))=>outcome,
+                    Ok(_)=>ClassificationOutcome::Failed{kind:crate::behavior_classifier::ClassificationErrorKind::Panicked},
+                    Err(_)=>ClassificationOutcome::Failed{kind:crate::behavior_classifier::ClassificationErrorKind::Timeout},
+                },
             }
         };
         let outcome = if pending.created.elapsed()
@@ -531,6 +545,15 @@ fn persist_classification(
         window_id: snapshot.window_id.clone(),
         revision: snapshot.revision,
         projection_digest,
+        feature_version: snapshot.feature_version,
+        question_version: crate::behavior_classifier::QUESTION_VERSION,
+        host_policy_version: 1,
+        question_digest: crate::behavior_classifier::question_digest(),
+        mcp_commit: answer
+            .and_then(|a| a.mcp_commit.clone())
+            .or_else(|| counters.mcp_commit.clone()),
+        input_tokens: answer.map(|a| a.input_tokens),
+        output_tokens: answer.map(|a| a.output_tokens),
         status,
         class: answer.map(|a| a.class),
         reason,

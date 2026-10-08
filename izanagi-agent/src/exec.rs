@@ -180,12 +180,12 @@ pub(crate) async fn execute_command(
         Err(_) => {
             // タイムアウト: プロセスグループ全体を kill して孫プロセスも含めて停止する
             #[cfg(unix)]
-            if let Some(pid) = child.id() {
-                if let Ok(pid_i32) = i32::try_from(pid) {
-                    // 負の PID でプロセスグループ全体に SIGKILL を送信
-                    unsafe {
-                        libc::kill(-pid_i32, libc::SIGKILL);
-                    }
+            if let Some(pid) = child.id()
+                && let Ok(pid_i32) = i32::try_from(pid)
+            {
+                // 負の PID でプロセスグループ全体に SIGKILL を送信
+                unsafe {
+                    libc::kill(-pid_i32, libc::SIGKILL);
                 }
                 // i32 変換失敗時は child.kill() にフォールバック
             }

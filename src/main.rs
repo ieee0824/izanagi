@@ -50,7 +50,7 @@ enum Commands {
     /// 行動分析のローカル再生・監査表示・比較評価
     Behavior {
         #[command(subcommand)]
-        action: izanagi::behavior_cli::BehaviorAction,
+        action: Box<izanagi::behavior_cli::BehaviorAction>,
     },
     /// サンドボックスを起動
     Up {
@@ -442,7 +442,7 @@ async fn run() -> anyhow::Result<u8> {
 /// テスト可能なエントリポイント。`Cli::try_parse_from()` でテスト用引数を渡せる。
 pub(crate) async fn run_with(cli: Cli) -> anyhow::Result<u8> {
     if let Commands::Behavior { action } = cli.command {
-        return izanagi::behavior_cli::run(action, &default_log_dir().join("behavior")).await;
+        return izanagi::behavior_cli::run(*action, &default_log_dir().join("behavior")).await;
     }
     // init / mcp は設定ファイルを必要としないため、ロード・バリデーションをスキップ
     if matches!(cli.command, Commands::Init) {

@@ -102,6 +102,12 @@ fn manifest_rejects_leakage_duplicate_labels_aliases_and_unbounded_input() {
     let mut alias = original.clone();
     alias.model = "jev-latest".into();
     assert!(alias.validate().is_err());
+    let mut policy = original.clone();
+    policy.promotion_policy = "enable_automatic_blocking".into();
+    assert!(policy.validate().is_err());
+    let mut revision = original.clone();
+    revision.mcp_commit = Some("unverified-server-description".into());
+    assert!(revision.validate().is_err());
     let mut escaping = original;
     escaping.scenarios[0].events = "../private.jsonl".into();
     assert!(escaping.validate().is_err());
@@ -156,4 +162,90 @@ async fn captured_real_responses_keep_abstentions_and_validation_failures() {
             .filter_map(|o| o.answer())
             .all(|a| a.returned_model == PINNED_MODEL)
     );
+}
+
+#[tokio::test]
+async fn boundary_contracts_cover_routine_workloads_and_incomplete_observation() {
+    let dir = fixtures();
+    let manifest = load_manifest(&dir.join("boundary-manifest.json")).unwrap();
+    let report = evaluate_manifest(&manifest, &dir, &MockClassifier, "mock")
+        .await
+        .unwrap();
+    assert_eq!(report.methods[&EvaluationMethod::D].total_windows, 18);
+    assert_eq!(report.methods[&EvaluationMethod::D].true_positives, 5);
+    assert_eq!(report.methods[&EvaluationMethod::D].false_positives, 0);
+    assert_eq!(report.methods[&EvaluationMethod::D].abstained_windows, 5);
+    assert_eq!(report.methods[&EvaluationMethod::D].routine_workloads, 4);
+    for window in report
+        .windows
+        .iter()
+        .filter(|w| w.method == EvaluationMethod::D)
+    {
+        let expected = match window.expected {
+            ExpectedLabel::Normal => SeriesDecision::Normal,
+            ExpectedLabel::Suspicious => SeriesDecision::Suspicious,
+            ExpectedLabel::Indeterminate => SeriesDecision::Unknown,
+        };
+        assert_eq!(window.series_decision, expected, "{}", window.scenario_id);
+    }
+    // The deliberately simple mock does not establish real model performance:
+    // it over-alerts on a legitimate credential upload to a known destination.
+    let mock_upload = report
+        .windows
+        .iter()
+        .find(|w| w.method == EvaluationMethod::C && w.scenario_id == "legitimate-upload")
+        .unwrap();
+    assert_eq!(mock_upload.expected, ExpectedLabel::Normal);
+    assert_eq!(mock_upload.series_decision, SeriesDecision::Suspicious);
+    assert_eq!(report.methods[&EvaluationMethod::C].false_positives, 1);
+    assert_eq!(
+        report.methods[&EvaluationMethod::C].additional_false_alerts_per_routine_workload,
+        Some(0.25)
+    );
+}
+
+#[tokio::test]
+async fn additional_real_response_does_not_over_alert_on_known_credential_upload() {
+    let dir = fixtures();
+    let manifest = load_manifest(&dir.join("boundary-manifest.json")).unwrap();
+    let responses =
+        serde_json::from_slice(&std::fs::read(dir.join("jev-boundary-responses.json")).unwrap())
+            .unwrap();
+    let classifier = RecordedClassifier {
+        responses,
+        config: Default::default(),
+    };
+    let report = evaluate_manifest(&manifest, &dir, &classifier, "recorded")
+        .await
+        .unwrap();
+    let upload = report
+        .windows
+        .iter()
+        .find(|w| w.method == EvaluationMethod::C && w.scenario_id == "legitimate-upload")
+        .unwrap();
+    assert_eq!(upload.series_decision, SeriesDecision::Normal);
+    assert_eq!(
+        upload
+            .classifier
+            .as_ref()
+            .unwrap()
+            .answer()
+            .unwrap()
+            .returned_model,
+        "jev-1.13.0"
+    );
+    assert_eq!(
+        upload
+            .classifier
+            .as_ref()
+            .unwrap()
+            .answer()
+            .unwrap()
+            .input_tokens,
+        632
+    );
+    assert_eq!(report.methods[&EvaluationMethod::C].total_windows, 18);
+    // Unmeasured projections stay explicitly skipped, not filled with mock answers.
+    assert_eq!(report.methods[&EvaluationMethod::C].skipped_windows, 12);
+    assert_eq!(report.methods[&EvaluationMethod::C].abstained_windows, 5);
 }

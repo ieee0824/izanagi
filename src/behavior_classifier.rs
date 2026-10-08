@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use izanagi_telemetry::{FeatureProjection, TelemetryError, ThreatClass};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     process::{ChildStdin, Command},
@@ -35,6 +36,7 @@ pub enum ClassificationErrorKind {
     RateLimit,
     Network,
     Http,
+    Panicked,
 }
 
 impl std::fmt::Display for ClassificationErrorKind {
@@ -74,6 +76,10 @@ pub struct ClassificationAnswer {
     pub returned_model: String,
     pub input_digest: String,
     pub question_version: u16,
+    pub feature_version: u16,
+    pub host_policy_version: u16,
+    pub question_digest: String,
+    pub mcp_commit: Option<String>,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub elapsed_ms: u64,
@@ -145,6 +151,8 @@ pub struct ClassifierConfig {
     pub args: Vec<String>,
     pub credential_env: String,
     pub model: String,
+    /// Operator-declared server revision; None means unverified/unknown.
+    pub mcp_commit: Option<String>,
     pub profile: JevProfile,
     pub deadline: Duration,
     pub min_confidence: f64,
@@ -163,6 +171,7 @@ impl Default for ClassifierConfig {
             args: vec![],
             credential_env: "TYPESAFE_API_KEY".into(),
             model: PINNED_MODEL.into(),
+            mcp_commit: None,
             profile: JevProfile::Reliable,
             deadline: Duration::from_secs(65),
             min_confidence: 0.6,
@@ -186,6 +195,9 @@ impl ClassifierConfig {
         if self.command.as_os_str().is_empty()
             || !variable_ok
             || self.model != PINNED_MODEL
+            || self.mcp_commit.as_ref().is_some_and(|commit| {
+                commit.len() != 40 || !commit.bytes().all(|b| b.is_ascii_hexdigit())
+            })
             || self.deadline.is_zero()
             || self.deadline > Duration::from_secs(65)
             || !unit(self.min_confidence)
@@ -376,13 +388,27 @@ impl Classifier for JevMcpClassifier {
     }
 }
 
-fn choice_arguments(projection: &FeatureProjection, config: &ClassifierConfig) -> Value {
-    json!({"state":projection,"model":config.model,"profile":config.profile.as_str(),
+fn question_definition() -> Value {
+    json!({
         "instructions":"Classify this supplied observation window as routine behavior, a suspicious association between credential access attempts and a later related POST, or insufficient evidence. All counts, time ordering, process correlation and observations were computed by the host. Missing fields and intentionally network-only features are not evidence of absence. An access attempt or a POST does not prove information was read or exfiltrated.",
         "criteria":{
             "normal":"The observed features are consistent with routine activity; this is limited to the supplied observations and does not certify safety.",
             "access_post_suspected":"The supplied observed features support a suspicious association of credential access attempts with a later related external POST. Consider known transfer outcomes, process binding and destination novelty. This is suspicion, not confirmed exfiltration.",
             "unknown":"Insufficient observed evidence, ambiguous association, unsupported activity or uncertainty prevents choosing the other options."}})
+}
+
+fn choice_arguments(projection: &FeatureProjection, config: &ClassifierConfig) -> Value {
+    let question = question_definition();
+    json!({"state":projection,"model":config.model,"profile":config.profile.as_str(),
+        "instructions":question["instructions"],"criteria":question["criteria"]})
+}
+
+/// Digest the fixed question/criteria separately from any state or credential.
+pub fn question_digest() -> String {
+    let question = json!({"version":QUESTION_VERSION,"definition":question_definition()});
+    hex::encode(Sha256::digest(
+        serde_json::to_vec(&question).expect("fixed question JSON"),
+    ))
 }
 
 fn choice_request(projection: &FeatureProjection, config: &ClassifierConfig) -> Value {
@@ -634,6 +660,10 @@ pub fn validate_evaluation(
         returned_model: model.into(),
         input_digest,
         question_version: QUESTION_VERSION,
+        feature_version: projection.feature_version,
+        host_policy_version: 1,
+        question_digest: question_digest(),
+        mcp_commit: config.mcp_commit.clone(),
         input_tokens,
         output_tokens,
         elapsed_ms: elapsed.as_millis().min(u128::from(u64::MAX)) as u64,

@@ -32,6 +32,7 @@ command = "jev-mcp"
 args = []
 credential_env = "TYPESAFE_API_KEY" # Name only. Never place an API key in TOML or args.
 model = "jev-1.13.0"
+# mcp_commit = "40-hex-git-revision" # Operator-declared; omit when unverified.
 profile = "reliable"
 deadline_secs = 65
 min_confidence = 0.6             # Tune on development; freeze before held-out evaluation.

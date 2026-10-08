@@ -38,8 +38,8 @@ for line in sys.stdin:
             "type": "choice", "choice": choice,
             "probabilities": {name: float(name == choice) for name in ["normal", "access_post_suspected", "unknown"]},
             "confidence": 1.0}}, "usage": {"input_tokens": 17, "output_tokens": 9}}
-        if mode == "call_error":
-            result = {"isError": True, "structuredContent": {"error": {"kind": "rate_limit", "message": "DO_NOT_LOG_CANARY", "retryable": True, "status": 429}}, "content": [{"type": "text", "text": json.dumps(evaluation)}]}
+        if mode in ["call_error", "overloaded"]:
+            result = {"isError": True, "structuredContent": {"error": {"kind": "http" if mode == "overloaded" else "rate_limit", "message": "DO_NOT_LOG_CANARY", "retryable": True, "status": 529 if mode == "overloaded" else 429}}, "content": [{"type": "text", "text": json.dumps(evaluation)}]}
         elif mode == "text":
             result = {"content": [{"type": "text", "text": json.dumps(evaluation)}]}
         else:

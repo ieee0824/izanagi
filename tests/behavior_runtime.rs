@@ -74,6 +74,15 @@ async fn live_projection_is_sanitized_and_has_typed_audit_evidence() {
     assert_eq!(runtime.stats().storage_failed, 0);
     assert!(records.iter().any(|r|matches!(&r.payload,AuditPayload::Classification(a) if a.class==Some(ThreatClass::AccessPostSuspected) && a.requested_model=="mock-v1")));
     for record in records {
+        if let AuditPayload::Classification(a) = &record.payload {
+            assert_eq!(a.feature_version, FEATURE_VERSION);
+            assert_eq!(a.question_version, QUESTION_VERSION);
+            assert_eq!(a.host_policy_version, 1);
+            assert_eq!(a.question_digest, question_digest());
+            assert_eq!(a.mcp_commit, None);
+            assert_eq!(a.input_tokens, Some(0));
+            assert_eq!(a.output_tokens, Some(0));
+        }
         if let AuditPayload::Assessment { snapshot, .. } = record.payload {
             assert_eq!(
                 store
@@ -212,4 +221,74 @@ async fn slow_classifier_does_not_stop_ingestion_and_shutdown_cancels_it() {
         .await
         .unwrap();
     assert_eq!(calls.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn delayed_source_backlog_does_not_postpone_live_window_until_shutdown() {
+    let dir = Temp::new();
+    let mut runtime = BehaviorRuntime::spawn(&config(), vec![], dir.path().into()).unwrap();
+    let events = fixture(&runtime.start_config().session_id);
+    let mut backlog = events.last().unwrap().clone();
+    backlog.process = None;
+    backlog.tid = None;
+    backlog.source_instance_id = "delayed-source".into();
+    backlog.payload = TelemetryPayload::CollectorHealth { healthy: true };
+    for event in events {
+        runtime.sender().send(event).await.unwrap();
+    }
+    // This source remains behind the host's elapsed-time estimate for over
+    // the two-second lateness allowance. Every arrival used to reset the
+    // anchor, preventing any assessment while the source was still active.
+    for sequence in 1..=140 {
+        backlog.source_seq = sequence;
+        backlog.event_id = backlog.expected_event_id();
+        backlog.observed_monotonic_ns = 4_100_000_000 + sequence * 1_000_000;
+        runtime.sender().send(backlog.clone()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(runtime.stats().windows > 0);
+    assert!(runtime.stats().classified > 0);
+    runtime.shutdown().await;
+}
+
+struct Panicking;
+#[async_trait]
+impl Classifier for Panicking {
+    async fn classify(&self, _: &FeatureProjection) -> ClassificationOutcome {
+        panic!("fixture classifier panic");
+    }
+}
+#[tokio::test]
+async fn provider_panic_is_a_failure_and_ingestion_remains_live() {
+    let dir = Temp::new();
+    let mut runtime = BehaviorRuntime::spawn_with_classifier(
+        &config(),
+        vec![],
+        dir.path().into(),
+        Arc::new(Panicking),
+    )
+    .unwrap();
+    let events = fixture(&runtime.start_config().session_id);
+    for event in events.clone() {
+        runtime.sender().send(event).await.unwrap();
+    }
+    settle(&runtime).await;
+    assert_eq!(runtime.stats().failed, 1);
+    let mut next = events[0].clone();
+    next.source_seq = 50;
+    next.event_id = next.expected_event_id();
+    next.observed_monotonic_ns = 10_000_000_000;
+    runtime.sender().send(next).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while runtime.stats().events != 7 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), runtime.shutdown())
+        .await
+        .unwrap();
+    let store = AuditStore::new(runtime.session_dir(), Default::default()).unwrap();
+    assert!(store.read_records().unwrap().iter().any(|r| matches!(&r.payload, AuditPayload::Classification(a) if a.status == ClassificationStatus::Failed)));
 }

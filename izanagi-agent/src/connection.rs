@@ -8,6 +8,54 @@ use crate::exec::{EXEC_USER, execute_command};
 use crate::security::sanitize_anyhow_error;
 use crate::shell::{ShellChild, relay_shell};
 
+// Rotate data-source priority while leaving control messages first in the outer select.
+async fn next_forwarded<L, T>(
+    legacy: &mut tokio::sync::mpsc::Receiver<L>,
+    kernel: &mut Option<tokio::sync::mpsc::Receiver<T>>,
+    http: &mut Option<tokio::sync::mpsc::Receiver<T>>,
+    round: u8,
+    kernel_available: bool,
+    http_available: bool,
+) -> Forwarded<L, T> {
+    let legacy_event = legacy.recv();
+    let kernel_event = async {
+        match kernel.as_mut() {
+            Some(rx) => rx.recv().await,
+            None => std::future::pending().await,
+        }
+    };
+    let http_event = async {
+        match http.as_mut() {
+            Some(rx) => rx.recv().await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::pin!(legacy_event, kernel_event, http_event);
+    match round % 3 {
+        0 => tokio::select! { biased;
+            event = &mut legacy_event => Forwarded::Legacy(event),
+            event = &mut kernel_event, if kernel_available => Forwarded::Kernel(event.map(Box::new)),
+            event = &mut http_event, if http_available => Forwarded::Http(event.map(Box::new)),
+        },
+        1 => tokio::select! { biased;
+            event = &mut kernel_event, if kernel_available => Forwarded::Kernel(event.map(Box::new)),
+            event = &mut http_event, if http_available => Forwarded::Http(event.map(Box::new)),
+            event = &mut legacy_event => Forwarded::Legacy(event),
+        },
+        _ => tokio::select! { biased;
+            event = &mut http_event, if http_available => Forwarded::Http(event.map(Box::new)),
+            event = &mut legacy_event => Forwarded::Legacy(event),
+            event = &mut kernel_event, if kernel_available => Forwarded::Kernel(event.map(Box::new)),
+        },
+    }
+}
+
+enum Forwarded<L, T> {
+    Legacy(Option<L>),
+    Kernel(Option<Box<T>>),
+    Http(Option<Box<T>>),
+}
+
 /// 1 つのホスト接続を処理する。
 pub(crate) async fn handle_connection<S>(
     stream: S,
@@ -215,7 +263,9 @@ where
                 };
                 let mut health_tick = tokio::time::interval(std::time::Duration::from_secs(1));
                 let mut telemetry_budget = tokio::time::Instant::now();
-                let mut sent_telemetry = 0usize;
+                let mut sent_kernel = 0usize;
+                let mut sent_http = 0usize;
+                let mut forwarding_round = 0u8;
                 let transfer_result: anyhow::Result<()> = async {
                 send_message(&mut writer, &Message::TraceStarted, secret, &mut send_seq).await?;
 
@@ -229,7 +279,7 @@ where
                 // tokio ワーカースレッドも同じ tgid を持つため正確にフィルタできる。
                 let my_pid = std::process::id();
                 loop {
-                    if telemetry_budget.elapsed()>=std::time::Duration::from_secs(1) { telemetry_budget=tokio::time::Instant::now();sent_telemetry=0; }
+                    if telemetry_budget.elapsed()>=std::time::Duration::from_secs(1) { telemetry_budget=tokio::time::Instant::now();sent_kernel=0;sent_http=0; }
                     tokio::select! {
                         biased;
                         result = recv_message(&mut reader, secret, &mut recv_seq) => {
@@ -242,22 +292,24 @@ where
                                 break;
                             }
                         }
-                        event = async { match telemetry.as_mut() { Some(rx)=>rx.recv().await,None=>std::future::pending().await } }, if sent_telemetry<128 => {
-                            match event { Some(event)=>{sent_telemetry+=1;send_message(&mut writer,&Message::Telemetry(Box::new(event)),secret,&mut send_seq).await?;},None=>{telemetry=None;} }
-                        }
-                        event = async { match http_events.as_mut() { Some(rx)=>rx.recv().await,None=>std::future::pending().await } }, if sent_telemetry<128 => {
-                            match event { Some(event)=>{sent_telemetry+=1;send_message(&mut writer,&Message::Telemetry(Box::new(event)),secret,&mut send_seq).await?;},None=>{http_events=None;} }
-                        }
-                        event = rx.recv() => {
+                        event = next_forwarded(&mut rx, &mut telemetry, &mut http_events, forwarding_round, sent_kernel < 96, sent_http < 32) => {
+                            forwarding_round = (forwarding_round + 1) % 3;
                             match event {
-                                Some(event) if !is_agent_event(&event, my_pid) => {
-                                    let msg = Message::Event((*event).clone());
-                                    send_message(&mut writer, &msg, secret, &mut send_seq).await?;
+                                Forwarded::Kernel(Some(event)) => {
+                                    sent_kernel += 1;
+                                    send_message(&mut writer, &Message::Telemetry(event), secret, &mut send_seq).await?;
                                 }
-                                Some(_) => {
-                                    // agent 自身の syscall はスキップ
+                                Forwarded::Http(Some(event)) => {
+                                    sent_http += 1;
+                                    send_message(&mut writer, &Message::Telemetry(event), secret, &mut send_seq).await?;
                                 }
-                                None => {
+                                Forwarded::Kernel(None) => telemetry = None,
+                                Forwarded::Http(None) => http_events = None,
+                                Forwarded::Legacy(Some(event)) if !is_agent_event(&event, my_pid) => {
+                                    send_message(&mut writer, &Message::Event((*event).clone()), secret, &mut send_seq).await?;
+                                }
+                                Forwarded::Legacy(Some(_)) => {}
+                                Forwarded::Legacy(None) => {
                                     send_message(&mut writer, &Message::Error("trace event stream ended unexpectedly".into()), secret, &mut send_seq).await?;
                                     break;
                                 }
@@ -524,6 +576,45 @@ pub(crate) async fn recv_message<R: tokio::io::AsyncRead + Unpin>(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn ready_sources_rotate_and_have_independent_budgets() {
+        use super::{Forwarded, next_forwarded};
+        let (legacy_tx, mut legacy) = tokio::sync::mpsc::channel(16);
+        let (kernel_tx, kernel_rx) = tokio::sync::mpsc::channel(16);
+        let (http_tx, http_rx) = tokio::sync::mpsc::channel(16);
+        let mut kernel = Some(kernel_rx);
+        let mut http = Some(http_rx);
+        for _ in 0..8 {
+            legacy_tx.send(1u8).await.unwrap();
+            kernel_tx.send(2u8).await.unwrap();
+            http_tx.send(3u8).await.unwrap();
+        }
+        for round in 0..6 {
+            let event =
+                next_forwarded(&mut legacy, &mut kernel, &mut http, round, true, true).await;
+            assert!(matches!(
+                (round % 3, event),
+                (0, Forwarded::Legacy(Some(1)))
+                    | (1, Forwarded::Kernel(Some(_)))
+                    | (2, Forwarded::Http(Some(_)))
+            ));
+        }
+        assert!(matches!(
+            next_forwarded(&mut legacy, &mut kernel, &mut http, 1, false, true).await,
+            Forwarded::Http(Some(_))
+        ));
+        assert!(matches!(
+            next_forwarded(&mut legacy, &mut kernel, &mut http, 2, true, false).await,
+            Forwarded::Legacy(Some(1))
+        ));
+        kernel = None;
+        http = None;
+        assert!(matches!(
+            next_forwarded(&mut legacy, &mut kernel, &mut http, 1, true, true).await,
+            Forwarded::Legacy(Some(1))
+        ));
+    }
+
     #[tokio::test]
     async fn v3_host_and_real_agent_handshake_over_tcp() {
         use izanagi::protocol::{Message, read_message};

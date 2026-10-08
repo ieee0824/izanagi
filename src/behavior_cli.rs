@@ -54,6 +54,9 @@ pub struct ProviderOptions {
     pub mcp_arg: Vec<String>,
     #[arg(long, default_value = PINNED_MODEL)]
     pub model: String,
+    /// Operator-declared Jev MCP git revision, if verified separately.
+    #[arg(long)]
+    pub mcp_commit: Option<String>,
     #[arg(long, default_value = "reliable", value_parser = ["reliable", "interactive"])]
     pub profile: String,
     #[arg(long, default_value = "TYPESAFE_API_KEY")]
@@ -283,6 +286,7 @@ fn build_classifier(
         args: options.mcp_arg.clone(),
         credential_env: options.credential_env.clone(),
         model: options.model.clone(),
+        mcp_commit: options.mcp_commit.clone(),
         profile: if options.profile == "reliable" {
             JevProfile::Reliable
         } else {
@@ -291,6 +295,10 @@ fn build_classifier(
         ..Default::default()
     };
     if let Some(manifest) = manifest {
+        if options.mcp_commit.is_some() && options.mcp_commit != manifest.mcp_commit {
+            bail!("MCP revision does not match evaluation manifest");
+        }
+        config.mcp_commit = manifest.mcp_commit.clone();
         config.min_confidence = manifest.min_confidence;
         config.distribution_tolerance = manifest.distribution_tolerance;
         config.confidence_tolerance = manifest.confidence_tolerance;

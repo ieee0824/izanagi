@@ -1,0 +1,264 @@
+{
+  "schema_version": 1,
+  "seed": 39,
+  "source_commit": "614d4861a9e495a97304deae799afc75d93de859",
+  "collector_commit": "614d4861a9e495a97304deae799afc75d93de859",
+  "vm_image_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "scenario_version": "boundary-contract-v1",
+  "baseline_version": "fixture-v1",
+  "model": "jev-1.13.0",
+  "question_version": 1,
+  "min_confidence": 0.6,
+  "distribution_tolerance": 0.001,
+  "confidence_tolerance": 0.01,
+  "correlated_eligibility": "confirmed_writer_complete_v1",
+  "network_eligibility": "network_complete_mask_v1",
+  "scenarios": [
+    {
+      "id": "normal-install",
+      "family": "normal-install",
+      "split": "development",
+      "events": "normal-install.jsonl",
+      "events_sha256": "2a1f3b684426245b37f4b874a0cb3fd3e4a8df00aab3782cc5e6de8f92073dab",
+      "routine_workload": true,
+      "labels": [
+        {
+          "window_id": "boundary-normal-install:proxy:1",
+          "expected": "normal"
+        }
+      ]
+    },
+    {
+      "id": "normal-build",
+      "family": "normal-build",
+      "split": "development",
+      "events": "normal-build.jsonl",
+      "events_sha256": "d740a391ddcd5c3d60a35b43e090497f44d5abb50d25a3c5b0b730818e918f33",
+      "routine_workload": true,
+      "labels": [
+        {
+          "window_id": "boundary-normal-build:proxy:1",
+          "expected": "normal"
+        }
+      ]
+    },
+    {
+      "id": "legitimate-upload",
+      "family": "legitimate-upload",
+      "split": "development",
+      "events": "legitimate-upload.jsonl",
+      "events_sha256": "701297ce1d9d0fc88ecb631969ec85ccbbc99fd0a913ae24de92036c663fd95a",
+      "routine_workload": true,
+      "labels": [
+        {
+          "window_id": "boundary-legitimate-upload:proxy:1",
+          "expected": "normal"
+        }
+      ]
+    },
+    {
+      "id": "open-enoent",
+      "family": "open-enoent",
+      "split": "development",
+      "events": "open-enoent.jsonl",
+      "events_sha256": "e754b3b15aeb72649175895ad82c7698f5569cbdc0f19b686ffc71c4fbe2efad",
+      "routine_workload": false,
+      "labels": [
+        {
+          "window_id": "boundary-open-enoent:proxy:1",
+          "expected": "suspicious"
+        }
+      ]
+    },
+    {
+      "id": "open-eacces",
+      "family": "open-eacces",
+      "split": "development",
+      "events": "open-eacces.jsonl",
+      "events_sha256": "284fe9f62f7114d2cc89d3e8abc63515dc12bbe68680e943ef9e3fa7becc3680",
+      "routine_workload": false,
+      "labels": [
+        {
+          "window_id": "boundary-open-eacces:proxy:1",
+          "expected": "suspicious"
+        }
+      ]
+    },
+    {
+      "id": "open-without-read",
+      "family": "open-without-read",
+      "split": "development",
+      "events": "open-without-read.jsonl",
+      "events_sha256": "ca8dfd1e4ed45e56d31ac68ebbd765cb1d5ad641a107cef8942f91a0a4c8edb0",
+      "routine_workload": false,
+      "labels": [
+        {
+          "window_id": "boundary-open-without-read:proxy:1",
+          "expected": "suspicious"
+        }
+      ]
+    },
+    {
+      "id": "post-transfer-failed",
+      "family": "post-transfer-failed",
+      "split": "development",
+      "events": "post-transfer-failed.jsonl",
+      "events_sha256": "67ac5d496167229ffb37867f8334e7a8ee9de4b07b7cde9a93b9208eed4ae495",
+      "routine_workload": false,
+      "labels": [
+        {
+          "window_id": "boundary-post-transfer-failed:proxy:1",
+          "expected": "suspicious"
+        }
+      ]
+    },
+    {
+      "id": "unrelated-pid",
+      "family": "unrelated-pid",
+      "split": "development",
+      "events": "unrelated-pid.jsonl",
+      "events_sha256": "14236dfaa1b307f48ba8edfeeaa04b4a80c3bfee516ef7c8bd1374b7232a0204",
+      "routine_workload": false,
+      "labels": [
+        {
+          "window_id": "boundary-unrelated-pid:proxy:1",
+          "expected": "normal"
+        }
+      ]
+    },
+    {
+      "id": "pid-reuse",
+      "family": "pid-reuse",
+      "split": "development",
+      "events": "pid-reuse.jsonl",
+      "events_sha256": "bdc21c8570e7bd5b0fba098ce94d2a9c80b2129f85ad5b02d66b9ae9b51b42e7",
+      "routine_workload": false,
+      "labels": [
+        {
+          "window_id": "boundary-pid-reuse:proxy:1",
+          "expected": "normal"
+        }
+      ]
+    },
+    {
+      "id": "pid-namespace",
+      "family": "pid-namespace",
+      "split": "development",
+      "events": "pid-namespace.jsonl",
+      "events_sha256": "962dee3f6fa846d6773704cd8860eb45920608086e68c3caf35ed298a08e5fc8",
+      "routine_workload": false,
+      "labels": [
+        {
+          "window_id": "boundary-pid-namespace:proxy:1",
+          "expected": "normal"
+        }
+      ]
+    },
+    {
+      "id": "verified-child",
+      "family": "verified-child",
+      "split": "development",
+      "events": "verified-child.jsonl",
+      "events_sha256": "522ada6affc22187eb25e7696b6e1646e40b58635f61b977dbeafcf3b5fc90be",
+      "routine_workload": false,
+      "labels": [
+        {
+          "window_id": "boundary-verified-child:proxy:1",
+          "expected": "suspicious"
+        }
+      ]
+    },
+    {
+      "id": "keep-alive",
+      "family": "keep-alive",
+      "split": "development",
+      "events": "keep-alive.jsonl",
+      "events_sha256": "1305fd3ca50b1f712caee6549d2b7cb42ad48355743532175c5184f69bb92a59",
+      "routine_workload": true,
+      "labels": [
+        {
+          "window_id": "boundary-keep-alive:proxy:1",
+          "expected": "normal"
+        },
+        {
+          "window_id": "boundary-keep-alive:proxy:3",
+          "expected": "normal"
+        }
+      ]
+    },
+    {
+      "id": "ring-loss",
+      "family": "ring-loss",
+      "split": "development",
+      "events": "ring-loss.jsonl",
+      "events_sha256": "abd54b862b9d22a04d74f549d596c1392d03c21288c5189c0b80967a4d350f81",
+      "routine_workload": false,
+      "labels": [
+        {
+          "window_id": "boundary-ring-loss:proxy:1",
+          "expected": "indeterminate"
+        }
+      ]
+    },
+    {
+      "id": "tls-coverage",
+      "family": "tls-coverage",
+      "split": "development",
+      "events": "tls-coverage.jsonl",
+      "events_sha256": "ab8b1e7c52780d223d1cdd8426a93e022ccc0ecf82ba4f1b371e5a2d239ff81a",
+      "routine_workload": false,
+      "labels": [
+        {
+          "window_id": "boundary-tls-coverage:proxy:1",
+          "expected": "indeterminate"
+        }
+      ]
+    },
+    {
+      "id": "quic-coverage",
+      "family": "quic-coverage",
+      "split": "development",
+      "events": "quic-coverage.jsonl",
+      "events_sha256": "778927bda4c01fc7f5c7ec1321e3958a0471a402f7eb8abd19f0efd776b661b2",
+      "routine_workload": false,
+      "labels": [
+        {
+          "window_id": "boundary-quic-coverage:proxy:1",
+          "expected": "indeterminate"
+        }
+      ]
+    },
+    {
+      "id": "proxy-bypass-coverage",
+      "family": "proxy-bypass-coverage",
+      "split": "development",
+      "events": "proxy-bypass-coverage.jsonl",
+      "events_sha256": "99611902ee56111c5fc52b7b65d0cf32f0548227584e1180a3c5bc27df93d915",
+      "routine_workload": false,
+      "labels": [
+        {
+          "window_id": "boundary-proxy-bypass-coverage:proxy:1",
+          "expected": "indeterminate"
+        }
+      ]
+    },
+    {
+      "id": "clock-jump",
+      "family": "clock-jump",
+      "split": "development",
+      "events": "clock-jump.jsonl",
+      "events_sha256": "6e820220258152d5edb2478612a86908f2f95938b9bc89bd801b61c1589833f1",
+      "routine_workload": false,
+      "labels": [
+        {
+          "window_id": "boundary-clock-jump:proxy:1",
+          "expected": "indeterminate"
+        }
+      ]
+    }
+  ],
+  "feature_version": 1,
+  "host_policy_version": 1,
+  "promotion_policy": "audit_only_no_automatic_promotion_v1",
+  "mcp_commit": null
+}
