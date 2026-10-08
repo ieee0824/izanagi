@@ -35,10 +35,7 @@ impl DnsProxy {
             .await
             .with_context(|| format!("{} への TCP バインドに失敗", self.listen_addr))?;
 
-        eprintln!(
-            "DNS プロキシを起動しました: {} (UDP+TCP)",
-            self.listen_addr
-        );
+        eprintln!("DNS プロキシを起動しました: {} (UDP+TCP)", self.listen_addr);
         if self.allowlist.is_empty() {
             eprintln!("警告: allowed_hosts が空です。すべての DNS クエリをブロックします。");
         }
@@ -222,7 +219,7 @@ async fn handle_query(
     };
 
     // Question セクションからドメイン名を取得
-    let domain = match query.query() {
+    let domain = match query.queries.first() {
         Some(q) => {
             let name = q.name().to_ascii();
             // 末尾のドットを除去
@@ -259,12 +256,13 @@ async fn handle_query(
                 // answers, additionals, name_servers の全セクションを検証する。
                 // クライアント実装によっては additional セクションの A/AAAA レコードを
                 // 利用するため、answers のみの検証ではバイパスされる可能性がある。
-                let all_records = resp_msg.answers()
+                let all_records = resp_msg
+                    .answers
                     .iter()
-                    .chain(resp_msg.additionals().iter())
-                    .chain(resp_msg.name_servers().iter());
+                    .chain(resp_msg.additionals.iter())
+                    .chain(resp_msg.authorities.iter());
                 for record in all_records {
-                    let ip: Option<IpAddr> = match record.data() {
+                    let ip: Option<IpAddr> = match &record.data {
                         RData::A(a) => Some(IpAddr::V4(a.0)),
                         RData::AAAA(aaaa) => Some(IpAddr::V6(aaaa.0)),
                         _ => None,

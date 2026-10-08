@@ -162,7 +162,10 @@ fn write_pid_file() -> anyhow::Result<()> {
         {
             use std::fs::DirBuilder;
             use std::os::unix::fs::DirBuilderExt;
-            DirBuilder::new().mode(0o700).recursive(true).create(parent)?;
+            DirBuilder::new()
+                .mode(0o700)
+                .recursive(true)
+                .create(parent)?;
         }
         #[cfg(not(unix))]
         {
@@ -203,10 +206,10 @@ fn remove_pid_file() {
 
 /// ロックファイルを削除する。
 fn remove_lock_file() {
-    if let Err(e) = std::fs::remove_file(lock_file_path()) {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            eprintln!("警告: ロックファイルの削除に失敗: {}", e);
-        }
+    if let Err(e) = std::fs::remove_file(lock_file_path())
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!("警告: ロックファイルの削除に失敗: {}", e);
     }
 }
 
@@ -257,7 +260,10 @@ fn acquire_instance_lock() -> anyhow::Result<std::fs::File> {
         {
             use std::fs::DirBuilder;
             use std::os::unix::fs::DirBuilderExt;
-            DirBuilder::new().mode(0o700).recursive(true).create(parent)?;
+            DirBuilder::new()
+                .mode(0o700)
+                .recursive(true)
+                .create(parent)?;
         }
         #[cfg(not(unix))]
         {
@@ -358,10 +364,10 @@ async fn start_engine(
 
     let mut engine = build_engine(config)?;
     engine.set_event_handler(Box::new(move |event: &izanagi::event::SyscallEvent| {
-        if let Err(e) = event_storage.store_event(event) {
-            if !event_error_logged.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                eprintln!("イベントの保存に失敗: {} (以降のエラーは抑制)", e);
-            }
+        if let Err(e) = event_storage.store_event(event)
+            && !event_error_logged.swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            eprintln!("イベントの保存に失敗: {} (以降のエラーは抑制)", e);
         }
     }));
 
@@ -438,7 +444,12 @@ pub(crate) async fn run_with(cli: Cli) -> anyhow::Result<u8> {
         return Ok(0);
     }
     // config path は設定ファイルの存在を必要としない
-    if matches!(cli.command, Commands::Config { action: ConfigAction::Path }) {
+    if matches!(
+        cli.command,
+        Commands::Config {
+            action: ConfigAction::Path
+        }
+    ) {
         let path = match &cli.config {
             Some(p) => p.clone(),
             None => resolve_config_path()?,
@@ -672,12 +683,18 @@ mod tests {
         let dir = izanagi_dir();
         let components: Vec<_> = dir.components().collect();
         // パスに "instances" を含み、その後に 64 文字の hex ハッシュが続く
-        let has_instances = components
-            .iter()
-            .any(|c| c.as_os_str() == "instances");
-        assert!(has_instances, "izanagi_dir should contain 'instances': {:?}", dir);
+        let has_instances = components.iter().any(|c| c.as_os_str() == "instances");
+        assert!(
+            has_instances,
+            "izanagi_dir should contain 'instances': {:?}",
+            dir
+        );
         let last = dir.file_name().unwrap().to_str().unwrap();
         assert_eq!(last.len(), 64, "hash should be 64 hex chars: {}", last);
-        assert!(last.chars().all(|c| c.is_ascii_hexdigit()), "hash should be hex: {}", last);
+        assert!(
+            last.chars().all(|c| c.is_ascii_hexdigit()),
+            "hash should be hex: {}",
+            last
+        );
     }
 }

@@ -1,0 +1,61 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "04:00"
+      timezone: Asia/Tokyo
+    open-pull-requests-limit: 10
+    groups:
+      rust-minor-and-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: cargo
+    directory: /izanagi-agent
+    schedule:
+      interval: weekly
+      day: monday
+      time: "04:15"
+      timezone: Asia/Tokyo
+    open-pull-requests-limit: 5
+    groups:
+      rust-minor-and-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: cargo
+    directory: /izanagi-dns-proxy
+    schedule:
+      interval: weekly
+      day: monday
+      time: "04:30"
+      timezone: Asia/Tokyo
+    open-pull-requests-limit: 5
+    groups:
+      rust-minor-and-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: cargo
+    directory: /izanagi-http-capture
+    schedule:
+      interval: weekly
+      day: monday
+      time: "04:45"
+      timezone: Asia/Tokyo
+    open-pull-requests-limit: 5
+    groups:
+      rust-minor-and-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "05:00"
+      timezone: Asia/Tokyo
+    open-pull-requests-limit: 5
+    groups:
+      github-actions:
+        patterns: ["*"]

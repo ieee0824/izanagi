@@ -102,11 +102,13 @@ where
     }
 
     /// 現在の認証状態を返す。
+    #[cfg(test)]
     pub(crate) fn is_authenticated(&self) -> bool {
         self.secret.is_some()
     }
 
     /// 現在のシーケンス番号を返す (テスト用)。
+    #[cfg(test)]
     pub(crate) fn sequences(&self) -> (u64, u64) {
         (self.send_seq, self.recv_seq)
     }

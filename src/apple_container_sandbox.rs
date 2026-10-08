@@ -29,12 +29,12 @@ impl EnvFileGuard {
 
 impl Drop for EnvFileGuard {
     fn drop(&mut self) {
-        if let Some(ref path) = self.path {
-            if let Err(e) = std::fs::remove_file(path) {
-                // ファイルが既に削除されている場合は無視
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    eprintln!("警告: env-file の削除に失敗: {}: {}", path.display(), e);
-                }
+        if let Some(ref path) = self.path
+            && let Err(e) = std::fs::remove_file(path)
+        {
+            // ファイルが既に削除されている場合は無視
+            if e.kind() != std::io::ErrorKind::NotFound {
+                eprintln!("警告: env-file の削除に失敗: {}: {}", path.display(), e);
             }
         }
     }

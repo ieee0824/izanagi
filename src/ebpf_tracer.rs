@@ -140,7 +140,7 @@ fn read_raw_event(data: &[u8]) -> izanagi_common::RawSyscallEvent {
     let ptr = data.as_ptr();
     let align = core::mem::align_of::<izanagi_common::RawSyscallEvent>();
 
-    if ptr as usize % align == 0 {
+    if (ptr as usize).is_multiple_of(align) {
         // アライメントが合っている場合は直接読み取り
         // Safety: サイズチェックは呼び出し元で実施済み、アライメントも検証済み。
         unsafe { core::ptr::read(ptr as *const izanagi_common::RawSyscallEvent) }

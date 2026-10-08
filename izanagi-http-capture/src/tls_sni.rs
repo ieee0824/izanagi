@@ -91,10 +91,7 @@ async fn handle_connection(
         }
     };
 
-    logger.log_tls(&TlsCapture {
-        src_addr: src,
-        sni,
-    });
+    logger.log_tls(&TlsCapture { src_addr: src, sni });
 
     Ok(())
 }

@@ -4,7 +4,7 @@ use std::sync::OnceLock;
 use anyhow::Result;
 use tokio::io::AsyncReadExt;
 
-use crate::security::{sanitize_env, sanitize_exec_error, shell_escape, EXEC_ERROR_PREFIX};
+use crate::security::{EXEC_ERROR_PREFIX, sanitize_env, sanitize_exec_error, shell_escape};
 
 /// 非特権ユーザー名。コマンド実行はこのユーザーで行う。
 pub(crate) const EXEC_USER: &str = "izanagi";

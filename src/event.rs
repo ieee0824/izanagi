@@ -268,7 +268,10 @@ mod tests {
         // ここでは「現行フォーマットの round-trip は正常」であることを確認
         let result = deserialize_event(old_bytes);
         // bincode は厳密にバイト数が合わないとエラーになる
-        assert!(result.is_err(), "truncated payload should fail deserialization");
+        assert!(
+            result.is_err(),
+            "truncated payload should fail deserialization"
+        );
     }
 
     #[test]

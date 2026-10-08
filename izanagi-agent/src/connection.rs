@@ -4,7 +4,7 @@ use izanagi::protocol::{self, Message};
 use izanagi::tracer::Tracer;
 
 use crate::crypto::{constant_time_eq, sha256_hex};
-use crate::exec::{execute_command, EXEC_USER};
+use crate::exec::{EXEC_USER, execute_command};
 use crate::security::sanitize_anyhow_error;
 
 /// 1 つのホスト接続を処理する。
@@ -24,9 +24,7 @@ where
     // Hello ハンドシェイク: ホストから Hello を受信し、認証モードを合意する (#177)
     // シークレット設定時は Hello メッセージも HMAC で保護する
     let hello_msg = match &secret {
-        Some(s) => {
-            protocol::read_message_authenticated(&mut reader, s, &mut recv_seq).await?
-        }
+        Some(s) => protocol::read_message_authenticated(&mut reader, s, &mut recv_seq).await?,
         None => protocol::read_message(&mut reader).await?,
     };
     match hello_msg {
@@ -160,7 +158,8 @@ where
                     Err(e) => {
                         eprintln!("eBPF tracer start failed: {}", e);
                         let err_msg = format!("eBPF tracer start failed: {}", e);
-                        send_message(&mut writer, &Message::Error(err_msg), secret, &mut send_seq).await?;
+                        send_message(&mut writer, &Message::Error(err_msg), secret, &mut send_seq)
+                            .await?;
                         continue;
                     }
                 };
@@ -218,7 +217,16 @@ where
                     continue;
                 }
                 eprintln!("received Shell ({}x{})", cols, rows);
-                handle_shell(&mut reader, &mut writer, secret, &mut send_seq, &mut recv_seq, rows, cols).await?;
+                handle_shell(
+                    &mut reader,
+                    &mut writer,
+                    secret,
+                    &mut send_seq,
+                    &mut recv_seq,
+                    rows,
+                    cols,
+                )
+                .await?;
             }
             Some(Message::Stop) => {
                 eprintln!("received Stop");
@@ -258,8 +266,8 @@ where
     // passwd エントリを fork 前に取得 (getpwnam_r でスレッドセーフに)
     // passwd / *mut passwd は Send でないため await をまたがないようスコープを分離する
     let pw_result: Option<(libc::uid_t, libc::gid_t, String)> = {
-        let c_user = std::ffi::CString::new(EXEC_USER)
-            .map_err(|_| anyhow::anyhow!("invalid EXEC_USER"))?;
+        let c_user =
+            std::ffi::CString::new(EXEC_USER).map_err(|_| anyhow::anyhow!("invalid EXEC_USER"))?;
         let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
         let mut buf_size: usize = 1024;
         let mut found = None;
@@ -492,13 +500,7 @@ where
         -1
     };
 
-    send_message(
-        writer,
-        &Message::ShellClose { exit_code },
-        secret,
-        send_seq,
-    )
-    .await?;
+    send_message(writer, &Message::ShellClose { exit_code }, secret, send_seq).await?;
     eprintln!("shell closed with exit code {}", exit_code);
 
     Ok(())

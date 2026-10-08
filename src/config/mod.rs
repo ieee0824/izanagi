@@ -303,10 +303,8 @@ impl Config {
                     bail!("sandbox.tracer \"ebpf\" は Linux でのみ利用可能です");
                 }
             }
-            TracerBackend::Dtrace => {
-                if !is_macos {
-                    bail!("sandbox.tracer \"dtrace\" は macOS でのみ利用可能です");
-                }
+            TracerBackend::Dtrace if !is_macos => {
+                bail!("sandbox.tracer \"dtrace\" は macOS でのみ利用可能です");
             }
             _ => {}
         }

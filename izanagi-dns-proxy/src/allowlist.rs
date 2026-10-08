@@ -28,7 +28,12 @@ impl DomainAllowlist {
                 continue;
             }
             // IP:port 形式もスキップ
-            if host.contains(':') && host.split(':').next().is_some_and(|ip| ip.parse::<IpAddr>().is_ok()) {
+            if host.contains(':')
+                && host
+                    .split(':')
+                    .next()
+                    .is_some_and(|ip| ip.parse::<IpAddr>().is_ok())
+            {
                 continue;
             }
 
@@ -92,10 +97,8 @@ mod tests {
 
     #[test]
     fn exact_match() {
-        let al = DomainAllowlist::new(&[
-            "registry.npmjs.org".to_string(),
-            "github.com".to_string(),
-        ]);
+        let al =
+            DomainAllowlist::new(&["registry.npmjs.org".to_string(), "github.com".to_string()]);
         assert!(al.is_allowed("registry.npmjs.org"));
         assert!(al.is_allowed("github.com"));
         assert!(!al.is_allowed("evil.example.com"));
@@ -155,11 +158,8 @@ mod tests {
 
     #[test]
     fn empty_and_whitespace_entries_skipped() {
-        let al = DomainAllowlist::new(&[
-            "".to_string(),
-            "  ".to_string(),
-            "example.com".to_string(),
-        ]);
+        let al =
+            DomainAllowlist::new(&["".to_string(), "  ".to_string(), "example.com".to_string()]);
         assert!(al.is_allowed("example.com"));
         assert!(!al.is_allowed(""));
     }

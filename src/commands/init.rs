@@ -156,7 +156,8 @@ pub fn cmd_init(explicit_path: Option<&PathBuf>) -> Result<u8> {
             .with_prompt("DNS プロキシのリッスンアドレス")
             .default("127.0.0.1:15353".to_string())
             .validate_with(|input: &String| -> Result<(), String> {
-                input.parse::<std::net::SocketAddr>()
+                input
+                    .parse::<std::net::SocketAddr>()
                     .map(|_| ())
                     .map_err(|_| "無効なアドレスです (例: 127.0.0.1:15353)".to_string())
             })
@@ -165,7 +166,8 @@ pub fn cmd_init(explicit_path: Option<&PathBuf>) -> Result<u8> {
             .with_prompt("HTTP リッスンアドレス")
             .default("127.0.0.1:18080".to_string())
             .validate_with(|input: &String| -> Result<(), String> {
-                input.parse::<std::net::SocketAddr>()
+                input
+                    .parse::<std::net::SocketAddr>()
                     .map(|_| ())
                     .map_err(|_| "無効なアドレスです (例: 127.0.0.1:18080)".to_string())
             })
@@ -174,7 +176,8 @@ pub fn cmd_init(explicit_path: Option<&PathBuf>) -> Result<u8> {
             .with_prompt("HTTPS (TLS MITM) リッスンアドレス")
             .default("127.0.0.1:18443".to_string())
             .validate_with(|input: &String| -> Result<(), String> {
-                input.parse::<std::net::SocketAddr>()
+                input
+                    .parse::<std::net::SocketAddr>()
                     .map(|_| ())
                     .map_err(|_| "無効なアドレスです (例: 127.0.0.1:18443)".to_string())
             })
@@ -293,6 +296,7 @@ struct MitmConfig {
     secret_maps: Vec<String>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn generate_toml(
     backend: &str,
     qemu: Option<&(u32, String, String)>,
@@ -420,7 +424,6 @@ mod tests {
             &["file".into(), "network".into(), "process".into()],
             &["/etc/passwd".into(), "~/.ssh/*".into()],
             &[],
-        
             None,
         );
         assert!(toml.contains("backend = \"native\""));
@@ -447,7 +450,6 @@ mod tests {
             &["file".into()],
             &[],
             &["registry.npmjs.org".into()],
-        
             None,
         );
         assert!(toml.contains("[sandbox.qemu]"));
@@ -473,7 +475,6 @@ mod tests {
             &["file".into()],
             &["path/with\"quote".into()],
             &["evil.com\"\n[sandbox]\nbackend = \"native".into()],
-        
             None,
         );
         // TOML としてパース可能であること（インジェクションが無効化されている）
@@ -520,7 +521,6 @@ mod tests {
             &["file".into(), "network".into()],
             &["/etc/passwd".into()],
             &["example.com".into()],
-        
             None,
         );
         let _config =
@@ -540,7 +540,6 @@ mod tests {
             &["file".into()],
             &[],
             &["registry.npmjs.org".into()],
-        
             None,
         );
         let _config = Config::from_toml(&toml)

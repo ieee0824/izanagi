@@ -19,7 +19,7 @@ fn is_private_ipv4(ip: Ipv4Addr) -> bool {
         || ip.is_private()      // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
         || ip.is_link_local()   // 169.254.0.0/16
         || ip.is_unspecified()  // 0.0.0.0
-        || ip.is_broadcast()    // 255.255.255.255
+        || ip.is_broadcast() // 255.255.255.255
 }
 
 fn is_private_ipv6(ip: Ipv6Addr) -> bool {

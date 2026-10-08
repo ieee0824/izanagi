@@ -99,10 +99,7 @@ async fn main() -> anyhow::Result<()> {
         secret_map.add_from_str(s)?;
     }
     if !secret_map.is_empty() {
-        eprintln!(
-            "シークレットマッピング: {} エントリ",
-            cli.secret_maps.len()
-        );
+        eprintln!("シークレットマッピングを有効にしました");
     }
 
     // 許可ホスト
@@ -143,8 +140,15 @@ async fn main() -> anyhow::Result<()> {
         let listen = cli.listen_http;
         let max_body = cli.max_body_bytes;
         tokio::spawn(async move {
-            http_capture::run(listen, max_body, timeout, logger, semaphore, &mut shutdown_http)
-                .await
+            http_capture::run(
+                listen,
+                max_body,
+                timeout,
+                logger,
+                semaphore,
+                &mut shutdown_http,
+            )
+            .await
         })
     };
 

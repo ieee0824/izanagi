@@ -137,15 +137,35 @@ mod tests {
     #[test]
     fn sanitize_env_covers_all_injection_categories() {
         // Verify specific dangerous vars from each category are in the denylist
-        let library_injection = ["LD_PRELOAD", "LD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES",
-                                  "DYLD_FORCE_FLAT_NAMESPACE", "LD_AUDIT", "LD_DEBUG"];
+        let library_injection = [
+            "LD_PRELOAD",
+            "LD_LIBRARY_PATH",
+            "DYLD_INSERT_LIBRARIES",
+            "DYLD_FORCE_FLAT_NAMESPACE",
+            "LD_AUDIT",
+            "LD_DEBUG",
+        ];
         let shell_init = ["ENV", "BASH_ENV"];
-        let runtime_injection = ["PYTHONSTARTUP", "PYTHONPATH", "NODE_OPTIONS", "NODE_PATH",
-                                  "PERL5OPT", "PERL5LIB", "RUBYOPT", "RUBYLIB",
-                                  "CLASSPATH", "JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS",
-                                  "DOTNET_STARTUP_HOOKS"];
+        let runtime_injection = [
+            "PYTHONSTARTUP",
+            "PYTHONPATH",
+            "NODE_OPTIONS",
+            "NODE_PATH",
+            "PERL5OPT",
+            "PERL5LIB",
+            "RUBYOPT",
+            "RUBYLIB",
+            "CLASSPATH",
+            "JAVA_TOOL_OPTIONS",
+            "_JAVA_OPTIONS",
+            "DOTNET_STARTUP_HOOKS",
+        ];
 
-        for var in library_injection.iter().chain(shell_init.iter()).chain(runtime_injection.iter()) {
+        for var in library_injection
+            .iter()
+            .chain(shell_init.iter())
+            .chain(runtime_injection.iter())
+        {
             assert!(
                 DENIED_ENV_VARS.contains(var),
                 "expected '{}' to be in DENIED_ENV_VARS",

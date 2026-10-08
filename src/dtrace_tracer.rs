@@ -396,7 +396,7 @@ fn parse_dtrace_line(line: &str) -> Option<SyscallEvent> {
     // trailing Int を差し引いた中間フィールドを結合して復元する。
     let arg_kinds = arg_kinds_for_syscall(syscall_str);
     let mut args = smallvec::smallvec![];
-    let has_path_arg = arg_kinds.iter().any(|k| *k == ArgKind::Path);
+    let has_path_arg = arg_kinds.contains(&ArgKind::Path);
 
     if let Some(remainder) = args_remainder {
         if has_path_arg {
@@ -550,8 +550,8 @@ impl Tracer for DTraceTracer {
 
         // stderr を非同期で読み取り、バッファ詰まりによるハングを防止する (#102)
         // レートリミット: STDERR_LOG_LIMIT 行を超えたら抑制し、終了時にサマリを出力
-        let mut stderr_handle = if let Some(stderr) = child.stderr.take() {
-            Some(tokio::spawn(async move {
+        let mut stderr_handle = child.stderr.take().map(|stderr| {
+            tokio::spawn(async move {
                 let reader = BufReader::new(stderr);
                 let mut lines = reader.lines();
                 let mut count: usize = 0;
@@ -570,10 +570,8 @@ impl Tracer for DTraceTracer {
                         suppressed, count
                     );
                 }
-            }))
-        } else {
-            None
-        };
+            })
+        });
 
         let (tx, rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
 
@@ -1102,7 +1100,7 @@ mod tests {
     #[cfg(not(target_os = "macos"))]
     #[tokio::test]
     async fn dtrace_tracer_start_fails_on_non_macos() {
-        let mut tracer = DTraceTracer::new();
+        let tracer = DTraceTracer::new();
         let filter = TraceFilter {
             categories: vec![],
             pids: None,

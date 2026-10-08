@@ -220,15 +220,15 @@ impl Engine {
         // Box<dyn Fn + Send> → Arc<dyn Fn + Send + Sync> への変換は
         // Mutex でラップして Sync を付与する。spawn_blocking の各呼び出しは
         // 排他的に実行されるため安全。
-        let on_event: Option<Arc<dyn Fn(&SyscallEvent) + Send + Sync>> =
-            self.on_event.take().map(|h| {
-                let wrapper = std::sync::Mutex::new(h);
-                Arc::new(move |event: &SyscallEvent| {
-                    if let Ok(handler) = wrapper.lock() {
-                        handler(event);
-                    }
-                }) as Arc<dyn Fn(&SyscallEvent) + Send + Sync>
-            });
+        type EventHandler = Arc<dyn Fn(&SyscallEvent) + Send + Sync>;
+        let on_event: Option<EventHandler> = self.on_event.take().map(|h| {
+            let wrapper = std::sync::Mutex::new(h);
+            Arc::new(move |event: &SyscallEvent| {
+                if let Ok(handler) = wrapper.lock() {
+                    handler(event);
+                }
+            }) as Arc<dyn Fn(&SyscallEvent) + Send + Sync>
+        });
 
         // on_alert も同様に Arc ラップし、spawn_blocking でオフロードする。
         // LogStorage::store_alert 等の同期 I/O が tokio ワーカーをブロックするのを防止。
@@ -261,7 +261,7 @@ impl Engine {
                                 total_events += 1;
 
                                 // 定期的にチャネル長をチェックし、飽和を検知
-                                if total_events % check_interval == 0 {
+                                if total_events.is_multiple_of(check_interval) {
                                     let pending = rx.len() as u64;
                                     if pending > capacity * 3 / 4 {
                                         eprintln!(

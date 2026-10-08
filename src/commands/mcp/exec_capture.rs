@@ -90,7 +90,7 @@ pub(super) async fn exec_on_session_capture(
                         }
                         Ok::<_, std::io::Error>(buf)
                     },
-                    async { child.wait().await.map_err(std::io::Error::from) },
+                    async { child.wait().await },
                 )
             };
 

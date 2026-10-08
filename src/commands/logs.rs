@@ -107,20 +107,20 @@ impl TailReader {
         }
 
         // ローテーション検知: 現在のファイルの inode と比較
-        if let Ok(current_inode) = get_inode(&self.path) {
-            if current_inode != self.inode {
-                // ローテーションが発生した。旧ファイルの残りを読み切ってから reopen
-                if let Some(ref mut r) = self.reader {
-                    let _ = tail_lines(r, suspicious);
-                }
-                // 新しいファイルを先頭から開く (seek to start)
-                if let Some((r, ino)) = open_from_start(&self.path) {
-                    self.reader = Some(r);
-                    self.inode = ino;
-                } else {
-                    self.reader = None;
-                    return Ok(0);
-                }
+        if let Ok(current_inode) = get_inode(&self.path)
+            && current_inode != self.inode
+        {
+            // ローテーションが発生した。旧ファイルの残りを読み切ってから reopen
+            if let Some(ref mut r) = self.reader {
+                let _ = tail_lines(r, suspicious);
+            }
+            // 新しいファイルを先頭から開く (seek to start)
+            if let Some((r, ino)) = open_from_start(&self.path) {
+                self.reader = Some(r);
+                self.inode = ino;
+            } else {
+                self.reader = None;
+                return Ok(0);
             }
         }
 

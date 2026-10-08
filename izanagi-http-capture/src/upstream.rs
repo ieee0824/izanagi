@@ -81,7 +81,8 @@ async fn forward_https_inner(
         .await
         .with_context(|| format!("上流サーバーへの接続に失敗: {}", addr))?;
 
-    let mut tls_stream = connector.connect(server_name, tcp_stream)
+    let mut tls_stream = connector
+        .connect(server_name, tcp_stream)
         .await
         .context("上流 TLS ハンドシェイクに失敗")?;
 

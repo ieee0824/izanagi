@@ -43,10 +43,7 @@ async fn main() -> anyhow::Result<()> {
 
     // 設定ファイルの存在チェック（Config::load は NotFound 時にデフォルトを返すため）
     if !cli.config.exists() {
-        bail!(
-            "設定ファイルが見つかりません: {}",
-            cli.config.display()
-        );
+        bail!("設定ファイルが見つかりません: {}", cli.config.display());
     }
 
     // 設定ファイル読み込み

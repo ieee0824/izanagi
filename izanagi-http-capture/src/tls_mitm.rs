@@ -48,9 +48,7 @@ pub async fn run(
     allowed_hosts: Arc<HashSet<String>>,
     shutdown: &mut tokio::sync::watch::Receiver<()>,
 ) -> anyhow::Result<()> {
-    let resolver = MitmCertResolver {
-        cache: cert_cache,
-    };
+    let resolver = MitmCertResolver { cache: cert_cache };
 
     let mut tls_config = rustls::ServerConfig::builder()
         .with_no_client_auth()
@@ -135,11 +133,7 @@ async fn handle_connection(
         }
     };
 
-    let sni = tls_stream
-        .get_ref()
-        .1
-        .server_name()
-        .map(|s| s.to_string());
+    let sni = tls_stream.get_ref().1.server_name().map(|s| s.to_string());
 
     // 復号された HTTP リクエストをパース
     let result = tokio::time::timeout(timeout, async {
@@ -208,9 +202,7 @@ async fn handle_connection(
             &substituted_body,
         );
 
-        match upstream::forward_https(target_hostname, target_port, &request_bytes, timeout)
-            .await
-        {
+        match upstream::forward_https(target_hostname, target_port, &request_bytes, timeout).await {
             Ok(response) => {
                 let _ = tls_stream.write_all(&response).await;
             }
@@ -272,8 +264,15 @@ mod tests {
 
         let server = tokio::spawn(async move {
             run(
-                addr, 4096, Duration::from_secs(5), logger_clone, semaphore_clone,
-                cache_clone, secret_clone, hosts_clone, &mut shutdown_clone,
+                addr,
+                4096,
+                Duration::from_secs(5),
+                logger_clone,
+                semaphore_clone,
+                cache_clone,
+                secret_clone,
+                hosts_clone,
+                &mut shutdown_clone,
             )
             .await
         });

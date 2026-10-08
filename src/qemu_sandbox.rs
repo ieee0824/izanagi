@@ -1075,7 +1075,12 @@ mod tests {
         let args = build_args(&image, 2, 4096, &share, 9001, None, None, None);
 
         assert!(args.contains(&"-accel".to_string()));
-        assert!(args.contains(&"hvf".to_string()));
+        let expected_accel = if cfg!(target_os = "macos") {
+            "hvf"
+        } else {
+            "kvm"
+        };
+        assert!(args.contains(&expected_accel.to_string()));
         assert!(args.contains(&"-cpu".to_string()));
         assert!(args.contains(&"host".to_string()));
         assert!(args.contains(&"-m".to_string()));
@@ -1084,7 +1089,12 @@ mod tests {
         assert!(args.contains(&"2".to_string()));
         assert!(args.contains(&"-nographic".to_string()));
         assert!(args.contains(&"-machine".to_string()));
-        assert!(args.contains(&"virt".to_string()));
+        let expected_machine = if cfg!(target_arch = "aarch64") {
+            "virt"
+        } else {
+            "q35"
+        };
+        assert!(args.contains(&expected_machine.to_string()));
     }
 
     #[test]
@@ -1281,7 +1291,12 @@ mod tests {
 
         // 全主要引数が存在すること
         assert!(args.contains(&"-accel".to_string()));
-        assert!(args.contains(&"hvf".to_string()));
+        let expected_accel = if cfg!(target_os = "macos") {
+            "hvf"
+        } else {
+            "kvm"
+        };
+        assert!(args.contains(&expected_accel.to_string()));
         assert!(args.contains(&"-cpu".to_string()));
         assert!(args.contains(&"host".to_string()));
         assert!(args.contains(&"-m".to_string()));
@@ -1289,13 +1304,18 @@ mod tests {
         assert!(args.contains(&"-smp".to_string()));
         assert!(args.contains(&"4".to_string()));
         assert!(args.contains(&"-machine".to_string()));
-        assert!(args.contains(&"virt".to_string()));
+        let expected_machine = if cfg!(target_arch = "aarch64") {
+            "virt"
+        } else {
+            "q35"
+        };
+        assert!(args.contains(&expected_machine.to_string()));
         assert!(args.contains(&"-nographic".to_string()));
 
         // コマンドライン全体を文字列として出力してデバッグ可能にする
         let full_cmd = format!("qemu-system-aarch64 {}", args.join(" "));
         assert!(full_cmd.contains("qemu-system-aarch64"));
-        assert!(full_cmd.contains("-accel hvf"));
+        assert!(full_cmd.contains(&format!("-accel {expected_accel}")));
         assert!(full_cmd.contains("-cpu host"));
     }
 

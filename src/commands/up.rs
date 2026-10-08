@@ -40,12 +40,11 @@ pub async fn cmd_up(
     let (mut engine, log_storage) = start_engine(config, pcap_writer).await?;
 
     // CA 証明書をサンドボックス内に配布 (#272)
-    if let Some(ref http_capture) = config.http_capture {
-        if http_capture.enabled {
-            if let Some(ref ca_path) = http_capture.ca_cert_out {
-                install_ca_cert(engine.sandbox(), ca_path).await;
-            }
-        }
+    if let Some(ref http_capture) = config.http_capture
+        && http_capture.enabled
+        && let Some(ref ca_path) = http_capture.ca_cert_out
+    {
+        install_ca_cert(engine.sandbox(), ca_path).await;
     }
 
     let iza_dir = izanagi_dir();
