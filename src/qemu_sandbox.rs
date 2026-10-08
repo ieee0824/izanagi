@@ -326,6 +326,14 @@ pub struct QemuSandbox {
     pcap_writer: Option<std::sync::Arc<PcapWriter>>,
 }
 
+struct QemuBootSettings {
+    cpus: u32,
+    memory_mb: u32,
+    image_path: PathBuf,
+    share: ShareConfig,
+    dns_proxy: Option<String>,
+}
+
 impl QemuSandbox {
     /// 新しい `QemuSandbox` を作成する。
     pub fn new() -> Self {
@@ -355,6 +363,186 @@ impl QemuSandbox {
     pub fn with_qemu_binary(mut self, path: &str) -> Self {
         self.qemu_binary = path.to_string();
         self
+    }
+
+    fn boot_settings(&mut self, config: &SandboxConfig) -> anyhow::Result<QemuBootSettings> {
+        let (cpus, memory_mb, image, share, dns_proxy) = match config {
+            SandboxConfig::Qemu {
+                cpus,
+                memory_mb,
+                image,
+                share,
+                dns_proxy,
+            } => (
+                *cpus,
+                *memory_mb,
+                image.clone(),
+                share.clone(),
+                dns_proxy.clone(),
+            ),
+            _ => {
+                self.status = SandboxStatus::Stopped;
+                anyhow::bail!("QemuSandbox requires SandboxConfig::Qemu");
+            }
+        };
+
+        // #35: イメージの存在確認
+        let image_path = match check_image_exists(&image) {
+            Ok(p) => p,
+            Err(e) => {
+                self.status = SandboxStatus::Stopped;
+                return Err(e);
+            }
+        };
+
+        Ok(QemuBootSettings {
+            cpus,
+            memory_mb,
+            image_path,
+            share,
+            dns_proxy,
+        })
+    }
+
+    fn rotate_token_file(&mut self) -> anyhow::Result<PathBuf> {
+        // 旧トークンをゼロクリアしてからリトライ (#197)
+        if let Some(ref mut old_token) = self.token {
+            zeroize::Zeroize::zeroize(old_token);
+        }
+
+        // 前回のトークンファイルを削除（リーク防止）
+        if let Some(ref path) = self.token_file {
+            let _ = std::fs::remove_file(path);
+            self.token_file = None;
+        }
+
+        // リトライごとにトークンを再生成 (#194)
+        let token = generate_token();
+        self.token = Some(token.clone());
+
+        // リトライごとに fw_cfg トークンファイルを再生成 (#202)
+        let token_file_path = write_secure_temp_file("token", token.as_bytes())?;
+        self.token_file = Some(token_file_path.clone());
+
+        Ok(token_file_path)
+    }
+
+    async fn start_attempt(
+        &mut self,
+        boot: &QemuBootSettings,
+        secret_file_path: &Option<PathBuf>,
+    ) -> anyhow::Result<()> {
+        let token_file_path = self.rotate_token_file()?;
+
+        self.host_port = find_available_port().await?;
+
+        let args = build_qemu_args(&QemuArgsParams {
+            image_path: &boot.image_path,
+            cpus: boot.cpus,
+            memory_mb: boot.memory_mb,
+            share: &boot.share,
+            host_port: self.host_port,
+            token: Some(token_file_path.to_str().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "token temp file path is not valid UTF-8: {:?}",
+                    token_file_path
+                )
+            })?),
+            secret: secret_file_path.as_ref().and_then(|p| p.to_str()),
+            dns_proxy: boot.dns_proxy.as_deref(),
+        });
+
+        // バッファをリセットして QEMU を起動
+        self.qemu_stdout_head.lock().await.clear();
+        self.qemu_stderr_head.lock().await.clear();
+
+        match spawn_qemu_with_capture(
+            &self.qemu_binary,
+            &args,
+            &self.qemu_stdout_head,
+            &self.qemu_stderr_head,
+        ) {
+            Ok(child) => self.child = Some(child),
+            Err(e) => {
+                self.status = SandboxStatus::Stopped;
+                return Err(e);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn commit_ready_connection(
+        &mut self,
+        conn: PersistentConnection,
+        secret_file_path: &Option<PathBuf>,
+    ) {
+        self.connection = Some(Mutex::new(conn));
+        self.status = SandboxStatus::Running;
+        // 成功時に secret_file を登録（down() での削除対象にする）
+        self.secret_file = secret_file_path.clone();
+        self.cleanup_temp_files();
+
+        // 注意: ハンドシェイク (Hello/Ready) は try_handshake 内で完結するため、
+        // pcap には記録しない。pcap に記録されるのは Exec/ExecResult 等の
+        // アプリケーションメッセージのみ。
+    }
+
+    async fn rollback_attempt(&mut self, e: &anyhow::Error, attempt: u32) -> bool {
+        let incompatible = e.to_string().contains("incompatible protocol version")
+            || e.to_string().contains("unsupported protocol version");
+        self.log_qemu_output().await;
+        eprintln!(
+            "WARNING: QEMU startup attempt {} failed (port {}): {}. {}",
+            attempt + 1,
+            self.host_port,
+            e,
+            if attempt + 1 < PORT_RETRY_MAX && !incompatible {
+                "Retrying with a new port..."
+            } else {
+                "No more retries."
+            }
+        );
+        let _ = self.shutdown_qemu().await;
+        incompatible
+    }
+
+    async fn boot_with_retries(
+        &mut self,
+        boot: &QemuBootSettings,
+        secret_file_path: Option<PathBuf>,
+    ) -> anyhow::Result<()> {
+        // ポート取得 → QEMU 起動 → Agent 接続のリトライループ。
+        // find_available_port は TOCTOU リスクがあるため、接続失敗時に
+        // 別のポートで再試行する。
+        // トークンはリトライごとに再生成する (#194)。
+        // 前回の QEMU プロセスが残留する場合に同一トークンが複数 VM に存在しうるため。
+        let mut last_error = None;
+        for attempt in 0..PORT_RETRY_MAX {
+            self.start_attempt(boot, &secret_file_path).await?;
+
+            // Agent からの Ready 通知を待ち、接続を保持する
+            match self.wait_for_agent_ready().await {
+                Ok(conn) => {
+                    self.commit_ready_connection(conn, &secret_file_path);
+                    return Ok(());
+                }
+                Err(e) => {
+                    let incompatible = self.rollback_attempt(&e, attempt).await;
+                    last_error = Some(e);
+                    if incompatible {
+                        break;
+                    }
+                }
+            }
+        }
+
+        // 全リトライ失敗: secret ファイルをクリーンアップ
+        if let Some(ref path) = secret_file_path {
+            let _ = std::fs::remove_file(path);
+        }
+        self.status = SandboxStatus::Stopped;
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("QEMU startup failed after retries")))
     }
 
     /// Agent に TCP 接続して Hello ハンドシェイク + Ready 通知を待つ。
@@ -681,34 +869,7 @@ impl Sandbox for QemuSandbox {
 
         self.status = SandboxStatus::Starting;
 
-        let (cpus, memory_mb, image, share, dns_proxy) = match config {
-            SandboxConfig::Qemu {
-                cpus,
-                memory_mb,
-                image,
-                share,
-                dns_proxy,
-            } => (
-                *cpus,
-                *memory_mb,
-                image.clone(),
-                share.clone(),
-                dns_proxy.clone(),
-            ),
-            _ => {
-                self.status = SandboxStatus::Stopped;
-                anyhow::bail!("QemuSandbox requires SandboxConfig::Qemu");
-            }
-        };
-
-        // #35: イメージの存在確認
-        let image_path = match check_image_exists(&image) {
-            Ok(p) => p,
-            Err(e) => {
-                self.status = SandboxStatus::Stopped;
-                return Err(e);
-            }
-        };
+        let boot = self.boot_settings(config)?;
 
         // HMAC シークレットをリトライ間で共有するため先に読み出す
         let secret = load_shared_secret_from_env()?;
@@ -721,112 +882,7 @@ impl Sandbox for QemuSandbox {
             None
         };
 
-        // ポート取得 → QEMU 起動 → Agent 接続のリトライループ。
-        // find_available_port は TOCTOU リスクがあるため、接続失敗時に
-        // 別のポートで再試行する。
-        // トークンはリトライごとに再生成する (#194)。
-        // 前回の QEMU プロセスが残留する場合に同一トークンが複数 VM に存在しうるため。
-        let mut last_error = None;
-        for attempt in 0..PORT_RETRY_MAX {
-            // 旧トークンをゼロクリアしてからリトライ (#197)
-            if let Some(ref mut old_token) = self.token {
-                zeroize::Zeroize::zeroize(old_token);
-            }
-
-            // 前回のトークンファイルを削除（リーク防止）
-            if let Some(ref path) = self.token_file {
-                let _ = std::fs::remove_file(path);
-                self.token_file = None;
-            }
-
-            // リトライごとにトークンを再生成 (#194)
-            let token = generate_token();
-            self.token = Some(token.clone());
-
-            // リトライごとに fw_cfg トークンファイルを再生成 (#202)
-            let token_file_path = write_secure_temp_file("token", token.as_bytes())?;
-            self.token_file = Some(token_file_path.clone());
-
-            self.host_port = find_available_port().await?;
-
-            let args = build_qemu_args(&QemuArgsParams {
-                image_path: &image_path,
-                cpus,
-                memory_mb,
-                share: &share,
-                host_port: self.host_port,
-                token: Some(token_file_path.to_str().ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "token temp file path is not valid UTF-8: {:?}",
-                        token_file_path
-                    )
-                })?),
-                secret: secret_file_path.as_ref().and_then(|p| p.to_str()),
-                dns_proxy: dns_proxy.as_deref(),
-            });
-
-            // バッファをリセットして QEMU を起動
-            self.qemu_stdout_head.lock().await.clear();
-            self.qemu_stderr_head.lock().await.clear();
-
-            match spawn_qemu_with_capture(
-                &self.qemu_binary,
-                &args,
-                &self.qemu_stdout_head,
-                &self.qemu_stderr_head,
-            ) {
-                Ok(child) => self.child = Some(child),
-                Err(e) => {
-                    self.status = SandboxStatus::Stopped;
-                    return Err(e);
-                }
-            }
-
-            // Agent からの Ready 通知を待ち、接続を保持する
-            match self.wait_for_agent_ready().await {
-                Ok(conn) => {
-                    self.connection = Some(Mutex::new(conn));
-                    self.status = SandboxStatus::Running;
-                    // 成功時に secret_file を登録（down() での削除対象にする）
-                    self.secret_file = secret_file_path.clone();
-                    self.cleanup_temp_files();
-
-                    // 注意: ハンドシェイク (Hello/Ready) は try_handshake 内で完結するため、
-                    // pcap には記録しない。pcap に記録されるのは Exec/ExecResult 等の
-                    // アプリケーションメッセージのみ。
-
-                    return Ok(());
-                }
-                Err(e) => {
-                    let incompatible = e.to_string().contains("incompatible protocol version")
-                        || e.to_string().contains("unsupported protocol version");
-                    self.log_qemu_output().await;
-                    eprintln!(
-                        "WARNING: QEMU startup attempt {} failed (port {}): {}. {}",
-                        attempt + 1,
-                        self.host_port,
-                        e,
-                        if attempt + 1 < PORT_RETRY_MAX && !incompatible {
-                            "Retrying with a new port..."
-                        } else {
-                            "No more retries."
-                        }
-                    );
-                    let _ = self.shutdown_qemu().await;
-                    last_error = Some(e);
-                    if incompatible {
-                        break;
-                    }
-                }
-            }
-        }
-
-        // 全リトライ失敗: secret ファイルをクリーンアップ
-        if let Some(ref path) = secret_file_path {
-            let _ = std::fs::remove_file(path);
-        }
-        self.status = SandboxStatus::Stopped;
-        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("QEMU startup failed after retries")))
+        self.boot_with_retries(&boot, secret_file_path).await
     }
 
     async fn exec(
@@ -916,6 +972,29 @@ impl Sandbox for QemuSandbox {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn retry_rotates_private_token_file_and_removes_the_previous_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut sandbox = QemuSandbox::default();
+        let first_path = sandbox.rotate_token_file().unwrap();
+        let first = sandbox.token.clone().unwrap();
+        assert_eq!(std::fs::read_to_string(&first_path).unwrap(), first);
+        assert_eq!(
+            std::fs::metadata(&first_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let second_path = sandbox.rotate_token_file().unwrap();
+        assert!(!first_path.exists());
+        assert_ne!(sandbox.token.as_ref().unwrap(), &first);
+        assert_eq!(
+            std::fs::read_to_string(&second_path).unwrap(),
+            *sandbox.token.as_ref().unwrap()
+        );
+        sandbox.cleanup_temp_files();
+        assert!(!second_path.exists());
+    }
 
     #[test]
     fn new_sandbox_shell_exits_and_restores_terminal_without_input() {

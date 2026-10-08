@@ -215,6 +215,23 @@ verify fatal authentication errors propagate from the retry boundary, while an
 immediate disconnect returns a retryable absence. Linux cross-target all-target,
 all-feature Clippy passes.
 
+### QEMU and Apple Container startup
+
+The final original candidate in each backend is split. All original candidates
+and all new production helpers in both backend modules are below 50 lines.
+QEMU settings/image validation, token-file rotation, individual process startup,
+Ready commit and failed-attempt logging/shutdown are separate responsibilities.
+Token and secret-file lifetime, retry limits, output-buffer reset and startup
+error/state handling remain unchanged. Apple Container settings/image checks,
+private env-file preparation, boot arguments and process execution preserve
+RAII cleanup and state/Ready sequencing.
+
+All 33 QEMU and 28 Apple Container tests pass. Added regressions verify retry
+rotation removes the old token file, stores a new value with mode 0600, and
+cleans up after success; container spawn failures and unsuccessful exits restore
+Stopped state without registering a container. Linux cross-target all-target,
+all-feature Clippy passes.
+
 ## Outstanding work
 
 The remaining inventory is work to complete, except explicitly documented
