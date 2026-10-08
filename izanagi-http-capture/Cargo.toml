@@ -11,6 +11,7 @@ edition = "2024"
 #   cd izanagi-http-capture && cargo build --release
 
 [dependencies]
+izanagi-common = { path = "../izanagi-common", features = ["user"] }
 anyhow = "1"
 izanagi-telemetry = { path = "../izanagi-telemetry" }
 serde_json = "1"

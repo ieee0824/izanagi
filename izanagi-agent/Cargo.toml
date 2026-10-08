@@ -24,7 +24,6 @@ smallvec = { version = "1", features = ["serde"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "io-util", "time", "net"] }
 async-trait = "0.1"
 chrono = "0.4"
-hex = "0.4"
 subtle = "2.6"
 sha2 = "0.11"
 libc = "0.2"

@@ -1,5 +1,5 @@
 mod allowlist;
-mod ip_filter;
+use izanagi_common::ip_filter;
 mod proxy;
 mod response;
 mod upstream;
