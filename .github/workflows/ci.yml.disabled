@@ -19,7 +19,7 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            features: landlock
+            features: landlock,ebpf
           - os: macos-latest
             target: aarch64-apple-darwin
             features: ""
@@ -62,7 +62,7 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: Clippy
-        run: cargo clippy --all-targets --features landlock -- -D warnings
+        run: cargo clippy --all-targets --features landlock,ebpf -- -D warnings
 
   fmt:
     runs-on: ubuntu-latest

@@ -24,12 +24,22 @@ mod inner {
     // apply_ruleset_inner 内の async-signal-safe な write(2) と ENOSYS 用
     use libc;
 
-    /// 利用可能な最新の Landlock ABI バージョンを検出する。
-    /// `/sys/kernel/security/landlock/abi-version` ファイルを読み取って判定する。
-    /// カーネルが Landlock 非対応の場合は `None` を返す。
+    /// 利用可能な Landlock ABI バージョンを検出する。
+    /// `landlock_create_ruleset(2)` の VERSION クエリを使用し、
+    /// カーネルが Landlock 非対応または無効な場合は `None` を返す。
+    ///
+    /// この実装がルール構築で対応している最新ABIはV3なので、より新しい
+    /// カーネルではV3へ丸める。
     pub fn detect_abi() -> Option<ABI> {
-        let content = std::fs::read_to_string("/sys/kernel/security/landlock/abi-version").ok()?;
-        let version: u32 = content.trim().parse().ok()?;
+        const LANDLOCK_CREATE_RULESET_VERSION: libc::c_uint = 1;
+        let version = unsafe {
+            libc::syscall(
+                libc::SYS_landlock_create_ruleset,
+                std::ptr::null::<libc::c_void>(),
+                0usize,
+                LANDLOCK_CREATE_RULESET_VERSION,
+            )
+        };
         match version {
             v if v >= 3 => Some(ABI::V3),
             2 => Some(ABI::V2),
@@ -71,14 +81,17 @@ mod inner {
             ruleset = ruleset.add_rule(PathBeneath::new(fd, tmp_access))?;
         }
 
-        // 基本的な読み取り専用パス（ディレクトリ単位）
+        // 基本的な読み取り・実行専用パス（ディレクトリ単位）。
+        // Execute がないと Landlock 適用後に /bin/bash や /usr/bin/* を
+        // execve(2) できないため、書き込み権限とは分離して明示的に許可する。
         let readonly_dirs = ["/usr", "/lib", "/lib64", "/bin", "/sbin"];
         let read_access = AccessFs::ReadFile | AccessFs::ReadDir;
+        let read_execute_access = read_access | AccessFs::Execute;
         for p in &readonly_dirs {
             let path = std::path::Path::new(p);
             if path.exists() {
                 let fd = PathFd::new(path)?;
-                ruleset = ruleset.add_rule(PathBeneath::new(fd, read_access))?;
+                ruleset = ruleset.add_rule(PathBeneath::new(fd, read_execute_access))?;
             }
         }
 
@@ -97,7 +110,12 @@ mod inner {
             let path = std::path::Path::new(p);
             if path.exists() {
                 let fd = PathFd::new(path)?;
-                ruleset = ruleset.add_rule(PathBeneath::new(fd, read_access))?;
+                let access = if path.is_dir() {
+                    read_access
+                } else {
+                    AccessFs::ReadFile.into()
+                };
+                ruleset = ruleset.add_rule(PathBeneath::new(fd, access))?;
             }
         }
 
@@ -108,7 +126,7 @@ mod inner {
             let path = std::path::Path::new(p);
             if path.exists() {
                 let fd = PathFd::new(path)?;
-                ruleset = ruleset.add_rule(PathBeneath::new(fd, read_access))?;
+                ruleset = ruleset.add_rule(PathBeneath::new(fd, AccessFs::ReadFile))?;
             }
         }
 
@@ -283,7 +301,8 @@ mod inner {
                 use std::process::{Command, Stdio};
 
                 // ルールセット構築は fork 前に完了（heap allocation を伴う）
-                let ruleset = build_ruleset(&share_clone, abi).map_err(std::io::Error::other)?;
+                let mut ruleset =
+                    Some(build_ruleset(&share_clone, abi).map_err(std::io::Error::other)?);
 
                 // Safety: pre_exec 内では restrict_self() のみ呼ぶ（async-signal-safe）
                 // apply_ruleset は std::io::Result を返し、ヒープアロケーションを行わない
@@ -294,7 +313,10 @@ mod inner {
                         .envs(&env_clone)
                         .stdout(Stdio::piped())
                         .stderr(Stdio::piped())
-                        .pre_exec(move || apply_ruleset(ruleset))
+                        .pre_exec(move || match ruleset.take() {
+                            Some(ruleset) => apply_ruleset(ruleset),
+                            None => Err(std::io::Error::from_raw_os_error(libc::EINVAL)),
+                        })
                         .output()
                 }
             })
@@ -326,7 +348,8 @@ mod inner {
                 use std::process::{Command, Stdio};
 
                 // ルールセット構築は fork 前に完了（heap allocation を伴う）
-                let ruleset = build_ruleset(&share_clone, abi).map_err(std::io::Error::other)?;
+                let mut ruleset =
+                    Some(build_ruleset(&share_clone, abi).map_err(std::io::Error::other)?);
 
                 // Safety: pre_exec 内では restrict_self() のみ呼ぶ（async-signal-safe）
                 // apply_ruleset は std::io::Result を返し、ヒープアロケーションを行わない
@@ -339,7 +362,10 @@ mod inner {
                         .stdin(Stdio::inherit())
                         .stdout(Stdio::inherit())
                         .stderr(Stdio::inherit())
-                        .pre_exec(move || apply_ruleset(ruleset))
+                        .pre_exec(move || match ruleset.take() {
+                            Some(ruleset) => apply_ruleset(ruleset),
+                            None => Err(std::io::Error::from_raw_os_error(libc::EINVAL)),
+                        })
                         .status()
                 }
             })
@@ -440,9 +466,9 @@ pub fn describe_ruleset(share: &ShareConfig) -> String {
     // NOTE: mount_point はゲスト側パスのため Landlock ルールには含めない
     desc.push_str("    - /tmp (read/write)\n");
 
-    desc.push_str("  Read-only paths:\n");
+    desc.push_str("  Read/execute-only paths:\n");
     for p in &["/usr", "/lib", "/lib64", "/bin", "/sbin"] {
-        desc.push_str(&format!("    - {} (read-only)\n", p));
+        desc.push_str(&format!("    - {} (read/execute-only)\n", p));
     }
     // /etc は全体ではなく必要なファイルのみ
     for p in &[
@@ -486,7 +512,7 @@ mod tests {
         // mount_point はゲスト側パスのため含まれない
         assert!(!desc.contains("/workspace (mount_point, read/write)"));
         assert!(desc.contains("/tmp (read/write)"));
-        assert!(desc.contains("/usr (read-only)"));
+        assert!(desc.contains("/usr (read/execute-only)"));
         assert!(desc.contains("/etc/resolv.conf (read-only)"));
         // /proc は最小限のエントリのみ許可
         assert!(desc.contains("/proc (minimal read-only)"));
@@ -598,6 +624,70 @@ mod tests {
             sb.down().await.expect("down should succeed");
             assert_eq!(sb.status(), SandboxStatus::Stopped);
         }
+    }
+
+    #[cfg(all(target_os = "linux", feature = "landlock"))]
+    #[tokio::test]
+    async fn test_landlock_executes_system_binary() {
+        let share = ShareConfig {
+            host_paths: vec![PathBuf::from("/tmp")],
+            mount_point: PathBuf::from("/workspace"),
+        };
+        let config = SandboxConfig::Landlock { share };
+        let mut sb = LandlockSandbox::new();
+
+        // Landlock非対応または無効なカーネルでは実機テストをスキップする。
+        if sb.up(&config).await.is_err() {
+            return;
+        }
+
+        let output = sb
+            .exec(&["/bin/true".to_string()], &HashMap::new())
+            .await
+            .expect("a system binary should be executable under Landlock");
+        assert_eq!(output.exit_code, 0);
+
+        sb.down().await.expect("down should succeed");
+    }
+
+    #[cfg(all(target_os = "linux", feature = "landlock"))]
+    #[tokio::test]
+    async fn test_landlock_rejects_binary_outside_allowed_paths() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let share = ShareConfig {
+            host_paths: vec![PathBuf::from("/tmp")],
+            mount_point: PathBuf::from("/workspace"),
+        };
+        let config = SandboxConfig::Landlock { share };
+        let mut sb = LandlockSandbox::new();
+
+        // Landlock非対応または無効なカーネルでは実機テストをスキップする。
+        if sb.up(&config).await.is_err() {
+            return;
+        }
+
+        let executable = PathBuf::from(format!(
+            "/dev/shm/izanagi-landlock-denied-{}",
+            std::process::id()
+        ));
+        std::fs::write(&executable, b"#!/bin/sh\nexit 0\n").expect("create test executable");
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))
+            .expect("mark test file executable");
+
+        let result = sb
+            .exec(
+                &[executable.to_string_lossy().into_owned()],
+                &HashMap::new(),
+            )
+            .await;
+
+        let _ = std::fs::remove_file(&executable);
+        sb.down().await.expect("down should succeed");
+        assert!(
+            result.is_err(),
+            "a binary outside the allowed paths must not be executable"
+        );
     }
 
     #[cfg(all(target_os = "linux", feature = "landlock"))]
