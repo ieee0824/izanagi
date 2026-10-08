@@ -61,7 +61,9 @@ where
             }
             Some(Message::Error(e)) => anyhow::bail!("agent error on hello: {}", e),
             Some(other) => anyhow::bail!("expected Hello message, got {:?}", other),
-            None => anyhow::bail!("agent disconnected before Hello"),
+            None => anyhow::bail!(
+                "agent disconnected before Hello; possible incompatible protocol version: upgrade host and agent together"
+            ),
         }
 
         Ok(())

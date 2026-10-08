@@ -17,7 +17,6 @@ use aya_ebpf::{
     maps::RingBuf,
     programs::TracePointContext,
 };
-use aya_log_ebpf::info;
 use izanagi_common::{RawSyscallEvent, SyscallCategoryId, SyscallId};
 
 /// ring buffer マップ。ユーザー空間とイベントデータを共有する。
@@ -47,6 +46,11 @@ fn emit_event(
 
     let event = entry.as_mut_ptr();
     unsafe {
+        // Initialize every byte (including padding) with BPF-compatible stores.
+        // LLVM must not replace the writes with an unsupported memset call.
+        for index in 0..core::mem::size_of::<RawSyscallEvent>() {
+            core::ptr::write_volatile(event.cast::<u8>().add(index), 0);
+        }
         // bpf_ktime_get_ns() でタイムスタンプを取得
         (*event).timestamp_ns = aya_ebpf::helpers::bpf_ktime_get_ns();
 
@@ -57,7 +61,6 @@ fn emit_event(
 
         (*event).syscall_id = syscall_id as u32;
         (*event).category = category as u8;
-        (*event)._pad = [0u8; 3];
 
         // tracepoint の引数を読み取り (オフセットはフォーマット依存)
         // sys_enter の共通レイアウト: offset 8 = syscall_nr, offset 16~ = args
@@ -66,15 +69,13 @@ fn emit_event(
         (*event).arg2 = ctx.read_at::<u64>(32).unwrap_or(0);
 
         // プロセス名を取得
-        (*event).comm = [0u8; 16];
-        if let Ok(comm) = aya_ebpf::helpers::bpf_get_current_comm() {
-            (*event).comm = comm;
-        }
+        aya_ebpf::helpers::gen::bpf_get_current_comm(
+            core::ptr::addr_of_mut!((*event).comm).cast(),
+            16,
+        );
 
         // パスバッファは初期化のみ (tracepoint ごとに個別に読み取る)
-        (*event).path_buf = [0u8; 256];
         (*event).path_len = 0;
-        (*event)._pad2 = [0u8; 4];
     }
 
     entry.submit(0);
