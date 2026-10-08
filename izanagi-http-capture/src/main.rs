@@ -99,7 +99,7 @@ async fn main() -> anyhow::Result<()> {
         secret_map.add_from_str(s)?;
     }
     if !secret_map.is_empty() {
-        eprintln!("シークレットマッピング: {} エントリ", cli.secret_maps.len());
+        eprintln!("シークレットマッピングを有効にしました");
     }
 
     // 許可ホスト
