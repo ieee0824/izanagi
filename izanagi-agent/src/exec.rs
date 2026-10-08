@@ -173,7 +173,8 @@ pub(crate) async fn execute_command(
         }
         Ok(Err(e)) => {
             // 内部エラーの詳細をログに出して、抽象化されたメッセージを返す
-            eprintln!("exec internal error: {}", e);
+            let _ = e;
+            eprintln!("exec internal error");
             anyhow::bail!(EXEC_ERROR_PREFIX);
         }
         Err(_) => {
@@ -245,7 +246,7 @@ fn check_command_allowlist(cmd: &str) -> Result<()> {
     if allowed {
         Ok(())
     } else {
-        eprintln!("WARNING: command '{}' not in allowlist", cmd_name);
+        eprintln!("WARNING: command not in allowlist");
         anyhow::bail!("{}: not allowed", EXEC_ERROR_PREFIX)
     }
 }

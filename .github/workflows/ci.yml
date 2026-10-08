@@ -55,6 +55,7 @@ jobs:
           - izanagi-agent/Cargo.toml
           - izanagi-dns-proxy/Cargo.toml
           - izanagi-http-capture/Cargo.toml
+          - izanagi-telemetry/Cargo.toml
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
@@ -84,7 +85,7 @@ jobs:
         shell: bash
         run: |
           cargo fmt --all -- --check
-          for manifest in izanagi-common/Cargo.toml izanagi-agent/Cargo.toml izanagi-dns-proxy/Cargo.toml izanagi-http-capture/Cargo.toml; do
+          for manifest in izanagi-common/Cargo.toml izanagi-agent/Cargo.toml izanagi-dns-proxy/Cargo.toml izanagi-http-capture/Cargo.toml izanagi-telemetry/Cargo.toml; do
             cargo fmt --manifest-path "$manifest" -- --check
           done
       - name: Run Clippy

@@ -58,6 +58,8 @@ struct VmAgentTracerInner {
     port_override: Option<u16>,
     /// HMAC 認証用の共有シークレット。
     secret: Option<Vec<u8>>,
+    behavior: Option<crate::protocol::BehaviorStartConfig>,
+    telemetry_tx: Option<mpsc::Sender<izanagi_telemetry::TelemetryEnvelope>>,
 }
 
 impl VmAgentTracer {
@@ -73,6 +75,8 @@ impl VmAgentTracer {
                 token: None,
                 port_override: None,
                 secret: None,
+                behavior: None,
+                telemetry_tx: None,
             })),
         }
     }
@@ -129,7 +133,7 @@ impl VmAgentTracer {
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
         let mut client = Self::prepare(stream, filter, secret, token).await?;
-        Self::receive_events(&mut client, tx, &mut shutdown_rx).await
+        Self::receive_events(&mut client, tx, &mut shutdown_rx, None).await
     }
 
     async fn prepare<S>(
@@ -143,11 +147,40 @@ impl VmAgentTracer {
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
+        Self::prepare_inner(stream, filter, auth_key, token_hash, None).await
+    }
+
+    async fn prepare_inner<S>(
+        stream: S,
+        filter: &TraceFilter,
+        auth_key: Option<Vec<u8>>,
+        token_hash: Option<String>,
+        behavior: Option<crate::protocol::BehaviorStartConfig>,
+    ) -> anyhow::Result<
+        crate::protocol_client::ProtocolClient<tokio::io::ReadHalf<S>, tokio::io::WriteHalf<S>>,
+    >
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
         let (reader, writer) = tokio::io::split(stream);
         let mut client = crate::protocol_client::ProtocolClient::new(reader, writer, auth_key);
         tokio::time::timeout(std::time::Duration::from_secs(15), async {
             client.handshake_and_wait_ready(token_hash).await?;
-            client.start_tracing(filter).await
+            if let Some(config) = behavior {
+                client
+                    .send_message(&Message::StartBehavior {
+                        filter: filter.clone(),
+                        config,
+                    })
+                    .await?;
+                match client.recv_message().await? {
+                    Some(Message::TraceStarted) => Ok(()),
+                    Some(Message::Error(_)) => anyhow::bail!("agent behavior startup failed"),
+                    _ => anyhow::bail!("expected behavior TraceStarted acknowledgement"),
+                }
+            } else {
+                client.start_tracing(filter).await
+            }
         })
         .await
         .map_err(|_| {
@@ -162,11 +195,14 @@ impl VmAgentTracer {
         client: &mut crate::protocol_client::ProtocolClient<R, W>,
         tx: mpsc::Sender<Arc<SyscallEvent>>,
         shutdown_rx: &mut tokio::sync::oneshot::Receiver<()>,
+        telemetry_tx: Option<mpsc::Sender<izanagi_telemetry::TelemetryEnvelope>>,
     ) -> anyhow::Result<()>
     where
         R: tokio::io::AsyncRead + Unpin,
         W: tokio::io::AsyncWrite + Unpin,
     {
+        // Optional inference must never backpressure required syscall monitoring.
+        let mut telemetry_dropped = 0_u64;
         // イベント受信ループ
         loop {
             tokio::select! {
@@ -176,6 +212,20 @@ impl VmAgentTracer {
                             tokio::select! {
                                 result = tx.send(Arc::new(event)) => { if result.is_err() { break; } }
                                 _ = &mut *shutdown_rx => { break; }
+                            }
+                        }
+                        Some(Message::Telemetry(mut event)) => {
+                            if let Some(ref sender) = telemetry_tx {
+                                if telemetry_dropped > 0 {
+                                    event.quality.issues.push(izanagi_telemetry::QualityIssue::EventLoss);
+                                }
+                                if sender.try_send(*event).is_err() {
+                                    telemetry_dropped = telemetry_dropped.saturating_add(1);
+                                    if telemetry_dropped == 1 { eprintln!("behavior telemetry queue full or closed; optional analysis is degraded"); }
+                                } else {
+                                    if telemetry_dropped > 0 { eprintln!("behavior telemetry dropped: {telemetry_dropped}"); }
+                                    telemetry_dropped = 0;
+                                }
                             }
                         }
                         Some(Message::Error(e)) => {
@@ -192,6 +242,9 @@ impl VmAgentTracer {
             }
         }
 
+        if telemetry_dropped > 0 {
+            eprintln!("behavior telemetry dropped before shutdown: {telemetry_dropped}");
+        }
         Ok(())
     }
 }
@@ -245,6 +298,16 @@ impl Tracer for VmAgentTracer {
             .secret = Some(secret);
     }
 
+    fn set_behavior(
+        &self,
+        config: crate::protocol::BehaviorStartConfig,
+        sender: mpsc::Sender<izanagi_telemetry::TelemetryEnvelope>,
+    ) {
+        let mut inner = self.inner.lock().expect("VmAgentTracerInner lock poisoned");
+        inner.behavior = Some(config);
+        inner.telemetry_tx = Some(sender);
+    }
+
     async fn start(
         &self,
         filter: &TraceFilter,
@@ -255,7 +318,7 @@ impl Tracer for VmAgentTracer {
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
 
         // チェックと設定を同一ロック内で原子的に行い TOCTOU を防止
-        let (token, port, secret) = {
+        let (token, port, secret, behavior, telemetry_tx) = {
             let mut inner = self.inner.lock().expect("VmAgentTracerInner lock poisoned");
             if inner.shutdown_tx.is_some() || inner.starting {
                 anyhow::bail!("VmAgentTracer is already running");
@@ -272,7 +335,13 @@ impl Tracer for VmAgentTracer {
             inner.shutdown_tx = Some(shutdown_tx);
             inner.starting = true;
             inner.failure = None;
-            (inner.token.clone(), port, inner.secret.clone())
+            (
+                inner.token.clone(),
+                port,
+                inner.secret.clone(),
+                inner.behavior.clone(),
+                inner.telemetry_tx.clone(),
+            )
         };
 
         // Roll back the reservation on every failure or cancellation.
@@ -287,7 +356,7 @@ impl Tracer for VmAgentTracer {
                 TcpStream::connect(("127.0.0.1", port)),
             )
             .await??;
-            Self::prepare(stream, filter, secret, token).await
+            Self::prepare_inner(stream, filter, secret, token, behavior).await
         };
         let mut client = tokio::select! {
             biased;
@@ -302,7 +371,8 @@ impl Tracer for VmAgentTracer {
         let state = Arc::downgrade(&self.inner);
         inner.task = Some(tokio::spawn(async move {
             // Retain a sender until the failure reason has been recorded.
-            let result = Self::receive_events(&mut client, tx.clone(), &mut shutdown_rx).await;
+            let result =
+                Self::receive_events(&mut client, tx.clone(), &mut shutdown_rx, telemetry_tx).await;
             if let Err(error) = result
                 && let Some(state) = state.upgrade()
             {

@@ -95,6 +95,26 @@ pub struct RawSyscallEvent {
     pub path_len: u32,
     /// パディング (構造体末尾のアライメント調整)。
     pub _pad2: [u8; 4],
+    pub abi_version: u32,
+    pub kind: u32,
+    /// Kernel sched_process_fork observation generation; zero means unavailable.
+    pub process_start_ns: u64,
+    pub exec_generation: u64,
+    pub parent_start_ns: u64,
+    pub parent_tgid: u32,
+    pub child_pid: u32,
+    pub result: i64,
+    pub attempt_ns: u64,
+    /// Kernel address (never exported as a socket cookie), paired with generation.
+    pub socket_address: u64,
+    pub socket_generation: u64,
+    pub socket_state: u32,
+    pub family: u16,
+    pub source_port: u16,
+    pub destination_port: u16,
+    pub flags: u16,
+    pub source_address: [u8; 16],
+    pub destination_address: [u8; 16],
 }
 
 /// `RawSyscallEvent` のサイズ（バイト数）。
@@ -103,3 +123,17 @@ pub struct RawSyscallEvent {
 pub const PATH_BUF_SIZE: usize = 256;
 
 pub const RAW_EVENT_SIZE: usize = core::mem::size_of::<RawSyscallEvent>();
+
+/// Raw ABI is deliberately independent from the authenticated wire version.
+pub const RAW_ABI_VERSION: u32 = 1;
+pub const ABI_SECTION: &str = ".izanagi_abi";
+pub const ABI_MAGIC: [u8; 8] = *b"IZANABI!";
+pub const KIND_ENTER: u32 = 0;
+pub const KIND_OPEN_EXIT: u32 = 1;
+pub const KIND_FORK: u32 = 2;
+pub const KIND_EXEC: u32 = 3;
+pub const KIND_EXIT: u32 = 4;
+pub const KIND_SOCKET: u32 = 5;
+pub const FLAG_PATH_FAILED: u16 = 1;
+pub const FLAG_PATH_TRUNCATED: u16 = 2;
+pub const FLAG_STATE_MISSING: u16 = 4;

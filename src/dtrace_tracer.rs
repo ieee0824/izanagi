@@ -485,7 +485,7 @@ fn parse_dtrace_line(line: &str) -> Option<SyscallEvent> {
         process_name,
         syscall,
         args,
-        result: crate::event::SyscallResult::Ok(0), // entry probe では戻り値未取得
+        result: crate::event::SyscallResult::Unknown,
     })
 }
 

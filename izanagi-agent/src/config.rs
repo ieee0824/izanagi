@@ -48,7 +48,7 @@ pub(crate) fn log_env_summary() {
 
     eprintln!("--- agent config summary ---");
     if !allowed_cmds.is_empty() {
-        eprintln!("  IZANAGI_ALLOWED_COMMANDS = {}", allowed_cmds);
+        eprintln!("  command allowlist: configured");
     } else if allow_all == "1" {
         eprintln!("  IZANAGI_ALLOW_ALL_COMMANDS = 1 (all commands permitted)");
     } else {

@@ -71,7 +71,8 @@ where
             }
         }
         Some(other) => {
-            anyhow::bail!("expected Hello message, got {:?}", other);
+            let _ = other;
+            anyhow::bail!("expected Hello message");
         }
         None => {
             anyhow::bail!("host disconnected before Hello");
@@ -101,7 +102,7 @@ where
     // メッセージループ: Start (トレース) または Exec (コマンド実行) を処理
     loop {
         match recv_message(&mut reader, secret, &mut recv_seq).await? {
-            Some(Message::Exec { cmd, env }) => {
+            Some(Message::Exec { cmd, mut env }) => {
                 if !authenticated {
                     send_message(
                         &mut writer,
@@ -112,7 +113,15 @@ where
                     .await?;
                     continue;
                 }
-                eprintln!("received Exec: {:?}", cmd);
+                eprintln!("received Exec");
+                if let Some(proxy) = crate::sidecar::proxy_environment() {
+                    for key in ["http_proxy", "HTTP_PROXY"] {
+                        env.insert(key.into(), proxy.clone());
+                    }
+                    for key in ["no_proxy", "NO_PROXY"] {
+                        env.insert(key.into(), String::new());
+                    }
+                }
                 let result = execute_command(&cmd, &env).await;
                 match result {
                     Ok((exit_code, stdout, stderr)) => {
@@ -131,7 +140,7 @@ where
                     }
                     Err(e) => {
                         // 内部詳細はログのみに出力し、クライアントにはサニタイズ済みメッセージを返す
-                        eprintln!("exec error: {}", e);
+                        eprintln!("exec error: {}", sanitize_anyhow_error(&e));
                         let sanitized_msg = sanitize_anyhow_error(&e);
                         send_message(
                             &mut writer,
@@ -147,13 +156,36 @@ where
                     }
                 }
             }
-            Some(Message::Start(filter)) => {
-                eprintln!("received Start with filter: {:?}", filter);
+            Some(message @ (Message::Start(_) | Message::StartBehavior { .. })) => {
+                let (filter, behavior) = match message {
+                    Message::Start(filter) => (filter, None),
+                    Message::StartBehavior { filter, config } => (filter, Some(config)),
+                    _ => unreachable!(),
+                };
+                if behavior.is_some() && !authenticated {
+                    send_message(
+                        &mut writer,
+                        &Message::Error("behavior requires authenticated session".into()),
+                        secret,
+                        &mut send_seq,
+                    )
+                    .await?;
+                    continue;
+                }
+                eprintln!("received Start");
 
                 // eBPF Tracer を起動してイベントを転送する。
                 let tracer = izanagi::ebpf_tracer::EbpfTracer::new();
-                let mut rx = match tracer.start(&filter).await {
-                    Ok(rx) => rx,
+                let start = if let Some(config) = &behavior {
+                    tracer
+                        .start_observation(&filter, config.session_id.clone())
+                        .await
+                        .map(|(rx, telemetry)| (rx, Some(telemetry)))
+                } else {
+                    tracer.start(&filter).await.map(|rx| (rx, None))
+                };
+                let (mut rx, mut telemetry) = match start {
+                    Ok(channels) => channels,
                     Err(e) => {
                         eprintln!("eBPF tracer start failed: {}", e);
                         let err_msg = format!("eBPF tracer start failed: {}", e);
@@ -163,6 +195,27 @@ where
                     }
                 };
 
+                let (mut sidecar, mut http_events) = if let Some(config) = &behavior {
+                    match crate::sidecar::Sidecar::start(config).await {
+                        Ok((sidecar, events)) => (Some(sidecar), Some(events)),
+                        Err(_) => {
+                            tracer.stop().await?;
+                            send_message(
+                                &mut writer,
+                                &Message::Error("behavior sidecar startup failed".into()),
+                                secret,
+                                &mut send_seq,
+                            )
+                            .await?;
+                            continue;
+                        }
+                    }
+                } else {
+                    (None, None)
+                };
+                let mut health_tick = tokio::time::interval(std::time::Duration::from_secs(1));
+                let mut telemetry_budget = tokio::time::Instant::now();
+                let mut sent_telemetry = 0usize;
                 let transfer_result: anyhow::Result<()> = async {
                 send_message(&mut writer, &Message::TraceStarted, secret, &mut send_seq).await?;
 
@@ -176,7 +229,25 @@ where
                 // tokio ワーカースレッドも同じ tgid を持つため正確にフィルタできる。
                 let my_pid = std::process::id();
                 loop {
+                    if telemetry_budget.elapsed()>=std::time::Duration::from_secs(1) { telemetry_budget=tokio::time::Instant::now();sent_telemetry=0; }
                     tokio::select! {
+                        biased;
+                        result = recv_message(&mut reader, secret, &mut recv_seq) => {
+                            match result? { Some(Message::Stop)|None=>break,Some(_)=>{} }
+                        }
+                        _ = health_tick.tick() => {
+                            if sidecar.as_mut().is_some_and(crate::sidecar::Sidecar::failed) {
+                                // No direct-route fallback; applications retain a dead proxy.
+                                send_message(&mut writer,&Message::Error("behavior proxy stopped unexpectedly".into()),secret,&mut send_seq).await?;
+                                break;
+                            }
+                        }
+                        event = async { match telemetry.as_mut() { Some(rx)=>rx.recv().await,None=>std::future::pending().await } }, if sent_telemetry<128 => {
+                            match event { Some(event)=>{sent_telemetry+=1;send_message(&mut writer,&Message::Telemetry(Box::new(event)),secret,&mut send_seq).await?;},None=>{telemetry=None;} }
+                        }
+                        event = async { match http_events.as_mut() { Some(rx)=>rx.recv().await,None=>std::future::pending().await } }, if sent_telemetry<128 => {
+                            match event { Some(event)=>{sent_telemetry+=1;send_message(&mut writer,&Message::Telemetry(Box::new(event)),secret,&mut send_seq).await?;},None=>{http_events=None;} }
+                        }
                         event = rx.recv() => {
                             match event {
                                 Some(event) if !is_agent_event(&event, my_pid) => {
@@ -192,23 +263,12 @@ where
                                 }
                             }
                         }
-                        result = recv_message(&mut reader, secret, &mut recv_seq) => {
-                            match result? {
-                                Some(Message::Stop) => {
-                                    eprintln!("received Stop");
-                                    break;
-                                }
-                                Some(_) => {}
-                                None => {
-                                    break;
-                                }
-                            }
-                        }
                     }
                 }
                     Ok(())
                 }.await;
                 tracer.stop().await?;
+                drop(sidecar);
                 transfer_result?;
             }
             Some(Message::Shell { rows, cols }) => {
@@ -239,7 +299,8 @@ where
                 break;
             }
             Some(other) => {
-                eprintln!("unexpected message: {:?}", other);
+                let _ = other;
+                eprintln!("unexpected message type");
             }
             None => {
                 break;
@@ -322,52 +383,91 @@ where
     // 環境変数を fork 前に CString で構築する。
     // execve の envp 配列として渡すため、CString の Vec + NULL 終端ポインタ配列を用意する。
     // NUL バイトを含む値は安全でないためエラーにする (silent drop しない)。
-    let env_vars: Vec<std::ffi::CString> = [
+    let mut shell_env = vec![
         format!("HOME={}", home_dir),
         format!("USER={}", EXEC_USER),
         "TERM=xterm-256color".to_string(),
         "PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin".to_string(),
-    ]
-    .iter()
-    .map(|s| {
-        std::ffi::CString::new(s.as_str())
-            .map_err(|_| anyhow::anyhow!("environment variable contains interior NUL byte: {}", s))
-    })
-    .collect::<anyhow::Result<Vec<std::ffi::CString>>>()?;
+    ];
+    if let Some(proxy) = crate::sidecar::proxy_environment() {
+        for key in ["http_proxy", "HTTP_PROXY"] {
+            shell_env.push(format!("{key}={proxy}"));
+        }
+        for key in ["no_proxy", "NO_PROXY"] {
+            shell_env.push(format!("{key}="));
+        }
+    }
+    let env_vars: Vec<std::ffi::CString> = shell_env
+        .iter()
+        .map(|s| {
+            std::ffi::CString::new(s.as_str()).map_err(|_| {
+                anyhow::anyhow!("environment variable contains interior NUL byte: {}", s)
+            })
+        })
+        .collect::<anyhow::Result<Vec<std::ffi::CString>>>()?;
 
     // execve の envp / argv をスタック上に構築する (ヒープ確保なし)。
     // env_vars は固定 4 要素 + NULL 終端 = 5 要素。
-    assert_eq!(env_vars.len(), 4, "env_vars must have exactly 4 elements");
-    let envp: [*const libc::c_char; 5] = [
-        env_vars[0].as_ptr(),
-        env_vars[1].as_ptr(),
-        env_vars[2].as_ptr(),
-        env_vars[3].as_ptr(),
-        std::ptr::null(),
-    ];
+    let (pid, master_fd) = {
+        let mut envp: Vec<*const libc::c_char> =
+            env_vars.iter().map(|value| value.as_ptr()).collect();
+        envp.push(std::ptr::null());
 
-    let shell = std::ffi::CString::new("/bin/bash").expect("static string");
-    let argv0 = std::ffi::CString::new("-bash").expect("static string");
-    let argv: [*const libc::c_char; 2] = [argv0.as_ptr(), std::ptr::null()];
+        let shell = std::ffi::CString::new("/bin/bash").expect("static string");
+        let argv0 = std::ffi::CString::new("-bash").expect("static string");
+        let argv: [*const libc::c_char; 2] = [argv0.as_ptr(), std::ptr::null()];
 
-    // chdir 先を fork 前に確保
-    let workdir = std::ffi::CString::new("/workspace").expect("static string");
+        // chdir 先を fork 前に確保
+        let workdir = std::ffi::CString::new("/workspace").expect("static string");
 
-    // PTY を確保
-    let mut winsize = libc::winsize {
-        ws_row: rows,
-        ws_col: cols,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    };
-    let mut master_fd: libc::c_int = -1;
-    let pid = unsafe {
-        libc::forkpty(
-            &mut master_fd,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            &mut winsize,
-        )
+        // PTY を確保
+        let mut winsize = libc::winsize {
+            ws_row: rows,
+            ws_col: cols,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        let mut master_fd: libc::c_int = -1;
+        let pid = unsafe {
+            libc::forkpty(
+                &mut master_fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut winsize,
+            )
+        };
+
+        if pid == 0 {
+            // 子プロセス: async-signal-safe な操作のみ実行する。
+            // すべてのヒープ確保・ライブラリ呼び出しは fork 前に完了済み。
+            // 環境変数は execve の envp 引数で渡すため clearenv/putenv は不要。
+            // envp / argv は fork 前にスタック上で構築済み。子プロセス内はヒープ確保なし。
+            unsafe {
+                if libc::setgid(gid) != 0 {
+                    libc::_exit(126);
+                }
+                if libc::setuid(uid) != 0 {
+                    libc::_exit(126);
+                }
+
+                if libc::chdir(workdir.as_ptr()) != 0 {
+                    libc::_exit(126);
+                }
+
+                // /proc/self/environ のパーミッションを制限し、
+                // シェルプロセスが自身の環境変数を /proc 経由で読めないようにする。
+                #[cfg(target_os = "linux")]
+                if libc::prctl(libc::PR_SET_DUMPABLE, 0 as libc::c_ulong) != 0 {
+                    libc::_exit(126);
+                }
+
+                // execve で環境変数を envp 経由で渡す。親プロセスの環境を継承しない。
+                libc::execve(shell.as_ptr(), argv.as_ptr(), envp.as_ptr());
+                libc::_exit(127);
+            }
+        }
+
+        (pid, master_fd)
     };
 
     if pid < 0 {
@@ -380,36 +480,6 @@ where
         )
         .await?;
         return Ok(());
-    }
-
-    if pid == 0 {
-        // 子プロセス: async-signal-safe な操作のみ実行する。
-        // すべてのヒープ確保・ライブラリ呼び出しは fork 前に完了済み。
-        // 環境変数は execve の envp 引数で渡すため clearenv/putenv は不要。
-        // envp / argv は fork 前にスタック上で構築済み。子プロセス内はヒープ確保なし。
-        unsafe {
-            if libc::setgid(gid) != 0 {
-                libc::_exit(126);
-            }
-            if libc::setuid(uid) != 0 {
-                libc::_exit(126);
-            }
-
-            if libc::chdir(workdir.as_ptr()) != 0 {
-                libc::_exit(126);
-            }
-
-            // /proc/self/environ のパーミッションを制限し、
-            // シェルプロセスが自身の環境変数を /proc 経由で読めないようにする。
-            #[cfg(target_os = "linux")]
-            if libc::prctl(libc::PR_SET_DUMPABLE, 0 as libc::c_ulong) != 0 {
-                libc::_exit(126);
-            }
-
-            // execve で環境変数を envp 経由で渡す。親プロセスの環境を継承しない。
-            libc::execve(shell.as_ptr(), argv.as_ptr(), envp.as_ptr());
-            libc::_exit(127);
-        }
     }
 
     // Own the child before any fallible parent-side setup.
@@ -455,7 +525,7 @@ pub(crate) async fn recv_message<R: tokio::io::AsyncRead + Unpin>(
 #[cfg(test)]
 mod tests {
     #[tokio::test]
-    async fn v2_host_and_real_agent_handshake_over_tcp() {
+    async fn v3_host_and_real_agent_handshake_over_tcp() {
         use izanagi::protocol::{Message, read_message};
         use izanagi::protocol_client::ProtocolClient;
         use tokio::net::{TcpListener, TcpStream};

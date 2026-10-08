@@ -66,6 +66,14 @@ pub trait Tracer: Send + Sync {
     /// HMAC 認証用の共有シークレットを設定する。
     /// VmAgentTracer のみ実装する。その他は何もしない。
     fn set_secret(&self, _secret: Vec<u8>) {}
+
+    /// Optional behavior telemetry has an independent bounded channel.
+    fn set_behavior(
+        &self,
+        _config: crate::protocol::BehaviorStartConfig,
+        _sender: mpsc::Sender<izanagi_telemetry::TelemetryEnvelope>,
+    ) {
+    }
 }
 
 /// 何もしないトレーサー。`TracerBackend::None` 選択時に使用する。
