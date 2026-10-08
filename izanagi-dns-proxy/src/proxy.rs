@@ -219,7 +219,7 @@ async fn handle_query(
     };
 
     // Question セクションからドメイン名を取得
-    let domain = match query.query() {
+    let domain = match query.queries.first() {
         Some(q) => {
             let name = q.name().to_ascii();
             // 末尾のドットを除去
@@ -257,12 +257,12 @@ async fn handle_query(
                 // クライアント実装によっては additional セクションの A/AAAA レコードを
                 // 利用するため、answers のみの検証ではバイパスされる可能性がある。
                 let all_records = resp_msg
-                    .answers()
+                    .answers
                     .iter()
-                    .chain(resp_msg.additionals().iter())
-                    .chain(resp_msg.name_servers().iter());
+                    .chain(resp_msg.additionals.iter())
+                    .chain(resp_msg.authorities.iter());
                 for record in all_records {
-                    let ip: Option<IpAddr> = match record.data() {
+                    let ip: Option<IpAddr> = match &record.data {
                         RData::A(a) => Some(IpAddr::V4(a.0)),
                         RData::AAAA(aaaa) => Some(IpAddr::V6(aaaa.0)),
                         _ => None,
