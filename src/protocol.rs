@@ -5,16 +5,14 @@
 //! ## ワイヤーフォーマット
 //!
 //! ```text
-//! +--------+----------+------------------+
-//! | type   | length   | body             |
-//! | (u8)   | (u32 LE) | (bincode bytes)  |
-//! +--------+----------+------------------+
+//! magic (0xff) + version (2) + type (u8) + length (u32 LE) + body (postcard)
+//! Version 1 (bincode) is deliberately rejected; upgrade host and agent together.
 //! ```
 
 use std::collections::HashMap;
 
+use crate::wire_codec;
 use anyhow::Context;
-use bincode::Options;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -22,15 +20,6 @@ use crate::event::SyscallEvent;
 
 #[cfg(test)]
 use crate::event::SyscallCategory;
-
-/// bincode のデシリアライズオプションを返す。
-/// サイズ制限と固定長エンコーディングを適用し、悪意あるペイロードによる
-/// メモリ過大割り当てを防止する。
-fn bincode_options() -> impl bincode::Options {
-    bincode::DefaultOptions::new()
-        .with_fixint_encoding()
-        .with_limit(MAX_BODY_SIZE as u64)
-}
 
 /// メッセージタイプの識別子。
 #[repr(u8)]
@@ -136,47 +125,58 @@ impl Message {
 /// 最大メッセージボディサイズ (1 MiB)。
 /// 実際の SyscallEvent は数百バイト程度なので 1 MiB で十分。
 /// これを超えるメッセージは不正とみなす。
-const MAX_BODY_SIZE: u32 = 1024 * 1024;
+const MAX_BODY_SIZE: u32 = wire_codec::MAX_BODY_SIZE as u32;
+const WIRE_MAGIC: u8 = 0xff;
+const WIRE_VERSION: u8 = 2;
 
 /// シーケンス番号の最大許容ギャップ。これを超えるギャップはエラーとする。
 /// 本プロトコルは TCP 上の 1:1 接続で使用し、TCP が順序保証するため
 /// 正常時にギャップは発生しない。ギャップ検出は即エラーとする。
 const MAX_SEQUENCE_GAP: u64 = 0;
 
-/// メッセージヘッダーのサイズ: type (u8) + length (u32 LE) = 5 バイト。
-const HEADER_SIZE: usize = 1 + 4;
+/// Header: magic (u8) + version (u8) + type (u8) + length (u32 LE).
+const HEADER_SIZE: usize = 2 + 1 + 4;
+
+fn parse_header(header: &[u8; HEADER_SIZE]) -> anyhow::Result<(MessageType, u32)> {
+    if header[0] != WIRE_MAGIC || header[1] != WIRE_VERSION {
+        anyhow::bail!("incompatible protocol version; upgrade host and agent together");
+    }
+    let message_type = MessageType::try_from(header[2])?;
+    let length = u32::from_le_bytes(header[3..7].try_into().unwrap());
+    if length > MAX_BODY_SIZE {
+        anyhow::bail!("message body too large: {} bytes", length);
+    }
+    Ok((message_type, length))
+}
+
+async fn read_header<R: AsyncRead + Unpin>(
+    reader: &mut R,
+) -> anyhow::Result<Option<[u8; HEADER_SIZE]>> {
+    let mut header = [0; HEADER_SIZE];
+    if reader.read(&mut header[..1]).await? == 0 {
+        return Ok(None);
+    }
+    if header[0] != WIRE_MAGIC {
+        anyhow::bail!("incompatible protocol version; upgrade host and agent together");
+    }
+    reader.read_exact(&mut header[1..2]).await?;
+    if header[1] != WIRE_VERSION {
+        anyhow::bail!("unsupported protocol version: {}", header[1]);
+    }
+    reader.read_exact(&mut header[2..]).await?;
+    Ok(Some(header))
+}
 
 /// メッセージをワイヤーフォーマットにエンコードする。
 ///
-/// フォーマット: type (u8) + length (u32 LE) + body (bincode)
+/// フォーマット: magic + version + type (u8) + length (u32 LE) + body (postcard)
 ///
-/// ヘッダー 5 バイトを仮置きし、bincode::serialize_into で body を直接書き込む。
-/// 中間 Vec を経由しないため、アロケーションが 1 回で済む (#95)。
 pub fn encode_message(msg: &Message) -> anyhow::Result<Vec<u8>> {
-    // bincode のシリアライズサイズを事前計算して with_capacity
-    let body_size = bincode_options().serialized_size(msg)? as usize;
-    if body_size > MAX_BODY_SIZE as usize {
-        anyhow::bail!(
-            "message body too large: {} bytes (max {})",
-            body_size,
-            MAX_BODY_SIZE
-        );
-    }
-    let mut buf = Vec::with_capacity(HEADER_SIZE + body_size);
-    buf.push(msg.message_type() as u8);
-    buf.extend_from_slice(&(0u32).to_le_bytes()); // length は仮置き
-    bincode_options().serialize_into(&mut buf, msg)?;
-
-    // 実際のシリアライズサイズから length フィールドを確定（フレームの自己整合性を保証）
-    let actual_body_size = buf.len() - HEADER_SIZE;
-    if actual_body_size > MAX_BODY_SIZE as usize {
-        anyhow::bail!(
-            "message body too large: {} bytes (max {})",
-            actual_body_size,
-            MAX_BODY_SIZE
-        );
-    }
-    buf[1..HEADER_SIZE].copy_from_slice(&(actual_body_size as u32).to_le_bytes());
+    let body = wire_codec::encode(msg)?;
+    let mut buf = Vec::with_capacity(HEADER_SIZE + body.len());
+    buf.extend_from_slice(&[WIRE_MAGIC, WIRE_VERSION, msg.message_type() as u8]);
+    buf.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&body);
     Ok(buf)
 }
 
@@ -189,11 +189,8 @@ pub fn decode_message(data: &[u8]) -> anyhow::Result<Message> {
     if data.len() < HEADER_SIZE {
         anyhow::bail!("message too short: {} bytes", data.len());
     }
-    let header_type = MessageType::try_from(data[0])?;
-    let length = u32::from_le_bytes([data[1], data[2], data[3], data[4]]) as usize;
-    if length > MAX_BODY_SIZE as usize {
-        anyhow::bail!("message body too large: {} bytes", length);
-    }
+    let (header_type, length) = parse_header(data[..HEADER_SIZE].try_into().unwrap())?;
+    let length = length as usize;
     if data.len() < HEADER_SIZE + length {
         anyhow::bail!(
             "message body incomplete: expected {} bytes, got {}",
@@ -201,7 +198,10 @@ pub fn decode_message(data: &[u8]) -> anyhow::Result<Message> {
             data.len() - HEADER_SIZE
         );
     }
-    let msg: Message = bincode_options().deserialize(&data[HEADER_SIZE..HEADER_SIZE + length])?;
+    if data.len() != HEADER_SIZE + length {
+        anyhow::bail!("trailing bytes after message frame");
+    }
+    let msg: Message = wire_codec::decode(&data[HEADER_SIZE..])?;
 
     // ヘッダの型とデシリアライズされたメッセージの型が一致するか検証
     let actual_type = msg.message_type();
@@ -231,26 +231,16 @@ pub async fn write_message<W: AsyncWrite + Unpin>(
 ///
 /// ストリームが閉じた場合は `Ok(None)` を返す。
 pub async fn read_message<R: AsyncRead + Unpin>(reader: &mut R) -> anyhow::Result<Option<Message>> {
-    // ヘッダー読み取り (type: u8 + length: u32 LE = 5 bytes)
-    let mut header = [0u8; HEADER_SIZE];
-    match reader.read_exact(&mut header).await {
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e.into()),
-    }
-
-    let header_type = MessageType::try_from(header[0])?;
-    let length = u32::from_le_bytes([header[1], header[2], header[3], header[4]]);
-
-    if length > MAX_BODY_SIZE {
-        anyhow::bail!("message body too large: {} bytes", length);
-    }
+    let Some(header) = read_header(reader).await? else {
+        return Ok(None);
+    };
+    let (header_type, length) = parse_header(&header)?;
 
     // ボディ読み取り
     let mut body = vec![0u8; length as usize];
     reader.read_exact(&mut body).await?;
 
-    let msg: Message = bincode_options().deserialize(&body)?;
+    let msg: Message = wire_codec::decode(&body)?;
 
     // ヘッダの型とデシリアライズされたメッセージの型が一致するか検証
     let actual_type = msg.message_type();
@@ -275,13 +265,10 @@ const HMAC_SIZE: usize = 32;
 /// HMAC 認証付きワイヤーフォーマット:
 ///
 /// ```text
-/// +--------+----------+------------------+----------+--------+
-/// | type   | length   | body             | sequence | hmac   |
-/// | (u8)   | (u32 LE) | (bincode bytes)  | (u64 LE) | (32B)  |
-/// +--------+----------+------------------+----------+--------+
+/// magic + version + type + length + body + sequence (u64 LE) + hmac (32B)
 /// ```
 ///
-/// HMAC は type + length + body + sequence 全体に対して計算される。
+/// HMAC は magic + version + type + length + body + sequence 全体に対して計算される。
 /// sequence はリプレイ攻撃防止用の単調増加カウンタ。
 ///
 /// 共有シークレットから HMAC-SHA256 を計算する。
@@ -322,22 +309,9 @@ pub fn encode_message_authenticated(
     secret: &[u8],
     sequence: u64,
 ) -> anyhow::Result<Vec<u8>> {
-    let body = bincode_options().serialize(msg)?;
-    if body.len() > MAX_BODY_SIZE as usize {
-        anyhow::bail!(
-            "message body too large: {} bytes (max {})",
-            body.len(),
-            MAX_BODY_SIZE
-        );
-    }
-    let type_byte = [msg.message_type() as u8];
-    let length_bytes = (body.len() as u32).to_le_bytes();
+    let mut buf = encode_message(msg)?;
     let sequence_bytes = sequence.to_le_bytes();
-    let hmac = compute_hmac(secret, &[&type_byte, &length_bytes, &body, &sequence_bytes]);
-    let mut buf = Vec::with_capacity(1 + 4 + body.len() + 8 + HMAC_SIZE);
-    buf.push(type_byte[0]);
-    buf.extend_from_slice(&length_bytes);
-    buf.extend_from_slice(&body);
+    let hmac = compute_hmac(secret, &[&buf, &sequence_bytes]);
     buf.extend_from_slice(&sequence_bytes);
     buf.extend_from_slice(&hmac);
     Ok(buf)
@@ -374,20 +348,10 @@ pub async fn read_message_authenticated<R: AsyncRead + Unpin>(
     secret: &[u8],
     expected_sequence: &mut u64,
 ) -> anyhow::Result<Option<Message>> {
-    // ヘッダー読み取り (type: u8 + length: u32 LE = 5 bytes)
-    let mut header = [0u8; HEADER_SIZE];
-    match reader.read_exact(&mut header).await {
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e.into()),
-    }
-
-    let header_type = MessageType::try_from(header[0])?;
-    let length = u32::from_le_bytes([header[1], header[2], header[3], header[4]]);
-
-    if length > MAX_BODY_SIZE {
-        anyhow::bail!("message body too large: {} bytes", length);
-    }
+    let Some(header) = read_header(reader).await? else {
+        return Ok(None);
+    };
+    let (header_type, length) = parse_header(&header)?;
 
     // ボディ読み取り
     let mut body = vec![0u8; length as usize];
@@ -430,11 +394,11 @@ pub async fn read_message_authenticated<R: AsyncRead + Unpin>(
         );
     }
 
-    *expected_sequence = received_sequence.checked_add(1).ok_or_else(|| {
+    let next_sequence = received_sequence.checked_add(1).ok_or_else(|| {
         anyhow::anyhow!("sequence number overflow: received {}", received_sequence)
     })?;
 
-    let msg: Message = bincode_options().deserialize(&body)?;
+    let msg: Message = wire_codec::decode(&body)?;
 
     let actual_type = msg.message_type();
     if header_type != actual_type {
@@ -445,6 +409,7 @@ pub async fn read_message_authenticated<R: AsyncRead + Unpin>(
         );
     }
 
+    *expected_sequence = next_sequence;
     Ok(Some(msg))
 }
 
@@ -538,6 +503,176 @@ mod tests {
     // --- encode/decode 単体テスト ---
 
     #[test]
+    fn v2_fixed_wire_fixtures() {
+        for (message, fixture) in [
+            (Message::Stop, vec![0xff, 2, 1, 1, 0, 0, 0, 1]),
+            (Message::Ready, vec![0xff, 2, 3, 1, 0, 0, 0, 3]),
+            (
+                Message::Error("x".into()),
+                vec![0xff, 2, 4, 3, 0, 0, 0, 4, 1, b'x'],
+            ),
+            (
+                Message::Hello {
+                    authenticated: false,
+                    token: None,
+                },
+                vec![0xff, 2, 5, 3, 0, 0, 0, 5, 0, 0],
+            ),
+        ] {
+            assert_eq!(encode_message(&message).unwrap(), fixture);
+            assert_eq!(decode_message(&fixture).unwrap(), message);
+        }
+    }
+
+    #[test]
+    fn roundtrip_every_v2_message_variant() {
+        let messages = vec![
+            make_start_message(),
+            Message::Stop,
+            make_event_message(),
+            Message::Ready,
+            Message::Error("失敗".into()),
+            Message::Hello {
+                authenticated: true,
+                token: Some("token".into()),
+            },
+            Message::Exec {
+                cmd: vec!["echo".into(), "hello".into()],
+                env: HashMap::from([("A".into(), "B".into())]),
+            },
+            Message::ExecResult {
+                exit_code: -1,
+                stdout: vec![0, 255],
+                stderr: vec![128],
+            },
+            Message::Shell { rows: 24, cols: 80 },
+            Message::ShellData {
+                stream: 2,
+                data: vec![0, 255, 128],
+            },
+            Message::ShellClose { exit_code: -2 },
+            Message::ShellResize {
+                rows: 40,
+                cols: 120,
+            },
+        ];
+        for message in messages {
+            assert_eq!(
+                decode_message(&encode_message(&message).unwrap()).unwrap(),
+                message
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_peers_are_rejected_without_waiting_for_body() {
+        for authenticated in [false, true] {
+            let (mut client, mut server) = tokio::io::duplex(64);
+            // v1 Stop frame. Keep the stream open to catch blocking on a longer v2 header.
+            client
+                .write_all(&[1, 4, 0, 0, 0, 1, 0, 0, 0])
+                .await
+                .unwrap();
+            let secret = rand::random::<[u8; 32]>();
+            let mut sequence = 0;
+            let result = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                if authenticated {
+                    read_message_authenticated(&mut server, &secret, &mut sequence).await
+                } else {
+                    read_message(&mut server).await
+                }
+            })
+            .await
+            .unwrap();
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("incompatible protocol")
+            );
+            assert_eq!(sequence, 0);
+        }
+        // A v1 reader's type parser rejects the first byte of every v2 frame.
+        assert!(MessageType::try_from(encode_message(&Message::Stop).unwrap()[0]).is_err());
+    }
+
+    #[tokio::test]
+    async fn unknown_version_and_partial_headers_are_errors() {
+        let mut unsupported = &[WIRE_MAGIC, 99][..];
+        assert!(
+            read_message(&mut unsupported)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("version")
+        );
+        for count in 1..HEADER_SIZE {
+            let frame = encode_message(&Message::Ready).unwrap();
+            let mut partial = &frame[..count];
+            assert!(read_message(&mut partial).await.is_err());
+        }
+    }
+
+    #[test]
+    fn reject_trailing_frame_and_body_bytes() {
+        let mut frame = encode_message(&Message::Stop).unwrap();
+        frame.push(0);
+        assert!(decode_message(&frame).is_err());
+        frame[3..7].copy_from_slice(&2u32.to_le_bytes());
+        assert!(
+            decode_message(&frame)
+                .unwrap_err()
+                .to_string()
+                .contains("trailing")
+        );
+    }
+
+    #[test]
+    fn body_size_boundary_is_enforced_during_encoding() {
+        // Error variant + three-byte string length prefix occupy four bytes.
+        let message = Message::Error("x".repeat(MAX_BODY_SIZE as usize - 4));
+        let frame = encode_message(&message).unwrap();
+        assert_eq!(frame.len(), HEADER_SIZE + MAX_BODY_SIZE as usize);
+        assert_eq!(decode_message(&frame).unwrap(), message);
+        let oversized = Message::Error("x".repeat(MAX_BODY_SIZE as usize - 3));
+        assert!(encode_message(&oversized).is_err());
+        let secret = rand::random::<[u8; 32]>();
+        assert!(encode_message_authenticated(&oversized, &secret, 0).is_err());
+    }
+
+    #[tokio::test]
+    async fn authenticated_header_tampering_and_invalid_body_are_rejected() {
+        let secret = rand::random::<[u8; 32]>();
+        let frame = encode_message_authenticated(&Message::Ready, &secret, 0).unwrap();
+        for index in [0, 1, 2, HEADER_SIZE] {
+            let mut tampered = frame.clone();
+            tampered[index] ^= 1;
+            let mut reader = tampered.as_slice();
+            let mut sequence = 0;
+            assert!(
+                read_message_authenticated(&mut reader, &secret, &mut sequence)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(sequence, 0);
+        }
+        // A valid MAC does not make malformed postcard bytes valid. No sequence commit.
+        let mut invalid = vec![WIRE_MAGIC, WIRE_VERSION, 3, 1, 0, 0, 0, 255];
+        let sequence_bytes = 0u64.to_le_bytes();
+        let tag = compute_hmac(&secret, &[&invalid, &sequence_bytes]);
+        invalid.extend_from_slice(&sequence_bytes);
+        invalid.extend_from_slice(&tag);
+        let mut reader = invalid.as_slice();
+        let mut sequence = 0;
+        assert!(
+            read_message_authenticated(&mut reader, &secret, &mut sequence)
+                .await
+                .is_err()
+        );
+        assert_eq!(sequence, 0);
+    }
+
+    #[test]
     fn roundtrip_start_message() {
         let msg = make_start_message();
         let encoded = encode_message(&msg).unwrap();
@@ -595,7 +730,7 @@ mod tests {
         // Start メッセージをエンコードしてからヘッダの type を Stop に書き換え
         let msg = make_start_message();
         let mut encoded = encode_message(&msg).unwrap();
-        encoded[0] = MessageType::Stop as u8; // ヘッダを改ざん
+        encoded[2] = MessageType::Stop as u8; // ヘッダを改ざん
         let result = decode_message(&encoded);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("type mismatch"));
@@ -678,9 +813,9 @@ mod tests {
         let msg = Message::Stop;
         let encoded = encode_message(&msg).unwrap();
         // type = 1 (Stop)
-        assert_eq!(encoded[0], 1);
+        assert_eq!(&encoded[..3], &[WIRE_MAGIC, WIRE_VERSION, 1]);
         // length is u32 LE
-        let len = u32::from_le_bytes([encoded[1], encoded[2], encoded[3], encoded[4]]);
+        let len = u32::from_le_bytes(encoded[3..7].try_into().unwrap());
         assert_eq!(len as usize, encoded.len() - HEADER_SIZE);
     }
 
@@ -951,7 +1086,10 @@ mod tests {
         // Write header: type=1 (Stop), length=MAX_BODY_SIZE+1
         let msg_type: u8 = 1;
         let length: u32 = MAX_BODY_SIZE + 1;
-        client.write_all(&[msg_type]).await.unwrap();
+        client
+            .write_all(&[WIRE_MAGIC, WIRE_VERSION, msg_type])
+            .await
+            .unwrap();
         client.write_all(&length.to_le_bytes()).await.unwrap();
         drop(client);
         let result = read_message(&mut server).await;

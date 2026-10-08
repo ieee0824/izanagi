@@ -16,7 +16,6 @@ ebpf = ["izanagi/ebpf"]
 
 [dependencies]
 anyhow = "1"
-bincode = "1"
 serde = { version = "1", features = ["derive"] }
 smallvec = { version = "1", features = ["serde"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "io-util", "time", "net"] }
@@ -29,6 +28,9 @@ libc = "0.2"
 
 # izanagi 本体からプロトコルとイベント型を参照する
 izanagi = { path = ".." }
+
+[dev-dependencies]
+rand = "0.10"
 
 [[bin]]
 name = "izanagi-agent"

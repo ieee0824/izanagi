@@ -182,23 +182,28 @@ pub struct SyscallEvent {
     /// eBPF ではスレッドID (tid) が `pid` に、thread group ID (tgid) が `tgid` に入る。
     /// DTrace 等 tgid を提供しないトレーサー向けにデフォルト 0 とする。
     /// シリアライズ形式はバージョン非対応であり、プロデューサー/コンシューマーは
-    /// lockstep アップグレードを前提とする。`#[serde(default)]` は bincode の
+    /// lockstep アップグレードを前提とする。`#[serde(default)]` は postcard の
     /// 後方互換性保証ではなく、tgid を送れない実装向けのフォールバック用途。
     #[serde(default)]
     pub tgid: u32,
 }
 
-/// `SyscallEvent` を bincode でシリアライズする。
+/// `SyscallEvent` を postcard でシリアライズする。
 /// vm-agent ↔ host 間の転送フォーマットとして使用する。
 pub fn serialize_event(event: &SyscallEvent) -> anyhow::Result<Vec<u8>> {
-    let bytes = bincode::serialize(event)?;
+    let body = crate::wire_codec::encode(event)?;
+    let mut bytes = Vec::with_capacity(body.len() + 2);
+    bytes.extend_from_slice(&[0xff, 2]);
+    bytes.extend_from_slice(&body);
     Ok(bytes)
 }
 
-/// bincode バイト列から `SyscallEvent` をデシリアライズする。
+/// postcard バイト列から `SyscallEvent` をデシリアライズする。
 pub fn deserialize_event(bytes: &[u8]) -> anyhow::Result<SyscallEvent> {
-    let event = bincode::deserialize(bytes)?;
-    Ok(event)
+    if !bytes.starts_with(&[0xff, 2]) {
+        anyhow::bail!("incompatible event format; upgrade producer and consumer together");
+    }
+    crate::wire_codec::decode(&bytes[2..])
 }
 
 #[cfg(test)]
@@ -206,7 +211,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn roundtrip_bincode_serialization() {
+    fn roundtrip_postcard_serialization() {
         let event = SyscallEvent {
             timestamp: SystemTime::now(),
             pid: 42,
@@ -250,7 +255,7 @@ mod tests {
     #[test]
     fn deserialize_old_format_without_tgid() {
         // 旧フォーマット (tgid なし) のペイロードをシミュレート
-        // bincode はポジショナルなので、末尾フィールドが欠けた短いペイロードを渡す
+        // postcard はポジショナルなので、末尾フィールドが欠けた短いペイロードを渡す
         let event = SyscallEvent {
             timestamp: SystemTime::UNIX_EPOCH,
             pid: 1,
@@ -261,13 +266,13 @@ mod tests {
             tgid: 0,
         };
         let bytes = serialize_event(&event).unwrap();
-        // tgid (末尾 4 バイト) を削って旧フォーマットをシミュレート
-        let old_bytes = &bytes[..bytes.len() - 4];
-        // bincode は末尾が足りない場合エラーになるが、serde(default) は効かない
-        // → 旧 agent との互換性は bincode では保証されない（lockstep upgrade 前提）
+        // tgid (末尾の varint 1 バイト) を削って旧フォーマットをシミュレート
+        let old_bytes = &bytes[..bytes.len() - 1];
+        // postcard は末尾が足りない場合エラーになるが、serde(default) は効かない
+        // → 旧 agent との互換性は postcard では保証されない（lockstep upgrade 前提）
         // ここでは「現行フォーマットの round-trip は正常」であることを確認
         let result = deserialize_event(old_bytes);
-        // bincode は厳密にバイト数が合わないとエラーになる
+        // postcard は厳密にバイト数が合わないとエラーになる
         assert!(
             result.is_err(),
             "truncated payload should fail deserialization"

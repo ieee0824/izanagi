@@ -2,10 +2,6 @@ version: 2
 updates:
   - package-ecosystem: cargo
     directory: /
-    # bincode 3.0.0 contains only compile_error!; retain the wire-compatible v1.
-    ignore:
-      - dependency-name: bincode
-        update-types: [version-update:semver-major]
     schedule:
       interval: weekly
       day: monday
@@ -18,9 +14,6 @@ updates:
 
   - package-ecosystem: cargo
     directory: /izanagi-agent
-    ignore:
-      - dependency-name: bincode
-        update-types: [version-update:semver-major]
     schedule:
       interval: weekly
       day: monday
