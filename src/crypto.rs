@@ -46,4 +46,11 @@ mod tests {
     fn sha256_hex_different_inputs() {
         assert_ne!(sha256_hex("a"), sha256_hex("b"));
     }
+    #[test]
+    fn sha256_hex_utf8_known_value() {
+        assert_eq!(
+            sha256_hex("日本語🔐"),
+            "8a6863f8e5f6f6c176ad7063d583d5fb42fc7817198f34b0f7f356ac583e51cc"
+        );
+    }
 }

@@ -1,9 +1,4 @@
-/// SHA256 ハッシュを16進文字列で返す。
-pub(crate) fn sha256_hex(input: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let hash = Sha256::digest(input.as_bytes());
-    hex::encode(hash)
-}
+pub(crate) use izanagi::crypto::sha256_hex;
 
 /// SHA256 ダイジェストの定数時間比較。秘密鍵・固定鍵は不要。
 /// ハッシュ計算時間は入力長に依存するが、比較は内容による早期終了をしない。
@@ -64,5 +59,12 @@ mod tests {
             changed[index] ^= 1;
             assert!(!constant_time_eq(&input, &changed));
         }
+    }
+    #[test]
+    fn shared_sha256_hex_utf8_known_value() {
+        assert_eq!(
+            sha256_hex("日本語🔐"),
+            "8a6863f8e5f6f6c176ad7063d583d5fb42fc7817198f34b0f7f356ac583e51cc"
+        );
     }
 }

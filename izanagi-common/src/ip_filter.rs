@@ -1,4 +1,4 @@
-//! DNS リバインディング対策用の IP アドレスフィルタ。
+//! DNS リバインディング・SSRF 対策用の IP アドレスフィルタ。
 //!
 //! upstream DNS 応答に含まれる A/AAAA レコードがプライベート/ループバック/
 //! リンクローカルアドレスでないことを検証する。
@@ -80,5 +80,58 @@ mod tests {
         assert!(is_private_ip("::ffff:192.168.1.1".parse().unwrap()));
         // ::ffff:8.8.8.8 はパブリック
         assert!(!is_private_ip("::ffff:8.8.8.8".parse().unwrap()));
+    }
+    #[test]
+    fn address_range_boundaries_preserve_policy() {
+        let cases = [
+            ("9.255.255.255", false),
+            ("10.0.0.0", true),
+            ("10.255.255.255", true),
+            ("11.0.0.0", false),
+            ("172.15.255.255", false),
+            ("172.16.0.0", true),
+            ("172.31.255.255", true),
+            ("172.32.0.0", false),
+            ("192.167.255.255", false),
+            ("192.168.0.0", true),
+            ("192.168.255.255", true),
+            ("192.169.0.0", false),
+            ("126.255.255.255", false),
+            ("127.0.0.0", true),
+            ("127.255.255.255", true),
+            ("128.0.0.0", false),
+            ("169.253.255.255", false),
+            ("169.254.0.0", true),
+            ("169.254.255.255", true),
+            ("169.255.0.0", false),
+            ("0.0.0.0", true),
+            ("0.0.0.1", false),
+            ("255.255.255.254", false),
+            ("255.255.255.255", true),
+            ("fbff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", false),
+            ("fc00::", true),
+            ("fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", true),
+            ("fe00::", false),
+            ("fe7f:ffff:ffff:ffff:ffff:ffff:ffff:ffff", false),
+            ("fe80::", true),
+            ("febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff", true),
+            ("fec0::", false),
+            ("::", true),
+            ("::1", true),
+            ("::2", false),
+            ("::ffff:172.15.255.255", false),
+            ("::ffff:172.16.0.0", true),
+            ("::ffff:172.31.255.255", true),
+            ("::ffff:172.32.0.0", false),
+            ("::ffff:0.0.0.0", true),
+            ("::ffff:255.255.255.255", true),
+        ];
+        for (address, expected) in cases {
+            assert_eq!(
+                is_private_ip(address.parse().unwrap()),
+                expected,
+                "{address}"
+            );
+        }
     }
 }

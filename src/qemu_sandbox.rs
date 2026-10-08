@@ -5,13 +5,14 @@
 //! - virtio-vsock の代わりに TCP (localhost) を使用
 //! - HVF (`-accel hvf`) でアクセラレーション
 
+use crate::util::find_available_port;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
@@ -606,18 +607,6 @@ impl Drop for QemuSandbox {
             zeroize::Zeroize::zeroize(token);
         }
     }
-}
-
-/// 空きポートを取得する。
-///
-/// **TOCTOU リスク**: ポート取得後にリスナーを閉じてから QEMU がバインドするまでの
-/// 間に、他プロセスが同じポートを奪う可能性がある。この関数自体では解決できないため、
-/// 呼び出し元で QEMU 起動→接続失敗時にリトライするロジックと組み合わせて使用すること。
-async fn find_available_port() -> anyhow::Result<u16> {
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let port = listener.local_addr()?.port();
-    drop(listener);
-    Ok(port)
 }
 
 /// QEMU 起動時のポート TOCTOU リトライ最大回数。

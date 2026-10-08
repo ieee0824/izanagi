@@ -137,3 +137,7 @@ pub const KIND_SOCKET: u32 = 5;
 pub const FLAG_PATH_FAILED: u16 = 1;
 pub const FLAG_PATH_TRUNCATED: u16 = 2;
 pub const FLAG_STATE_MISSING: u16 = 4;
+
+/// ユーザー空間の DNS / HTTP 接続先に共通の内部アドレス判定。
+#[cfg(feature = "user")]
+pub mod ip_filter;

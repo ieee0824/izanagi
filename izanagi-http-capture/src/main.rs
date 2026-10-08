@@ -2,7 +2,7 @@ mod behavior_forward;
 mod ca;
 mod cert_cache;
 mod http_capture;
-mod ip_filter;
+use izanagi_common::ip_filter;
 mod logger;
 mod secret_map;
 mod tls_mitm;

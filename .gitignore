@@ -19,3 +19,7 @@ izanagi.toml
 # Local Python fixture/harness bytecode
 __pycache__/
 *.pyc
+
+# Shared library build artifacts
+/izanagi-common/target/
+/izanagi-common/Cargo.lock

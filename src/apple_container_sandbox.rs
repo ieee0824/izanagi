@@ -3,6 +3,7 @@
 //! `container` CLI (Apple Container) を使用してコンテナを管理する。
 //! Docker 互換の CLI: `container run`, `container stop`, `container exec`, `container rm`
 
+use crate::util::find_available_port;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -336,14 +337,6 @@ impl Default for AppleContainerSandbox {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// 空きポートを取得する。
-async fn find_available_port() -> anyhow::Result<u16> {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-    let port = listener.local_addr()?.port();
-    drop(listener);
-    Ok(port)
 }
 
 #[async_trait::async_trait]
