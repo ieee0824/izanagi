@@ -1,4 +1,3 @@
-src/commands/config.rs	cmd_config_mitm	36	139
 izanagi-dns-proxy/src/main.rs	main	41	50
 izanagi-dns-proxy/src/proxy.rs	run	30	52
 izanagi-dns-proxy/src/proxy.rs	handle_query	197	102

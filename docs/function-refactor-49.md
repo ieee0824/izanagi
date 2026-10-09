@@ -249,6 +249,16 @@ A new Linux enforcement regression checks an explicitly allowed /etc file is
 readable while another host-readable /etc file remains denied. Actual Linux
 execution remains a CI gate for this commit.
 
+### Interactive MITM configuration
+
+The final root CLI candidate is split into DNS selection, HTTP/TLS addresses,
+CA output, hidden mapping input and allowed-host prompts. Every new production
+helper is below 50 lines. Prompt ordering/defaults, disabled-section replacement,
+address parsing/error behavior, hidden mapping entry and private TOML persistence
+are unchanged. The three config-command tests pass; an added regression verifies
+new-directory/file permissions and private overwrite without trailing content.
+Linux cross-target all-target/all-feature Clippy passes.
+
 ## Outstanding work
 
 The remaining inventory is work to complete, except explicitly documented
