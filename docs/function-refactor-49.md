@@ -311,9 +311,20 @@ all-target check and formatting pass; existing unused legacy SNI/logger warnings
 remain. CI at `8ee22b1` passes all standard CI and secret scanning; final-head
 Linux/no_std and CodeQL gates remain required.
 
+### HTTP capture startup
+
+The HTTP binary entry point and every new startup helper are below 50 lines.
+Behavior mode dispatch, CA loading/export, mapping and host preparation, listener
+spawning and signal handling have separate responsibilities. CA export still
+precedes mapping validation, logger creation still follows policy preparation,
+and the listener select/error propagation and signal-task abort order are
+unchanged. The 59 component tests pass; a new regression verifies certificate
+output occurs before invalid mapping failure and logger setup. All-target check
+and formatting pass with the same legacy unused-path warnings.
+
 ## Outstanding work
 
-The remaining inventory contains seven HTTP-capture functions requiring
+The remaining inventory contains six HTTP-capture functions requiring
 responsibility decomposition and the documented declarative telemetry exception.
 Full fmt/check/test and Linux/feature CI gates, final inventory, PR and merge
 remain required before closing #49.

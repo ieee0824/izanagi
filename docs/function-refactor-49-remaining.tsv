@@ -2,7 +2,6 @@ izanagi-http-capture/src/behavior_forward.rs	parse_header	70	98
 izanagi-http-capture/src/behavior_forward.rs	forward	290	110
 izanagi-http-capture/src/behavior_forward.rs	handle	413	91
 izanagi-http-capture/src/behavior_forward.rs	run	505	55
-izanagi-http-capture/src/main.rs	main	88	150
 izanagi-http-capture/src/tls_mitm.rs	run	40	72
 izanagi-http-capture/src/tls_mitm.rs	handle_connection	113	122
 izanagi-telemetry/src/correlation.rs	finish_snapshot	462	50
