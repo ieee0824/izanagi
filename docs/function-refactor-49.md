@@ -232,6 +232,23 @@ cleans up after success; container spawn failures and unsuccessful exits restore
 Stopped state without registering a container. Linux cross-target all-target,
 all-feature Clippy passes.
 
+### Landlock enforcement and Engine monitoring
+
+Both Landlock candidates and the Engine startup candidate are split, and all
+new production helpers are below 50 lines. Landlock runtime directories,
+configuration files and process metadata retain their exact ordered rules and
+access masks. Child execution still builds the ruleset before fork and only
+applies it inside pre_exec, with no new allocation in that boundary.
+Engine startup/authentication rollback, callback wrapping/offloading, saturation
+warnings, monitoring failure publication and channel/shutdown handling have
+separate responsibilities. Startup and failure ordering are unchanged.
+
+The eight macOS Landlock/stub tests, 22 Engine tests and five monitoring lifecycle
+integration tests pass. Linux cross-target all-target/all-feature Clippy passes.
+A new Linux enforcement regression checks an explicitly allowed /etc file is
+readable while another host-readable /etc file remains denied. Actual Linux
+execution remains a CI gate for this commit.
+
 ## Outstanding work
 
 The remaining inventory is work to complete, except explicitly documented

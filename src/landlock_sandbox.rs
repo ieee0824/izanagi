@@ -81,6 +81,21 @@ mod inner {
             ruleset = ruleset.add_rule(PathBeneath::new(fd, tmp_access))?;
         }
 
+        ruleset = allow_runtime_directories(ruleset)?;
+
+        ruleset = allow_system_configuration(ruleset)?;
+
+        ruleset = allow_process_metadata(ruleset)?;
+
+        // /sys: デフォルト deny のまま。明示的な許可は行わない。
+        // /proc, /sys 全体はルールに含まれないため Landlock の deny-by-default で制限される。
+
+        Ok(ruleset)
+    }
+
+    fn allow_runtime_directories(
+        mut ruleset: landlock::RulesetCreated,
+    ) -> anyhow::Result<landlock::RulesetCreated> {
         // 基本的な読み取り・実行専用パス（ディレクトリ単位）。
         // Execute がないと Landlock 適用後に /bin/bash や /usr/bin/* を
         // execve(2) できないため、書き込み権限とは分離して明示的に許可する。
@@ -95,6 +110,13 @@ mod inner {
             }
         }
 
+        Ok(ruleset)
+    }
+
+    fn allow_system_configuration(
+        mut ruleset: landlock::RulesetCreated,
+    ) -> anyhow::Result<landlock::RulesetCreated> {
+        let read_access = AccessFs::ReadFile | AccessFs::ReadDir;
         // /etc は全体を許可せず、必要最小限のファイル/ディレクトリのみ読み取り許可
         // /etc/shadow 等の機密ファイルへのアクセスを防ぐため
         let readonly_etc_paths = [
@@ -119,6 +141,12 @@ mod inner {
             }
         }
 
+        Ok(ruleset)
+    }
+
+    fn allow_process_metadata(
+        mut ruleset: landlock::RulesetCreated,
+    ) -> anyhow::Result<landlock::RulesetCreated> {
         // /proc: デフォルト deny。一部プログラムが必要とする最小限のエントリのみ許可。
         // /proc/self/environ は明示的に許可しない（環境変数窃取の防止）。
         let readonly_proc_paths = ["/proc/self/status", "/proc/self/maps", "/proc/self/exe"];
@@ -130,10 +158,35 @@ mod inner {
             }
         }
 
-        // /sys: デフォルト deny のまま。明示的な許可は行わない。
-        // /proc, /sys 全体はルールに含まれないため Landlock の deny-by-default で制限される。
-
         Ok(ruleset)
+    }
+
+    fn exec_with_ruleset(
+        share: &ShareConfig,
+        abi: ABI,
+        cmd: &[String],
+        env: &HashMap<String, String>,
+    ) -> std::io::Result<std::process::Output> {
+        use std::process::{Command, Stdio};
+
+        // ルールセット構築は fork 前に完了（heap allocation を伴う）
+        let mut ruleset = Some(build_ruleset(share, abi).map_err(std::io::Error::other)?);
+
+        // Safety: pre_exec 内では restrict_self() のみ呼ぶ（async-signal-safe）
+        // apply_ruleset は std::io::Result を返し、ヒープアロケーションを行わない
+        unsafe {
+            Command::new(&cmd[0])
+                .args(&cmd[1..])
+                .env_clear()
+                .envs(env)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .pre_exec(move || match ruleset.take() {
+                    Some(ruleset) => apply_ruleset(ruleset),
+                    None => Err(std::io::Error::from_raw_os_error(libc::EINVAL)),
+                })
+                .output()
+        }
     }
 
     /// 構築済みルールセットを現在のプロセスに適用する。
@@ -299,27 +352,7 @@ mod inner {
             let cmd_clone: Vec<String> = cmd.to_vec();
 
             let output = tokio::task::spawn_blocking(move || {
-                use std::process::{Command, Stdio};
-
-                // ルールセット構築は fork 前に完了（heap allocation を伴う）
-                let mut ruleset =
-                    Some(build_ruleset(&share_clone, abi).map_err(std::io::Error::other)?);
-
-                // Safety: pre_exec 内では restrict_self() のみ呼ぶ（async-signal-safe）
-                // apply_ruleset は std::io::Result を返し、ヒープアロケーションを行わない
-                unsafe {
-                    Command::new(&cmd_clone[0])
-                        .args(&cmd_clone[1..])
-                        .env_clear()
-                        .envs(&env_clone)
-                        .stdout(Stdio::piped())
-                        .stderr(Stdio::piped())
-                        .pre_exec(move || match ruleset.take() {
-                            Some(ruleset) => apply_ruleset(ruleset),
-                            None => Err(std::io::Error::from_raw_os_error(libc::EINVAL)),
-                        })
-                        .output()
-                }
+                exec_with_ruleset(&share_clone, abi, &cmd_clone, &env_clone)
             })
             .await??;
 
@@ -689,6 +722,38 @@ mod tests {
             result.is_err(),
             "a binary outside the allowed paths must not be executable"
         );
+    }
+
+    #[cfg(all(target_os = "linux", feature = "landlock"))]
+    #[tokio::test]
+    async fn test_landlock_limits_etc_to_explicitly_allowed_files() {
+        let config = SandboxConfig::Landlock {
+            share: ShareConfig {
+                host_paths: vec![PathBuf::from("/tmp")],
+                mount_point: PathBuf::from("/workspace"),
+            },
+        };
+        let mut sb = LandlockSandbox::new();
+        if sb.up(&config).await.is_err() {
+            return;
+        }
+        std::fs::read("/etc/hostname").expect("denied fixture must be readable without Landlock");
+        let allowed = sb
+            .exec(&["/bin/cat".into(), "/etc/passwd".into()], &HashMap::new())
+            .await
+            .unwrap();
+        let denied = sb
+            .exec(
+                &["/bin/cat".into(), "/etc/hostname".into()],
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
+        sb.down().await.unwrap();
+        assert_eq!(allowed.exit_code, 0);
+        assert!(!allowed.stdout.is_empty());
+        assert_ne!(denied.exit_code, 0);
+        assert!(denied.stdout.is_empty());
     }
 
     #[cfg(all(target_os = "linux", feature = "landlock"))]
