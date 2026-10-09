@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
@@ -279,22 +279,7 @@ fn acquire_instance_lock() -> anyhow::Result<std::fs::File> {
     }
 
     // create_new で新規作成を試みて stale 判定に使う（exists() の TOCTOU を排除）
-    let (file, lock_existed) = match std::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&path)
-    {
-        Ok(f) => (f, false),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            let f = std::fs::OpenOptions::new()
-                .write(true)
-                .truncate(false)
-                .open(&path)
-                .context("ロックファイルを開けません")?;
-            (f, true)
-        }
-        Err(e) => return Err(anyhow::Error::new(e).context("ロックファイルの作成に失敗")),
-    };
+    let (file, lock_existed) = open_instance_lock(&path)?;
 
     let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if ret != 0 {
@@ -313,6 +298,26 @@ fn acquire_instance_lock() -> anyhow::Result<std::fs::File> {
     }
 
     Ok(file)
+}
+
+#[cfg(unix)]
+fn open_instance_lock(path: &std::path::Path) -> anyhow::Result<(std::fs::File, bool)> {
+    match std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(path)
+    {
+        Ok(f) => Ok((f, false)),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let f = std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(false)
+                .open(path)
+                .context("ロックファイルを開けません")?;
+            Ok((f, true))
+        }
+        Err(e) => Err(anyhow::Error::new(e).context("ロックファイルの作成に失敗")),
+    }
 }
 
 /// 非 Unix 環境ではロックをスキップする。
@@ -483,9 +488,35 @@ pub(crate) async fn run_with(cli: Cli) -> anyhow::Result<u8> {
         }
     }
 
+    run_configured(cli).await
+}
+
+async fn run_configured(cli: Cli) -> anyhow::Result<u8> {
+    let (config_path, config) = load_cli_config(&cli)?;
+    validate_cli_auth(&config)?;
+    report_cli_config(&cli, &config, &config_path);
+
+    // サブコマンド分岐
+    match cli.command {
+        Commands::Behavior { .. } => unreachable!("behavior is handled before config loading"),
+        Commands::Up { pcap } => commands::cmd_up(&config, &config_path, pcap.as_deref()).await,
+        Commands::Down => commands::cmd_down().await,
+        Commands::Exec { cmd } => commands::cmd_exec(&config, &cmd).await,
+        Commands::Shell => commands::cmd_shell(&config).await,
+        Commands::Logs { .. } => unreachable!("logs is handled before config loading"),
+        Commands::Config { action } => commands::cmd_config(action, &config, &config_path),
+        Commands::Init => unreachable!("init is handled before config loading"),
+        Commands::Mcp => unreachable!("mcp is handled before config loading"),
+        Commands::Completions { .. } => {
+            unreachable!("completions is handled before config loading")
+        }
+    }
+}
+
+fn load_cli_config(cli: &Cli) -> anyhow::Result<(PathBuf, Config)> {
     // -c 未指定時は自動解決
-    let config_path = match cli.config {
-        Some(p) => p,
+    let config_path = match &cli.config {
+        Some(p) => p.clone(),
         None => resolve_config_path()?,
     };
 
@@ -518,6 +549,18 @@ pub(crate) async fn run_with(cli: Cli) -> anyhow::Result<u8> {
         anyhow::bail!("behavior analysis and raw --pcap capture cannot be enabled together");
     }
 
+    Ok((config_path, config))
+}
+
+fn report_cli_config(cli: &Cli, config: &Config, config_path: &Path) {
+    if cli.verbose {
+        eprintln!("設定ファイル: {:?}", config_path);
+        eprintln!("バックエンド: {:?}", config.sandbox.backend);
+        eprintln!("トレーサー: {:?}", config.sandbox.tracer);
+    }
+}
+
+fn validate_cli_auth(config: &Config) -> anyhow::Result<()> {
     // シークレット設定の検証:
     // 1. IZANAGI_SECRET_FILE が設定されているなら読み込み失敗はハードエラー（require_auth に関係なく）
     // 2. require_auth = true（デフォルト）ならシークレット未設定もエラー
@@ -530,33 +573,39 @@ pub(crate) async fn run_with(cli: Cli) -> anyhow::Result<u8> {
         );
     }
 
-    if cli.verbose {
-        eprintln!("設定ファイル: {:?}", config_path);
-        eprintln!("バックエンド: {:?}", config.sandbox.backend);
-        eprintln!("トレーサー: {:?}", config.sandbox.tracer);
-    }
-
-    // サブコマンド分岐
-    match cli.command {
-        Commands::Behavior { .. } => unreachable!("behavior is handled before config loading"),
-        Commands::Up { pcap } => commands::cmd_up(&config, &config_path, pcap.as_deref()).await,
-        Commands::Down => commands::cmd_down().await,
-        Commands::Exec { cmd } => commands::cmd_exec(&config, &cmd).await,
-        Commands::Shell => commands::cmd_shell(&config).await,
-        Commands::Logs { .. } => unreachable!("logs is handled before config loading"),
-        Commands::Config { action } => commands::cmd_config(action, &config, &config_path),
-        Commands::Init => unreachable!("init is handled before config loading"),
-        Commands::Mcp => unreachable!("mcp is handled before config loading"),
-        Commands::Completions { .. } => {
-            unreachable!("completions is handled before config loading")
-        }
-    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[tokio::test]
+    async fn config_path_command_skips_missing_configuration_loading() {
+        let path =
+            std::env::temp_dir().join(format!("izanagi-missing-config-{}", rand::random::<u64>()));
+        assert!(!path.exists());
+        let cli = Cli::try_parse_from(["izanagi", "-c", path.to_str().unwrap(), "config", "path"])
+            .unwrap();
+        assert_eq!(run_with(cli).await.unwrap(), 0);
+        assert!(!path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn instance_lock_reopen_preserves_contents_and_creation_state() {
+        let path = std::env::temp_dir().join(format!("izanagi-lock-{}", rand::random::<u64>()));
+        let (file, existed) = open_instance_lock(&path).unwrap();
+        assert!(!existed);
+        drop(file);
+        std::fs::write(&path, "stale marker").unwrap();
+        let (file, existed) = open_instance_lock(&path).unwrap();
+        assert!(existed);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "stale marker");
+        drop(file);
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn cli_parse_config_show() {

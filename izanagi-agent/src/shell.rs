@@ -23,7 +23,7 @@ impl ShellChild {
         }
     }
 
-    fn try_reap(&mut self) -> std::io::Result<Option<i32>> {
+    fn exited_without_reaping(&mut self) -> std::io::Result<bool> {
         // Peek without reaping so the PID/process-group ID cannot be reused
         // before we kill any surviving group members (the shell may exit first).
         let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
@@ -41,12 +41,19 @@ impl ShellChild {
                 self.reaped = true;
             }
             return if error.raw_os_error() == Some(libc::EINTR) {
-                Ok(None)
+                Ok(false)
             } else {
                 Err(error)
             };
         }
         if unsafe { info.si_pid() } == 0 {
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    fn try_reap(&mut self) -> std::io::Result<Option<i32>> {
+        if !self.exited_without_reaping()? {
             return Ok(None);
         }
         unsafe {
@@ -135,114 +142,142 @@ where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
 {
-    use std::os::fd::AsRawFd;
-    // Capture every error, including setup errors, before common cleanup.
-    let result: anyhow::Result<()> = async {
-        let master_fd = master.as_raw_fd();
-        let flags = unsafe { libc::fcntl(master_fd, libc::F_GETFL) };
-        if flags < 0
-            || unsafe { libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
-        {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        let master_async = tokio::io::unix::AsyncFd::new(master)?;
-        loop {
-            tokio::select! {
-                // PTY → ホスト (stdout)
-                readable = master_async.readable() => {
-                    match readable {
-                        Ok(mut guard) => {
-                            match guard.try_io(|inner| {
-                                use std::io::Read;
-                                let mut buf = vec![0u8; 4096];
-                                let n = inner.get_ref().read(&mut buf)?;
-                                buf.truncate(n);
-                                Ok(buf)
-                            }) {
-                                Ok(Ok(data)) if !data.is_empty() => {
-                                    send_message(
-                                        writer,
-                                        &Message::ShellData { stream: 1, data },
-                                        auth_key,
-                                        send_seq,
-                                    ).await?;
-                                }
-                                Ok(Ok(_)) => {
-                                    // EOF — シェル終了
-                                    break;
-                                }
-                                Ok(Err(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                                    continue;
-                                }
-                                Ok(Err(_)) => {
-                                    break;
-                                }
-                                Err(_would_block) => {
-                                    continue;
-                                }
-                            }
-                        }
-                        Err(_) => break,
-                    }
-                }
-                // ホスト → PTY (stdin) / リサイズ / クローズ
-                result = recv_message(reader, auth_key, recv_seq) => {
-                    match result? {
-                        Some(Message::ShellData { stream: 0, data }) => {
-                            // stdin をPTY に書き込み
-                            match master_async.writable().await {
-                                Ok(mut guard) => {
-                                    let _ = guard.try_io(|inner| {
-                                        use std::io::Write;
-                                        inner.get_ref().write_all(&data)
-                                    });
-                                }
-                                Err(_) => break,
-                            }
-                        }
-                        Some(Message::ShellResize { rows, cols }) => {
-                            let ws = libc::winsize {
-                                ws_row: rows,
-                                ws_col: cols,
-                                ws_xpixel: 0,
-                                ws_ypixel: 0,
-                            };
-                            unsafe {
-                                libc::ioctl(master_fd, libc::TIOCSWINSZ, &ws);
-                            }
-                        }
-                        Some(Message::Stop) | None => {
-                            break;
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-
-        Ok(())
-    }
-    .await;
-    // The transfer future has dropped the PTY master before signalling/waiting.
+    let mut transport = ShellTransport {
+        reader,
+        writer,
+        auth_key,
+        send_seq,
+        recv_seq,
+    };
+    // transfer owns/drops the master even on setup error; cleanup always follows.
+    let result = transport.transfer(master).await;
     let cleanup = child.cleanup().await;
     if let Err(error) = &cleanup {
         eprintln!("shell cleanup failed: {error}");
     }
     result?;
     let exit_code = cleanup?;
-    // A stalled peer must not retain the connection task after child cleanup.
-    tokio::time::timeout(
-        std::time::Duration::from_secs(1),
-        send_message(
-            writer,
-            &Message::ShellClose { exit_code },
-            auth_key,
-            send_seq,
-        ),
-    )
-    .await??;
-    eprintln!("shell closed with exit code {}", exit_code);
-    Ok(())
+    transport.close(exit_code).await
+}
+
+struct ShellTransport<'a, R, W> {
+    reader: &'a mut MessageReader<R>,
+    writer: &'a mut W,
+    auth_key: Option<&'a [u8]>,
+    send_seq: &'a mut u64,
+    recv_seq: &'a mut u64,
+}
+
+impl<R, W> ShellTransport<'_, R, W>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    async fn transfer(&mut self, master: std::fs::File) -> anyhow::Result<()> {
+        let master = nonblocking_master(master)?;
+        loop {
+            tokio::select! {
+                readable = master.readable() => {
+                    if !self.forward_output(readable).await? { break; }
+                }
+                result = recv_message(self.reader, self.auth_key, self.recv_seq) => {
+                    if !self.forward_input(result?, &master).await { break; }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn forward_output(
+        &mut self,
+        readable: std::io::Result<tokio::io::unix::AsyncFdReadyGuard<'_, std::fs::File>>,
+    ) -> anyhow::Result<bool> {
+        let Ok(mut guard) = readable else {
+            return Ok(false);
+        };
+        match guard.try_io(|inner| {
+            use std::io::Read;
+            let mut buf = vec![0u8; 4096];
+            let n = inner.get_ref().read(&mut buf)?;
+            buf.truncate(n);
+            Ok(buf)
+        }) {
+            Ok(Ok(data)) if !data.is_empty() => {
+                send_message(
+                    self.writer,
+                    &Message::ShellData { stream: 1, data },
+                    self.auth_key,
+                    self.send_seq,
+                )
+                .await?;
+                Ok(true)
+            }
+            Ok(Ok(_)) => Ok(false), // EOF: shell exited.
+            Ok(Err(error)) => Ok(error.kind() == std::io::ErrorKind::WouldBlock),
+            Err(_would_block) => Ok(true),
+        }
+    }
+
+    async fn forward_input(
+        &mut self,
+        message: Option<Message>,
+        master: &tokio::io::unix::AsyncFd<std::fs::File>,
+    ) -> bool {
+        use std::os::fd::AsRawFd;
+        match message {
+            Some(Message::ShellData { stream: 0, data }) => match master.writable().await {
+                Ok(mut guard) => {
+                    let _ = guard.try_io(|inner| {
+                        use std::io::Write;
+                        inner.get_ref().write_all(&data)
+                    });
+                }
+                Err(_) => return false,
+            },
+            Some(Message::ShellResize { rows, cols }) => {
+                let ws = libc::winsize {
+                    ws_row: rows,
+                    ws_col: cols,
+                    ws_xpixel: 0,
+                    ws_ypixel: 0,
+                };
+                unsafe {
+                    libc::ioctl(master.get_ref().as_raw_fd(), libc::TIOCSWINSZ, &ws);
+                }
+            }
+            Some(Message::Stop) | None => return false,
+            _ => {}
+        }
+        true
+    }
+
+    async fn close(&mut self, exit_code: i32) -> anyhow::Result<()> {
+        // A stalled peer must not retain the connection task after child cleanup.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            send_message(
+                self.writer,
+                &Message::ShellClose { exit_code },
+                self.auth_key,
+                self.send_seq,
+            ),
+        )
+        .await??;
+        eprintln!("shell closed with exit code {}", exit_code);
+        Ok(())
+    }
+}
+
+fn nonblocking_master(
+    master: std::fs::File,
+) -> std::io::Result<tokio::io::unix::AsyncFd<std::fs::File>> {
+    use std::os::fd::AsRawFd;
+    let master_fd = master.as_raw_fd();
+    let flags = unsafe { libc::fcntl(master_fd, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    tokio::io::unix::AsyncFd::new(master)
 }
 
 #[cfg(all(test, target_os = "linux"))]

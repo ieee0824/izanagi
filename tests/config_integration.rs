@@ -80,3 +80,50 @@ fn load_nonexistent_returns_default() {
         config.err()
     );
 }
+
+#[test]
+fn config_display_authentication_precedes_verbose_output_and_never_prints_credentials() {
+    let path = std::env::temp_dir().join(format!(
+        "izanagi49-auth-display-{}-{}.toml",
+        std::process::id(),
+        rand::random::<u64>()
+    ));
+    let mut config = Config::default();
+    config.sandbox.backend = izanagi::config::SandboxBackend::Native;
+    config.sandbox.tracer = izanagi::config::TracerBackend::None;
+    config.sandbox.require_auth = Some(true);
+    std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+    let run = |authenticated: bool| {
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_izanagi"));
+        command
+            .args(["-v", "-c"])
+            .arg(&path)
+            .args(["config", "show"]);
+        command
+            .env_remove("IZANAGI_SECRET_FILE")
+            .env_remove("IZANAGI_SHARED_SECRET");
+        if authenticated {
+            command.env("IZANAGI_SHARED_SECRET", "CANARY-AUTH-DO-NOT-PRINT");
+        }
+        command.output().unwrap()
+    };
+    let rejected = run(false);
+    let accepted = run(true);
+    std::fs::remove_file(&path).unwrap();
+    assert!(!rejected.status.success());
+    assert!(rejected.stdout.is_empty());
+    let error = String::from_utf8_lossy(&rejected.stderr);
+    assert!(
+        error.contains("共有シークレットが設定されていません"),
+        "{error}"
+    );
+    assert!(!error.contains("設定ファイル:"));
+    assert!(
+        accepted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&accepted.stderr)
+    );
+    assert!(String::from_utf8_lossy(&accepted.stderr).contains("設定ファイル:"));
+    assert!(!String::from_utf8_lossy(&accepted.stdout).contains("CANARY-AUTH"));
+    assert!(!String::from_utf8_lossy(&accepted.stderr).contains("CANARY-AUTH"));
+}

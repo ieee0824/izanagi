@@ -51,25 +51,7 @@ fn check_no_running_instance() -> Result<u8, anyhow::Error> {
 fn validate_target_pid() -> anyhow::Result<u32> {
     let (pid, saved_timestamp) = read_pid_file()?;
 
-    // PID 再利用対策: PID ファイルの mtime を確認
-    if saved_timestamp > 0
-        && let Ok(meta) = std::fs::metadata(pid_file_path())
-        && let Ok(mtime) = meta.modified()
-    {
-        let mtime_secs = mtime
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        if mtime_secs < saved_timestamp.saturating_sub(1) {
-            session::remove_session(&izanagi_dir());
-            remove_pid_file();
-            remove_lock_file();
-            anyhow::bail!(
-                "PID ファイルのタイムスタンプが不整合です。PID {} は再利用されている可能性があります。stale ファイルを削除しました。",
-                pid
-            );
-        }
-    }
+    validate_pid_timestamp(pid, saved_timestamp)?;
 
     // セッション情報との整合性チェック
     if let Ok(Some(sess)) = session::load_session(&izanagi_dir())
@@ -103,6 +85,30 @@ fn validate_target_pid() -> anyhow::Result<u32> {
     }
 
     Ok(pid)
+}
+
+fn validate_pid_timestamp(pid: u32, saved_timestamp: u64) -> anyhow::Result<()> {
+    // PID 再利用対策: PID ファイルの mtime を確認
+    if saved_timestamp > 0
+        && let Ok(meta) = std::fs::metadata(pid_file_path())
+        && let Ok(mtime) = meta.modified()
+    {
+        let mtime_secs = mtime
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if mtime_secs < saved_timestamp.saturating_sub(1) {
+            session::remove_session(&izanagi_dir());
+            remove_pid_file();
+            remove_lock_file();
+            anyhow::bail!(
+                "PID ファイルのタイムスタンプが不整合です。PID {} は再利用されている可能性があります。stale ファイルを削除しました。",
+                pid
+            );
+        }
+    }
+
+    Ok(())
 }
 
 pub async fn cmd_down() -> anyhow::Result<u8> {

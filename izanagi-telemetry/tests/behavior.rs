@@ -140,6 +140,79 @@ fn replay(events: Vec<TelemetryEnvelope>, config: CorrelationConfig) -> FeatureS
 }
 
 #[test]
+fn transfer_interval_gaps_and_socket_sharing_remain_in_evidence() {
+    for payload in [
+        TelemetryPayload::ObservationGap {
+            reason: QualityIssue::EventLoss,
+            dropped: 1,
+        },
+        TelemetryPayload::CollectorHealth { healthy: false },
+        TelemetryPayload::SocketLifecycle {
+            socket: socket(2),
+            state: SocketState::Shared,
+        },
+    ] {
+        let mut events = fixture(ProcessBinding::ConfirmedWriter);
+        let gap = event("health", 1, 3_050_000_000, None, payload);
+        let gap_id = gap.event_id.clone();
+        events.push(gap);
+        let snapshot = replay(events, CorrelationConfig::default());
+        assert_eq!(deterministic_rule(&snapshot), ThreatClass::Unknown);
+        assert!(snapshot.evidence_event_ids.contains(&gap_id));
+        assert_eq!(snapshot.transfer_outcome, TransferOutcome::Completed);
+    }
+}
+
+#[test]
+fn conflicting_open_outcomes_preserve_counts_and_degrade_quality() {
+    let mut events = fixture(ProcessBinding::ConfirmedWriter);
+    events.push(event(
+        "ebpf",
+        5,
+        1_200_000_000,
+        Some(process(42, 1)),
+        TelemetryPayload::FileOpenOutcome {
+            attempt_id: "open-1".into(),
+            outcome: OpenOutcome::Failed { errno: 13 },
+        },
+    ));
+    let snapshot = replay(events, CorrelationConfig::default());
+    assert_eq!(snapshot.credential_open_succeeded, 1);
+    assert_eq!(snapshot.credential_open_failed, 1);
+    assert!(
+        snapshot
+            .quality
+            .issues
+            .contains(&QualityIssue::MissingOutcome)
+    );
+    assert_eq!(deterministic_rule(&snapshot), ThreatClass::Unknown);
+}
+
+#[test]
+fn evidence_truncation_is_stable_under_arrival_reordering() {
+    let events = fixture(ProcessBinding::ConfirmedWriter);
+    let mut reversed = events.clone();
+    reversed.reverse();
+    let config = CorrelationConfig {
+        max_events_per_window: 2,
+        ..Default::default()
+    };
+    let first = replay(events, config.clone());
+    let second = replay(reversed, config);
+    // Revisions reflect arrival history; the semantic snapshot remains identical.
+    assert_eq!(first.evidence_event_ids, second.evidence_event_ids);
+    assert_eq!(first.quality, second.quality);
+    assert_eq!(first.evidence_event_ids.len(), 2);
+    assert!(
+        first
+            .quality
+            .issues
+            .contains(&QualityIssue::WindowTruncated)
+    );
+    assert_eq!(deterministic_rule(&first), ThreatClass::Unknown);
+}
+
+#[test]
 fn confirmed_attempt_and_post_is_warning_not_confirmed_read() {
     let snapshot = replay(
         fixture(ProcessBinding::ConfirmedWriter),

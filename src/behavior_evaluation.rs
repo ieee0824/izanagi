@@ -84,9 +84,11 @@ pub struct EvaluationManifest {
 
 impl EvaluationManifest {
     pub fn validate(&self) -> Result<()> {
-        let hex = |value: &str, len: usize| {
-            value.len() == len && value.bytes().all(|b| b.is_ascii_hexdigit())
-        };
+        self.validate_settings()?;
+        self.validate_scenarios()
+    }
+
+    fn validate_settings(&self) -> Result<()> {
         if self.schema_version != 1
             || self.feature_version != izanagi_telemetry::FEATURE_VERSION
             || self.host_policy_version != 1
@@ -96,9 +98,9 @@ impl EvaluationManifest {
                 commit.len() != 40 || !commit.bytes().all(|b| b.is_ascii_hexdigit())
             })
             || self.question_version != QUESTION_VERSION
-            || !hex(&self.source_commit, 40)
-            || !hex(&self.collector_commit, 40)
-            || !hex(&self.vm_image_sha256, 64)
+            || !valid_hex(&self.source_commit, 40)
+            || !valid_hex(&self.collector_commit, 40)
+            || !valid_hex(&self.vm_image_sha256, 64)
             || !safe_id(&self.scenario_version)
             || !safe_id(&self.baseline_version)
             || !self.min_confidence.is_finite()
@@ -114,6 +116,10 @@ impl EvaluationManifest {
         {
             bail!("invalid evaluation manifest");
         }
+        Ok(())
+    }
+
+    fn validate_scenarios(&self) -> Result<()> {
         let mut ids = BTreeSet::new();
         let mut families = BTreeMap::new();
         for scenario in &self.scenarios {
@@ -125,7 +131,7 @@ impl EvaluationManifest {
                     .events
                     .components()
                     .any(|part| matches!(part, std::path::Component::ParentDir))
-                || !hex(&scenario.events_sha256, 64)
+                || !valid_hex(&scenario.events_sha256, 64)
                 || scenario.labels.is_empty()
                 || scenario.labels.len() > 256
             {
@@ -149,6 +155,10 @@ impl EvaluationManifest {
         }
         Ok(())
     }
+}
+
+fn valid_hex(value: &str, len: usize) -> bool {
+    value.len() == len && value.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 fn safe_id(value: &str) -> bool {
@@ -184,29 +194,7 @@ pub fn replay<R: BufRead>(
     let mut latest = BTreeMap::<String, FeatureSnapshot>::new();
     let mut total = 0u64;
     loop {
-        let mut line = Vec::new();
-        // Bound a line before parsing or allocation of an arbitrarily long JSON object.
-        loop {
-            let available = reader
-                .fill_buf()
-                .map_err(|_| anyhow::anyhow!("replay input I/O failed"))?;
-            if available.is_empty() {
-                break;
-            }
-            let len = available
-                .iter()
-                .position(|c| *c == b'\n')
-                .map_or(available.len(), |index| index + 1);
-            if line.len().saturating_add(len) > MAX_EVENT_BYTES {
-                bail!("replay event size limit exceeded");
-            }
-            line.extend_from_slice(&available[..len]);
-            let ended = available[len - 1] == b'\n';
-            reader.consume(len);
-            if ended {
-                break;
-            }
-        }
+        let line = read_replay_line(&mut reader)?;
         if line.is_empty() {
             break;
         }
@@ -217,40 +205,77 @@ pub fn replay<R: BufRead>(
         if line.iter().all(|b| b.is_ascii_whitespace()) {
             bail!("blank replay event");
         }
-        let event: TelemetryEnvelope = match serde_json::from_slice(&line) {
-            Ok(event) => event,
-            Err(_) => {
-                let record: AuditRecord = serde_json::from_slice(&line)
-                    .map_err(|_| anyhow::anyhow!("invalid replay event JSON"))?;
-                let AuditPayload::Event(mut event) = record.payload else {
-                    continue;
-                };
-                if record.storage_gap && !event.quality.issues.contains(&QualityIssue::StorageGap) {
-                    event.quality.issues.push(QualityIssue::StorageGap);
-                }
-                event
-            }
+        let Some(event) = decode_replay_event(&line)? else {
+            continue;
         };
-        event
-            .validate()
-            .map_err(|_| anyhow::anyhow!("invalid replay event"))?;
-        for snapshot in correlator
+        let snapshots = correlator
             .ingest(event)
-            .map_err(|_| anyhow::anyhow!("replay correlation failed"))?
-        {
-            keep_latest(&mut latest, snapshot);
-            if latest.len() > MAX_REPLAY_WINDOWS {
-                bail!("replay window count limit exceeded");
-            }
+            .map_err(|_| anyhow::anyhow!("replay correlation failed"))?;
+        collect_latest(&mut latest, snapshots)?;
+    }
+    collect_latest(&mut latest, correlator.flush())?;
+    Ok(latest.into_values().collect())
+}
+
+fn read_replay_line<R: BufRead>(reader: &mut R) -> Result<Vec<u8>> {
+    let mut line = Vec::new();
+    // Bound a line before parsing or allocation of an arbitrarily long JSON object.
+    loop {
+        let available = reader
+            .fill_buf()
+            .map_err(|_| anyhow::anyhow!("replay input I/O failed"))?;
+        if available.is_empty() {
+            break;
+        }
+        let len = available
+            .iter()
+            .position(|c| *c == b'\n')
+            .map_or(available.len(), |index| index + 1);
+        if line.len().saturating_add(len) > MAX_EVENT_BYTES {
+            bail!("replay event size limit exceeded");
+        }
+        line.extend_from_slice(&available[..len]);
+        let ended = available[len - 1] == b'\n';
+        reader.consume(len);
+        if ended {
+            break;
         }
     }
-    for snapshot in correlator.flush() {
-        keep_latest(&mut latest, snapshot);
+    Ok(line)
+}
+
+fn decode_replay_event(line: &[u8]) -> Result<Option<TelemetryEnvelope>> {
+    let event: TelemetryEnvelope = match serde_json::from_slice(line) {
+        Ok(event) => event,
+        Err(_) => {
+            let record: AuditRecord = serde_json::from_slice(line)
+                .map_err(|_| anyhow::anyhow!("invalid replay event JSON"))?;
+            let AuditPayload::Event(mut event) = record.payload else {
+                return Ok(None);
+            };
+            if record.storage_gap && !event.quality.issues.contains(&QualityIssue::StorageGap) {
+                event.quality.issues.push(QualityIssue::StorageGap);
+            }
+            event
+        }
+    };
+    event
+        .validate()
+        .map_err(|_| anyhow::anyhow!("invalid replay event"))?;
+    Ok(Some(event))
+}
+
+fn collect_latest(
+    latest: &mut BTreeMap<String, FeatureSnapshot>,
+    snapshots: Vec<FeatureSnapshot>,
+) -> Result<()> {
+    for snapshot in snapshots {
+        keep_latest(latest, snapshot);
         if latest.len() > MAX_REPLAY_WINDOWS {
             bail!("replay window count limit exceeded");
         }
     }
-    Ok(latest.into_values().collect())
+    Ok(())
 }
 
 fn keep_latest(latest: &mut BTreeMap<String, FeatureSnapshot>, snapshot: FeatureSnapshot) {
@@ -368,6 +393,22 @@ pub async fn evaluate_manifest(
     provider: &str,
 ) -> Result<EvaluationReport> {
     manifest.validate()?;
+    validate_classifier(manifest, classifier, provider)?;
+    let base = base_dir
+        .canonicalize()
+        .map_err(|_| anyhow::anyhow!("invalid evaluation base directory"))?;
+    let mut run = EvaluationRun::new(manifest, classifier, provider);
+    for scenario in &manifest.scenarios {
+        run.evaluate_scenario(&base, scenario).await?;
+    }
+    Ok(run.finish())
+}
+
+fn validate_classifier(
+    manifest: &EvaluationManifest,
+    classifier: &dyn Classifier,
+    provider: &str,
+) -> Result<()> {
     if !matches!(provider, "mock" | "recorded" | "jev-mcp") {
         bail!("invalid evaluation provider");
     }
@@ -380,52 +421,86 @@ pub async fn evaluate_manifest(
     {
         bail!("classifier configuration does not match evaluation manifest");
     }
-    let base = base_dir
+    Ok(())
+}
+
+fn load_fixture(base: &Path, scenario: &EvaluationScenario) -> Result<Vec<u8>> {
+    let path = base
+        .join(&scenario.events)
         .canonicalize()
-        .map_err(|_| anyhow::anyhow!("invalid evaluation base directory"))?;
-    let mut results = Vec::new();
-    let mut models = BTreeSet::new();
-    let mut metrics: BTreeMap<_, _> = [
-        EvaluationMethod::A,
-        EvaluationMethod::B,
-        EvaluationMethod::C,
-        EvaluationMethod::D,
-    ]
-    .into_iter()
-    .map(|method| (method, EvaluationMetrics::default()))
-    .collect();
-    let mut elapsed = BTreeMap::<EvaluationMethod, Vec<u64>>::new();
-    for scenario in &manifest.scenarios {
-        let path = base
-            .join(&scenario.events)
-            .canonicalize()
-            .map_err(|_| anyhow::anyhow!("cannot open evaluation fixture"))?;
-        if !path.starts_with(&base) {
-            bail!("evaluation fixture escapes manifest directory");
+        .map_err(|_| anyhow::anyhow!("cannot open evaluation fixture"))?;
+    if !path.starts_with(base) {
+        bail!("evaluation fixture escapes manifest directory");
+    }
+    let file = std::fs::File::open(&path)
+        .map_err(|_| anyhow::anyhow!("cannot open evaluation fixture"))?;
+    if file
+        .metadata()
+        .map_err(|_| anyhow::anyhow!("cannot read evaluation fixture"))?
+        .len()
+        > MAX_REPLAY_BYTES
+    {
+        bail!("evaluation fixture size limit exceeded");
+    }
+    // Read and hash the exact immutable bytes which will be replayed, avoiding a reopen race.
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(
+        &mut std::io::Read::take(file, MAX_REPLAY_BYTES + 1),
+        &mut bytes,
+    )
+    .map_err(|_| anyhow::anyhow!("cannot read evaluation fixture"))?;
+    if bytes.len() as u64 > MAX_REPLAY_BYTES {
+        bail!("evaluation fixture size limit exceeded");
+    }
+    if hex::encode(Sha256::digest(&bytes)) != scenario.events_sha256 {
+        bail!("evaluation fixture does not match manifest digest");
+    }
+    Ok(bytes)
+}
+
+const METHODS: [EvaluationMethod; 4] = [
+    EvaluationMethod::A,
+    EvaluationMethod::B,
+    EvaluationMethod::C,
+    EvaluationMethod::D,
+];
+
+struct EvaluationRun<'a> {
+    manifest: &'a EvaluationManifest,
+    classifier: &'a dyn Classifier,
+    provider: &'a str,
+    results: Vec<EvaluationWindowResult>,
+    models: BTreeSet<String>,
+    metrics: BTreeMap<EvaluationMethod, EvaluationMetrics>,
+    elapsed: BTreeMap<EvaluationMethod, Vec<u64>>,
+}
+
+impl<'a> EvaluationRun<'a> {
+    fn new(
+        manifest: &'a EvaluationManifest,
+        classifier: &'a dyn Classifier,
+        provider: &'a str,
+    ) -> Self {
+        Self {
+            manifest,
+            classifier,
+            provider,
+            results: Vec::new(),
+            models: BTreeSet::new(),
+            metrics: METHODS
+                .into_iter()
+                .map(|method| (method, EvaluationMetrics::default()))
+                .collect(),
+            elapsed: BTreeMap::new(),
         }
-        let file = std::fs::File::open(&path)
-            .map_err(|_| anyhow::anyhow!("cannot open evaluation fixture"))?;
-        if file
-            .metadata()
-            .map_err(|_| anyhow::anyhow!("cannot read evaluation fixture"))?
-            .len()
-            > MAX_REPLAY_BYTES
-        {
-            bail!("evaluation fixture size limit exceeded");
-        }
-        // Read and hash the exact immutable bytes which will be replayed, avoiding a reopen race.
-        let mut bytes = Vec::new();
-        std::io::Read::read_to_end(
-            &mut std::io::Read::take(file, MAX_REPLAY_BYTES + 1),
-            &mut bytes,
-        )
-        .map_err(|_| anyhow::anyhow!("cannot read evaluation fixture"))?;
-        if bytes.len() as u64 > MAX_REPLAY_BYTES {
-            bail!("evaluation fixture size limit exceeded");
-        }
-        if hex::encode(Sha256::digest(&bytes)) != scenario.events_sha256 {
-            bail!("evaluation fixture does not match manifest digest");
-        }
+    }
+
+    async fn evaluate_scenario(
+        &mut self,
+        base: &Path,
+        scenario: &EvaluationScenario,
+    ) -> Result<()> {
+        let bytes = load_fixture(base, scenario)?;
         let snapshots = replay(std::io::Cursor::new(bytes), CorrelationConfig::default())?;
         let mut labels: BTreeMap<_, _> = scenario
             .labels
@@ -435,7 +510,7 @@ pub async fn evaluate_manifest(
         if snapshots.len() != labels.len() {
             bail!("replayed candidate windows do not match independent labels");
         }
-        for method in metrics.values_mut() {
+        for method in self.metrics.values_mut() {
             if scenario.routine_workload {
                 method.routine_workloads += 1;
             }
@@ -444,157 +519,227 @@ pub async fn evaluate_manifest(
             let expected = labels
                 .remove(&snapshot.window_id)
                 .ok_or_else(|| anyhow::anyhow!("replayed window has no independent label"))?;
-            let existing = !snapshot.rule_matches.is_empty();
-            for method in [
-                EvaluationMethod::A,
-                EvaluationMethod::B,
-                EvaluationMethod::C,
-                EvaluationMethod::D,
-            ] {
-                let request_started = std::time::Instant::now();
-                let (series_decision, assessment, digest) = match method {
-                    EvaluationMethod::A => (SeriesDecision::NotApplied, None, None),
-                    EvaluationMethod::D => (
-                        match deterministic_rule(&snapshot) {
-                            ThreatClass::Normal => SeriesDecision::Normal,
-                            ThreatClass::AccessPostSuspected => SeriesDecision::Suspicious,
-                            ThreatClass::Unknown => SeriesDecision::Unknown,
-                        },
-                        None,
-                        Some(
-                            snapshot
-                                .projection(FeatureMode::Correlated)
-                                .digest()
-                                .map_err(|_| anyhow::anyhow!("invalid replay projection"))?,
-                        ),
-                    ),
-                    EvaluationMethod::B | EvaluationMethod::C => {
-                        let projection = snapshot.projection(if method == EvaluationMethod::B {
-                            FeatureMode::NetworkOnly
-                        } else {
-                            FeatureMode::Correlated
-                        });
-                        let digest = projection
-                            .digest()
-                            .map_err(|_| anyhow::anyhow!("invalid replay projection"))?;
-                        let outcome = classifier.classify(&projection).await;
-                        if let Some(answer) = outcome.answer() {
-                            if answer.input_digest != digest
-                                || answer.question_version != manifest.question_version
-                                || (provider != "mock"
-                                    && (answer.requested_model != manifest.model
-                                        || answer.returned_model != manifest.model))
-                            {
-                                bail!("classifier output does not match evaluation manifest");
-                            }
-                            models.insert(answer.returned_model.clone());
-                        }
-                        (decision(&outcome), Some(outcome), Some(digest))
-                    }
-                };
-                let result = EvaluationWindowResult {
-                    scenario_id: scenario.id.clone(),
-                    split: scenario.split,
-                    window_id: snapshot.window_id.clone(),
-                    revision: snapshot.revision,
-                    expected,
-                    method,
-                    existing_rule_alert: existing,
-                    series_decision,
-                    detected: existing || series_decision == SeriesDecision::Suspicious,
-                    projection_digest: digest,
-                    classifier_elapsed_ms: assessment.as_ref().map(|_| {
-                        request_started
-                            .elapsed()
-                            .as_millis()
-                            .min(u128::from(u64::MAX)) as u64
-                    }),
-                    classifier: assessment,
-                };
-                let stats = metrics
-                    .get_mut(&method)
-                    .expect("all comparison methods exist");
-                stats.total_windows += 1;
-                if existing {
-                    stats.existing_rule_alerts += 1;
-                }
-                if series_decision == SeriesDecision::Suspicious {
-                    stats.additional_series_alerts += 1;
-                }
-                match series_decision {
-                    SeriesDecision::Normal
-                    | SeriesDecision::Suspicious
-                    | SeriesDecision::NotApplied => stats.classified_windows += 1,
-                    SeriesDecision::Unknown => stats.abstained_windows += 1,
-                    SeriesDecision::Failed => stats.failed_windows += 1,
-                    SeriesDecision::Skipped => stats.skipped_windows += 1,
-                }
-                match expected {
-                    ExpectedLabel::Normal => {
-                        stats.negative_windows += 1;
-                        if result.detected {
-                            stats.false_positives += 1;
-                        } else {
-                            stats.true_negatives += 1;
-                        }
-                    }
-                    ExpectedLabel::Suspicious => {
-                        stats.positive_windows += 1;
-                        if result.detected {
-                            stats.true_positives += 1;
-                        } else {
-                            stats.false_negatives += 1;
-                        }
-                    }
-                    ExpectedLabel::Indeterminate => stats.indeterminate_windows += 1,
-                }
-                if scenario.routine_workload && series_decision == SeriesDecision::Suspicious {
-                    stats.routine_false_alerts += 1;
-                }
-                if let Some(answer) = result
-                    .classifier
-                    .as_ref()
-                    .and_then(ClassificationOutcome::answer)
-                {
-                    stats.input_tokens = stats.input_tokens.saturating_add(answer.input_tokens);
-                    stats.output_tokens = stats.output_tokens.saturating_add(answer.output_tokens);
-                }
-                if let Some(duration) = result.classifier_elapsed_ms {
-                    elapsed.entry(method).or_default().push(duration);
-                }
-                results.push(result);
+            for method in METHODS {
+                let result = self
+                    .evaluate_window(scenario, &snapshot, expected, method)
+                    .await?;
+                self.record_result(result, scenario.routine_workload);
             }
         }
+        Ok(())
     }
-    for (method, stats) in &mut metrics {
-        stats.precision = ratio(
-            stats.true_positives,
-            stats.true_positives + stats.false_positives,
+
+    async fn evaluate_window(
+        &mut self,
+        scenario: &EvaluationScenario,
+        snapshot: &FeatureSnapshot,
+        expected: ExpectedLabel,
+        method: EvaluationMethod,
+    ) -> Result<EvaluationWindowResult> {
+        let existing = !snapshot.rule_matches.is_empty();
+        let request_started = std::time::Instant::now();
+        let Assessment {
+            series_decision,
+            assessment,
+            digest,
+        } = self.assess(snapshot, method).await?;
+        Ok(EvaluationWindowResult {
+            scenario_id: scenario.id.clone(),
+            split: scenario.split,
+            window_id: snapshot.window_id.clone(),
+            revision: snapshot.revision,
+            expected,
+            method,
+            existing_rule_alert: existing,
+            series_decision,
+            detected: existing || series_decision == SeriesDecision::Suspicious,
+            projection_digest: digest,
+            classifier_elapsed_ms: assessment.as_ref().map(|_| {
+                request_started
+                    .elapsed()
+                    .as_millis()
+                    .min(u128::from(u64::MAX)) as u64
+            }),
+            classifier: assessment,
+        })
+    }
+
+    async fn assess(
+        &mut self,
+        snapshot: &FeatureSnapshot,
+        method: EvaluationMethod,
+    ) -> Result<Assessment> {
+        Ok(match method {
+            EvaluationMethod::A => Assessment {
+                series_decision: SeriesDecision::NotApplied,
+                assessment: None,
+                digest: None,
+            },
+            EvaluationMethod::D => Assessment {
+                series_decision: match deterministic_rule(snapshot) {
+                    ThreatClass::Normal => SeriesDecision::Normal,
+                    ThreatClass::AccessPostSuspected => SeriesDecision::Suspicious,
+                    ThreatClass::Unknown => SeriesDecision::Unknown,
+                },
+                assessment: None,
+                digest: Some(
+                    snapshot
+                        .projection(FeatureMode::Correlated)
+                        .digest()
+                        .map_err(|_| anyhow::anyhow!("invalid replay projection"))?,
+                ),
+            },
+            EvaluationMethod::B | EvaluationMethod::C => {
+                self.classify_snapshot(snapshot, method).await?
+            }
+        })
+    }
+
+    async fn classify_snapshot(
+        &mut self,
+        snapshot: &FeatureSnapshot,
+        method: EvaluationMethod,
+    ) -> Result<Assessment> {
+        let projection = snapshot.projection(if method == EvaluationMethod::B {
+            FeatureMode::NetworkOnly
+        } else {
+            FeatureMode::Correlated
+        });
+        let digest = projection
+            .digest()
+            .map_err(|_| anyhow::anyhow!("invalid replay projection"))?;
+        let outcome = self.classifier.classify(&projection).await;
+        if let Some(answer) = outcome.answer() {
+            if answer.input_digest != digest
+                || answer.question_version != self.manifest.question_version
+                || (self.provider != "mock"
+                    && (answer.requested_model != self.manifest.model
+                        || answer.returned_model != self.manifest.model))
+            {
+                bail!("classifier output does not match evaluation manifest");
+            }
+            self.models.insert(answer.returned_model.clone());
+        }
+        Ok(Assessment {
+            series_decision: decision(&outcome),
+            assessment: Some(outcome),
+            digest: Some(digest),
+        })
+    }
+
+    fn record_result(&mut self, result: EvaluationWindowResult, routine_workload: bool) {
+        let stats = self
+            .metrics
+            .get_mut(&result.method)
+            .expect("all comparison methods exist");
+        stats.record_decision(&result);
+        stats.record_label(&result);
+        stats.record_cost(&result, routine_workload);
+        if let Some(duration) = result.classifier_elapsed_ms {
+            self.elapsed
+                .entry(result.method)
+                .or_default()
+                .push(duration);
+        }
+        self.results.push(result);
+    }
+
+    fn finish(mut self) -> EvaluationReport {
+        for (method, stats) in &mut self.metrics {
+            stats.finish(self.elapsed.remove(method).unwrap_or_default());
+        }
+        EvaluationReport {
+            schema_version: 1,
+            provider: self.provider.into(),
+            simulated: self.provider == "mock",
+            manifest: self.manifest.clone(),
+            returned_models: self.models.into_iter().collect(),
+            methods: self.metrics,
+            windows: self.results,
+        }
+    }
+}
+
+struct Assessment {
+    series_decision: SeriesDecision,
+    assessment: Option<ClassificationOutcome>,
+    digest: Option<String>,
+}
+
+impl EvaluationMetrics {
+    fn record_decision(&mut self, result: &EvaluationWindowResult) {
+        self.total_windows += 1;
+        if result.existing_rule_alert {
+            self.existing_rule_alerts += 1;
+        }
+        if result.series_decision == SeriesDecision::Suspicious {
+            self.additional_series_alerts += 1;
+        }
+        match result.series_decision {
+            SeriesDecision::Normal | SeriesDecision::Suspicious | SeriesDecision::NotApplied => {
+                self.classified_windows += 1
+            }
+            SeriesDecision::Unknown => self.abstained_windows += 1,
+            SeriesDecision::Failed => self.failed_windows += 1,
+            SeriesDecision::Skipped => self.skipped_windows += 1,
+        }
+    }
+
+    fn record_label(&mut self, result: &EvaluationWindowResult) {
+        match result.expected {
+            ExpectedLabel::Normal => {
+                self.negative_windows += 1;
+                if result.detected {
+                    self.false_positives += 1;
+                } else {
+                    self.true_negatives += 1;
+                }
+            }
+            ExpectedLabel::Suspicious => {
+                self.positive_windows += 1;
+                if result.detected {
+                    self.true_positives += 1;
+                } else {
+                    self.false_negatives += 1;
+                }
+            }
+            ExpectedLabel::Indeterminate => self.indeterminate_windows += 1,
+        }
+    }
+
+    fn record_cost(&mut self, result: &EvaluationWindowResult, routine_workload: bool) {
+        if routine_workload && result.series_decision == SeriesDecision::Suspicious {
+            self.routine_false_alerts += 1;
+        }
+        if let Some(answer) = result
+            .classifier
+            .as_ref()
+            .and_then(ClassificationOutcome::answer)
+        {
+            self.input_tokens = self.input_tokens.saturating_add(answer.input_tokens);
+            self.output_tokens = self.output_tokens.saturating_add(answer.output_tokens);
+        }
+    }
+
+    fn finish(&mut self, mut times: Vec<u64>) {
+        self.precision = ratio(
+            self.true_positives,
+            self.true_positives + self.false_positives,
         );
-        stats.recall = ratio(stats.true_positives, stats.positive_windows);
-        stats.f1 = ratio(
-            2 * stats.true_positives,
-            2 * stats.true_positives + stats.false_positives + stats.false_negatives,
+        self.recall = ratio(self.true_positives, self.positive_windows);
+        self.f1 = ratio(
+            2 * self.true_positives,
+            2 * self.true_positives + self.false_positives + self.false_negatives,
         );
-        stats.coverage = ratio(stats.classified_windows, stats.total_windows).unwrap_or(0.0);
-        stats.abstention_rate = ratio(stats.abstained_windows, stats.total_windows).unwrap_or(0.0);
-        stats.error_rate = ratio(stats.failed_windows, stats.total_windows).unwrap_or(0.0);
-        stats.additional_false_alerts_per_routine_workload =
-            ratio(stats.routine_false_alerts, stats.routine_workloads);
-        let mut times = elapsed.remove(method).unwrap_or_default();
+        self.coverage = ratio(self.classified_windows, self.total_windows).unwrap_or(0.0);
+        self.abstention_rate = ratio(self.abstained_windows, self.total_windows).unwrap_or(0.0);
+        self.error_rate = ratio(self.failed_windows, self.total_windows).unwrap_or(0.0);
+        self.additional_false_alerts_per_routine_workload =
+            ratio(self.routine_false_alerts, self.routine_workloads);
         times.sort_unstable();
-        stats.p50_elapsed_ms = percentile(&times, 50);
-        stats.p95_elapsed_ms = percentile(&times, 95);
+        self.p50_elapsed_ms = percentile(&times, 50);
+        self.p95_elapsed_ms = percentile(&times, 95);
     }
-    Ok(EvaluationReport {
-        schema_version: 1,
-        provider: provider.into(),
-        simulated: provider == "mock",
-        manifest: manifest.clone(),
-        returned_models: models.into_iter().collect(),
-        methods: metrics,
-        windows: results,
-    })
 }
 
 fn ratio(numerator: u64, denominator: u64) -> Option<f64> {

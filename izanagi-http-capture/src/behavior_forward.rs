@@ -77,6 +77,46 @@ fn parse_header(bytes: &[u8]) -> anyhow::Result<Request> {
     }
     let mut lines = text.split("\r\n");
     let request_line = lines.next().context("missing request line")?;
+    let target = parse_request_target(request_line)?;
+    let (host, port, path) = (target.host, target.port, target.path);
+    let ParsedHeaders {
+        headers,
+        seen,
+        length,
+        host_header,
+        close,
+    } = parse_request_headers(lines)?;
+    if host_header != Some((host.clone(), port)) {
+        bail!("Host and absolute target differ");
+    }
+    let length = length.unwrap_or(0);
+    if matches!(target.method, "POST" | "PUT" | "PATCH") && !seen.contains("content-length") {
+        bail!("content length is required");
+    }
+    if length > MAX_BODY {
+        bail!("request body exceeds limit");
+    }
+    Ok(Request {
+        method: target.method.to_owned(),
+        host,
+        port,
+        path: path.to_owned(),
+        headers,
+        content_length: length,
+        body: Vec::new(),
+        received_bytes: 0,
+        close,
+    })
+}
+
+struct RequestTarget<'a> {
+    method: &'a str,
+    host: String,
+    port: u16,
+    path: &'a str,
+}
+
+fn parse_request_target(request_line: &str) -> anyhow::Result<RequestTarget<'_>> {
     let parts: Vec<_> = request_line.split(' ').collect();
     if parts.len() != 3 || parts[2] != "HTTP/1.1" {
         bail!("unsupported request line");
@@ -98,6 +138,25 @@ fn parse_header(bytes: &[u8]) -> anyhow::Result<Request> {
         bail!("invalid target");
     }
     let (host, port) = authority(auth)?;
+    Ok(RequestTarget {
+        method: parts[0],
+        host,
+        port,
+        path,
+    })
+}
+
+struct ParsedHeaders {
+    headers: Vec<(String, String)>,
+    seen: HashSet<String>,
+    length: Option<u64>,
+    host_header: Option<(String, u16)>,
+    close: bool,
+}
+
+fn parse_request_headers<'a>(
+    lines: impl Iterator<Item = &'a str>,
+) -> anyhow::Result<ParsedHeaders> {
     let mut headers = Vec::new();
     let mut seen = HashSet::new();
     let mut length = None;
@@ -107,19 +166,7 @@ fn parse_header(bytes: &[u8]) -> anyhow::Result<Request> {
         if line.is_empty() {
             continue;
         }
-        if line.starts_with([' ', '\t']) {
-            bail!("folded header is unsupported");
-        }
-        let (key, value) = line.split_once(':').context("malformed header")?;
-        if key.is_empty()
-            || !key
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
-        {
-            bail!("invalid header name");
-        }
-        let key = key.to_ascii_lowercase();
-        let value = value.trim().to_owned();
+        let (key, value) = parse_request_header_field(line)?;
         if !seen.insert(key.clone()) {
             bail!("duplicate header");
         }
@@ -143,27 +190,30 @@ fn parse_header(bytes: &[u8]) -> anyhow::Result<Request> {
         }
         headers.push((key, value));
     }
-    if host_header != Some((host.clone(), port)) {
-        bail!("Host and absolute target differ");
-    }
-    let length = length.unwrap_or(0);
-    if matches!(parts[0], "POST" | "PUT" | "PATCH") && !seen.contains("content-length") {
-        bail!("content length is required");
-    }
-    if length > MAX_BODY {
-        bail!("request body exceeds limit");
-    }
-    Ok(Request {
-        method: parts[0].to_owned(),
-        host,
-        port,
-        path: path.to_owned(),
+    Ok(ParsedHeaders {
         headers,
-        content_length: length,
-        body: Vec::new(),
-        received_bytes: 0,
+        seen,
+        length,
+        host_header,
         close,
     })
+}
+
+fn parse_request_header_field(line: &str) -> anyhow::Result<(String, String)> {
+    if line.starts_with([' ', '\t']) {
+        bail!("folded header is unsupported");
+    }
+    let (key, value) = line.split_once(':').context("malformed header")?;
+    if key.is_empty()
+        || !key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+    {
+        bail!("invalid header name");
+    }
+    let key = key.to_ascii_lowercase();
+    let value = value.trim().to_owned();
+    Ok((key, value))
 }
 
 async fn read_request(stream: &mut TcpStream) -> anyhow::Result<Option<Request>> {
@@ -294,6 +344,19 @@ async fn forward(
     counts: &mut ForwardCounts,
 ) -> anyhow::Result<u16> {
     let mut upstream = connect_upstream(config, request).await?;
+    let bytes = upstream_request_bytes(request);
+    while (counts.written as usize) < bytes.len() {
+        let n = upstream.write(&bytes[counts.written as usize..]).await?;
+        if n == 0 {
+            bail!("upstream write stopped");
+        }
+        counts.written += n as u64;
+    }
+    let response = read_forward_response(&mut upstream, counts).await?;
+    write_client_response(client, request, &response).await
+}
+
+fn upstream_request_bytes(request: &Request) -> Vec<u8> {
     let host = if request.port == 80 {
         request.host.clone()
     } else {
@@ -320,13 +383,13 @@ async fn forward(
     }
     bytes.extend_from_slice(b"\r\n");
     bytes.extend_from_slice(&request.body);
-    while (counts.written as usize) < bytes.len() {
-        let n = upstream.write(&bytes[counts.written as usize..]).await?;
-        if n == 0 {
-            bail!("upstream write stopped");
-        }
-        counts.written += n as u64;
-    }
+    bytes
+}
+
+async fn read_forward_response(
+    upstream: &mut TcpStream,
+    counts: &mut ForwardCounts,
+) -> anyhow::Result<Vec<u8>> {
     let mut response = Vec::new();
     let mut chunk = [0; 8192];
     loop {
@@ -340,11 +403,16 @@ async fn forward(
         counts.received += n as u64;
         response.extend_from_slice(&chunk[..n]);
     }
-    let end = response
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .context("incomplete response")?;
-    let header = std::str::from_utf8(&response[..end]).context("invalid response")?;
+    Ok(response)
+}
+
+struct ResponseHead {
+    status: u16,
+    length: Option<usize>,
+    output: Vec<String>,
+}
+
+fn parse_response_head(header: &str) -> anyhow::Result<ResponseHead> {
     let line = header.split("\r\n").next().context("missing response")?;
     let status: u16 = line.split(' ').nth(1).context("missing status")?.parse()?;
     if !line.starts_with("HTTP/1.") || !(200..600).contains(&status) {
@@ -373,6 +441,28 @@ async fn forward(
             output.push(format!("{}: {}\r\n", key, value));
         }
     }
+    Ok(ResponseHead {
+        status,
+        length,
+        output,
+    })
+}
+
+async fn write_client_response(
+    client: &mut TcpStream,
+    request: &Request,
+    response: &[u8],
+) -> anyhow::Result<u16> {
+    let end = response
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .context("incomplete response")?;
+    let header = std::str::from_utf8(&response[..end]).context("invalid response")?;
+    let ResponseHead {
+        status,
+        length,
+        output,
+    } = parse_response_head(header)?;
     let body = &response[end + 4..];
     if request.method != "HEAD" && length.is_some_and(|n| n != body.len()) {
         bail!("incomplete or surplus response body");
@@ -416,27 +506,8 @@ async fn handle(
     tx: mpsc::Sender<SidecarRecord>,
     connection_id: String,
 ) {
-    let Ok(peer) = client.peer_addr() else {
+    let Some(tuple) = connection_tuple(&client) else {
         return;
-    };
-    let Ok(local) = client.local_addr() else {
-        return;
-    };
-    let namespace = std::fs::read_link("/proc/self/ns/net")
-        .ok()
-        .and_then(|p| {
-            p.to_str().and_then(|s| {
-                s.trim_start_matches("net:[")
-                    .trim_end_matches(']')
-                    .parse()
-                    .ok()
-            })
-        })
-        .unwrap_or(0);
-    let tuple = SocketTuple {
-        net_namespace: namespace,
-        client: peer,
-        local,
     };
     for sequence in 0..128u64 {
         let request = match tokio::time::timeout(config.timeout, read_request(&mut client)).await {
@@ -448,23 +519,7 @@ async fn handle(
             }
         };
         let id = format!("{}:{}", connection_id, sequence);
-        emit(
-            &tx,
-            TelemetryPayload::HttpRequest {
-                connection_id: connection_id.clone(),
-                request_id: id.clone(),
-                tuple: tuple.clone(),
-                method: method(&request.method),
-                policy: if config.allowed_hosts.contains(&request.host) {
-                    PolicyAllowed::Allowed
-                } else {
-                    PolicyAllowed::Denied
-                },
-                novelty: DestinationNovelty::Unknown,
-                declared_content_length: Some(request.content_length),
-                raw_host: Some(request.host.clone()),
-            },
-        );
+        emit_request(&tx, &config, &request, &connection_id, &id, &tuple);
         let mut counts = ForwardCounts::default();
         let result = tokio::time::timeout(
             config.timeout,
@@ -475,23 +530,7 @@ async fn handle(
             Ok(Ok(value)) => Some(value),
             _ => None,
         };
-        emit(
-            &tx,
-            TelemetryPayload::HttpOutcome {
-                request_id: id,
-                client_bytes_received: request.received_bytes,
-                upstream_bytes_written: counts.written,
-                response_bytes_received: counts.received,
-                status: success,
-                outcome: if success.is_some() {
-                    TransferOutcome::Completed
-                } else if !config.allowed_hosts.contains(&request.host) {
-                    TransferOutcome::Rejected
-                } else {
-                    TransferOutcome::Failed
-                },
-            },
-        );
+        emit_outcome(&tx, &config, &request, id, &counts, success);
         if success.is_none() {
             reject(&mut client, 502).await;
             break;
@@ -502,20 +541,83 @@ async fn handle(
     }
 }
 
+fn connection_tuple(client: &TcpStream) -> Option<SocketTuple> {
+    let peer = client.peer_addr().ok()?;
+    let local = client.local_addr().ok()?;
+    let namespace = std::fs::read_link("/proc/self/ns/net")
+        .ok()
+        .and_then(|p| {
+            p.to_str().and_then(|s| {
+                s.trim_start_matches("net:[")
+                    .trim_end_matches(']')
+                    .parse()
+                    .ok()
+            })
+        })
+        .unwrap_or(0);
+    Some(SocketTuple {
+        net_namespace: namespace,
+        client: peer,
+        local,
+    })
+}
+
+fn emit_request(
+    tx: &mpsc::Sender<SidecarRecord>,
+    config: &ForwardConfig,
+    request: &Request,
+    connection_id: &str,
+    id: &str,
+    tuple: &SocketTuple,
+) {
+    emit(
+        tx,
+        TelemetryPayload::HttpRequest {
+            connection_id: connection_id.to_owned(),
+            request_id: id.to_owned(),
+            tuple: tuple.clone(),
+            method: method(&request.method),
+            policy: if config.allowed_hosts.contains(&request.host) {
+                PolicyAllowed::Allowed
+            } else {
+                PolicyAllowed::Denied
+            },
+            novelty: DestinationNovelty::Unknown,
+            declared_content_length: Some(request.content_length),
+            raw_host: Some(request.host.clone()),
+        },
+    );
+}
+
+fn emit_outcome(
+    tx: &mpsc::Sender<SidecarRecord>,
+    config: &ForwardConfig,
+    request: &Request,
+    id: String,
+    counts: &ForwardCounts,
+    success: Option<u16>,
+) {
+    emit(
+        tx,
+        TelemetryPayload::HttpOutcome {
+            request_id: id,
+            client_bytes_received: request.received_bytes,
+            upstream_bytes_written: counts.written,
+            response_bytes_received: counts.received,
+            status: success,
+            outcome: if success.is_some() {
+                TransferOutcome::Completed
+            } else if !config.allowed_hosts.contains(&request.host) {
+                TransferOutcome::Rejected
+            } else {
+                TransferOutcome::Failed
+            },
+        },
+    );
+}
+
 pub async fn run(config: ForwardConfig, telemetry_socket: &Path) -> anyhow::Result<()> {
-    if !config.listen.ip().is_loopback()
-        || config.max_connections == 0
-        || config.max_connections > 1024
-        || config.timeout.is_zero()
-    {
-        bail!("invalid behavior proxy configuration");
-    }
-    if config
-        .fixture_endpoint
-        .is_some_and(|a| !a.ip().is_loopback() || a.port() == 0)
-    {
-        bail!("fixture endpoint must be exact loopback receiver");
-    }
+    validate_forward_config(&config)?;
     let socket = UnixStream::connect(telemetry_socket)
         .await
         .context("telemetry collector unavailable")?;
@@ -558,9 +660,111 @@ pub async fn run(config: ForwardConfig, telemetry_socket: &Path) -> anyhow::Resu
     Ok(())
 }
 
+fn validate_forward_config(config: &ForwardConfig) -> anyhow::Result<()> {
+    if !config.listen.ip().is_loopback()
+        || config.max_connections == 0
+        || config.max_connections > 1024
+        || config.timeout.is_zero()
+    {
+        bail!("invalid behavior proxy configuration");
+    }
+    if config
+        .fixture_endpoint
+        .is_some_and(|a| !a.ip().is_loopback() || a.port() == 0)
+    {
+        bail!("fixture endpoint must be exact loopback receiver");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    async fn tcp_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        (client, server)
+    }
+
+    #[test]
+    fn response_headers_reject_ambiguous_framing_and_preserve_forwarded_fields() {
+        let head = parse_response_head(
+            "HTTP/1.1 201 Created\r\nContent-Length: 3\r\nConnection: close\r\nX-Result: ok",
+        )
+        .unwrap();
+        assert_eq!(head.status, 201);
+        assert_eq!(head.length, Some(3));
+        assert_eq!(head.output, ["x-result: ok\r\n"]);
+        for header in [
+            "HTTP/1.1 100 Continue",
+            "HTTP/1.1 200 OK\r\nContent-Length: 3\r\ncontent-length: 3",
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked",
+            "HTTP/1.1 200 OK\r\nContent-Length: invalid",
+        ] {
+            assert!(parse_response_head(header).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn response_body_validation_preserves_head_length_and_rejects_get_before_writing() {
+        let (mut client, mut server) = tcp_pair().await;
+        let mut request =
+            parse_header(b"HEAD http://example.com/ HTTP/1.1\r\nHost: example.com").unwrap();
+        let upstream = b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\n";
+        assert_eq!(
+            write_client_response(&mut server, &request, upstream)
+                .await
+                .unwrap(),
+            200
+        );
+        let expected =
+            b"HTTP/1.1 200 Response\r\nConnection: keep-alive\r\nContent-Length: 9\r\n\r\n";
+        let mut actual = vec![0; expected.len()];
+        client.read_exact(&mut actual).await.unwrap();
+        assert_eq!(actual, expected);
+        request.method = "GET".into();
+        assert!(
+            write_client_response(&mut server, &request, upstream)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            client.try_read(&mut [0; 1]).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_transfer_keeps_partial_counts_and_policy_classification() {
+        let request =
+            parse_header(b"GET http://example.com/ HTTP/1.1\r\nHost: example.com").unwrap();
+        let mut config = ForwardConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            allowed_hosts: HashSet::new(),
+            fixture_endpoint: None,
+            timeout: Duration::from_secs(1),
+            max_connections: 1,
+        };
+        let (tx, mut rx) = mpsc::channel(2);
+        let counts = ForwardCounts {
+            written: 43,
+            received: 12,
+        };
+        emit_outcome(&tx, &config, &request, "denied".into(), &counts, None);
+        config.allowed_hosts.insert("example.com".into());
+        emit_outcome(&tx, &config, &request, "failed".into(), &counts, None);
+        for expected in [TransferOutcome::Rejected, TransferOutcome::Failed] {
+            let record = rx.recv().await.unwrap();
+            assert!(matches!(record.payload, TelemetryPayload::HttpOutcome {
+                upstream_bytes_written: 43, response_bytes_received: 12, status: None,
+                outcome, ..
+            } if outcome == expected));
+        }
+    }
+
     #[test]
     fn framing_is_strict_and_has_no_secret_error_echo() {
         let valid = b"POST http://example.com/x HTTP/1.1\r\nHost: example.com\r\nContent-Length: 3";

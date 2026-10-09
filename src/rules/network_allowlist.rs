@@ -95,44 +95,22 @@ impl NetworkAllowlistRule {
             return Vec::new();
         }
 
-        // 全ホストの DNS 解決を並行に spawn
-        let mut join_set = tokio::task::JoinSet::new();
-        for host in &hosts {
-            let host_clone = host.clone();
-            join_set.spawn_blocking(move || {
-                use std::net::ToSocketAddrs;
-                let result = (host_clone.as_str(), 0u16).to_socket_addrs();
-                (host_clone, result)
-            });
-        }
+        let mut join_set = spawn_host_lookups(&hosts);
 
         let mut resolved_hosts = std::collections::HashSet::new();
         let mut still_unresolved = Vec::new();
         let mut warnings = Vec::new();
 
         // 全体に対して1つのタイムアウト
-        let timed_out = tokio::time::timeout(timeout, async {
-            while let Some(res) = join_set.join_next().await {
-                match res {
-                    Ok((host, Ok(addrs))) => {
-                        for addr in addrs {
-                            self.allowed_ips.insert(addr.ip());
-                        }
-                        resolved_hosts.insert(host);
-                    }
-                    Ok((host, Err(e))) => {
-                        warnings.push(format!(
-                            "警告: ホスト \"{}\" の DNS 解決に失敗しました: {}",
-                            host, e
-                        ));
-                        still_unresolved.push(host);
-                    }
-                    Err(e) => {
-                        warnings.push(format!("警告: DNS 解決タスクがパニックしました: {}", e));
-                    }
-                }
-            }
-        })
+        let timed_out = tokio::time::timeout(
+            timeout,
+            self.collect_host_lookups(
+                &mut join_set,
+                &mut resolved_hosts,
+                &mut still_unresolved,
+                &mut warnings,
+            ),
+        )
         .await
         .is_err();
 
@@ -143,25 +121,13 @@ impl NetworkAllowlistRule {
             // 大量のホストが未解決の場合、blocking スレッドプール (デフォルト 512 スレッド) が
             // 枯渇するリスクがあるが、allowed_hosts の数は通常数十件以下のため実用上問題ない。
             // (#112)
-            // タイムアウトで処理できなかったホストを未解決に追加
-            let mut processed = std::collections::HashSet::new();
-            for s in &resolved_hosts {
-                processed.insert(s.as_str());
-            }
-            for s in &still_unresolved {
-                processed.insert(s.as_str());
-            }
-            let mut timed_out_hosts = Vec::new();
-            for host in &hosts {
-                if !processed.contains(host.as_str()) {
-                    warnings.push(format!(
-                        "警告: ホスト \"{}\" の DNS 解決がタイムアウトしました ({:?})",
-                        host, timeout
-                    ));
-                    timed_out_hosts.push(host.clone());
-                }
-            }
-            still_unresolved.extend(timed_out_hosts);
+            retain_timed_out_hosts(
+                &hosts,
+                &resolved_hosts,
+                &mut still_unresolved,
+                &mut warnings,
+                timeout,
+            );
         }
 
         self.unresolved_hosts = still_unresolved;
@@ -170,6 +136,35 @@ impl NetworkAllowlistRule {
 
     /// 指定アドレスが許可リストに含まれるか判定する。
     /// 未解決ドメインがある場合は許可されず警告対象となる。
+    async fn collect_host_lookups(
+        &mut self,
+        join_set: &mut HostLookups,
+        resolved_hosts: &mut HashSet<String>,
+        still_unresolved: &mut Vec<String>,
+        warnings: &mut Vec<String>,
+    ) {
+        while let Some(res) = join_set.join_next().await {
+            match res {
+                Ok((host, Ok(addrs))) => {
+                    for addr in addrs {
+                        self.allowed_ips.insert(addr.ip());
+                    }
+                    resolved_hosts.insert(host);
+                }
+                Ok((host, Err(e))) => {
+                    warnings.push(format!(
+                        "警告: ホスト \"{}\" の DNS 解決に失敗しました: {}",
+                        host, e
+                    ));
+                    still_unresolved.push(host);
+                }
+                Err(e) => {
+                    warnings.push(format!("警告: DNS 解決タスクがパニックしました: {}", e));
+                }
+            }
+        }
+    }
+
     /// `resolve_hosts()` / `resolve_hosts_with_timeout()` を事前に呼んで解決しておくこと。
     fn is_allowed(&self, addr: &SocketAddr) -> bool {
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -190,6 +185,51 @@ impl NetworkAllowlistRule {
         }
         self.allowed_ips.contains(&addr.ip())
     }
+}
+
+type HostLookups = tokio::task::JoinSet<(String, std::io::Result<std::vec::IntoIter<SocketAddr>>)>;
+
+fn spawn_host_lookups(hosts: &[String]) -> HostLookups {
+    // 全ホストの DNS 解決を並行に spawn
+    let mut join_set = tokio::task::JoinSet::new();
+    for host in hosts {
+        let host_clone = host.clone();
+        join_set.spawn_blocking(move || {
+            use std::net::ToSocketAddrs;
+            let result = (host_clone.as_str(), 0u16).to_socket_addrs();
+            (host_clone, result)
+        });
+    }
+
+    join_set
+}
+
+fn retain_timed_out_hosts(
+    hosts: &[String],
+    resolved_hosts: &HashSet<String>,
+    still_unresolved: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+    timeout: std::time::Duration,
+) {
+    // タイムアウトで処理できなかったホストを未解決に追加
+    let mut processed = std::collections::HashSet::new();
+    for s in resolved_hosts {
+        processed.insert(s.as_str());
+    }
+    for s in still_unresolved.iter() {
+        processed.insert(s.as_str());
+    }
+    let mut timed_out_hosts = Vec::new();
+    for host in hosts {
+        if !processed.contains(host.as_str()) {
+            warnings.push(format!(
+                "警告: ホスト \"{}\" の DNS 解決がタイムアウトしました ({:?})",
+                host, timeout
+            ));
+            timed_out_hosts.push(host.clone());
+        }
+    }
+    still_unresolved.extend(timed_out_hosts);
 }
 
 impl Rule for NetworkAllowlistRule {
@@ -238,6 +278,45 @@ mod tests {
             args: args.into(),
             result: SyscallResult::Ok(0),
         })
+    }
+
+    #[test]
+    fn timeout_preserves_completed_failures_and_pending_host_order() {
+        let hosts = ["done", "failed", "pending", "pending"].map(str::to_owned);
+        let resolved = HashSet::from(["done".to_owned()]);
+        let mut unresolved = vec!["failed".to_owned()];
+        let mut warnings = vec!["original failure".to_owned()];
+        retain_timed_out_hosts(
+            &hosts,
+            &resolved,
+            &mut unresolved,
+            &mut warnings,
+            std::time::Duration::from_secs(1),
+        );
+        assert_eq!(unresolved, ["failed", "pending", "pending"]);
+        assert_eq!(warnings.len(), 3);
+        assert_eq!(warnings[0], "original failure");
+        assert!(warnings[1].contains("pending"));
+        assert_eq!(warnings[1], warnings[2]);
+    }
+
+    #[tokio::test]
+    async fn local_lookup_records_success_and_empty_resolution_is_noop() {
+        let mut rule = NetworkAllowlistRule::new(&["localhost".into()]);
+        assert!(
+            rule.resolve_hosts_with_timeout(std::time::Duration::from_secs(5))
+                .await
+                .is_empty()
+        );
+        assert!(rule.unresolved_hosts.is_empty());
+        assert!(rule.allowed_ips.iter().any(IpAddr::is_loopback));
+        let ips = rule.allowed_ips.clone();
+        assert!(
+            rule.resolve_hosts_with_timeout(std::time::Duration::ZERO)
+                .await
+                .is_empty()
+        );
+        assert_eq!(rule.allowed_ips, ips);
     }
 
     #[test]

@@ -11,6 +11,8 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 #[cfg(feature = "ebpf")]
 mod abi;
+#[cfg(all(target_os = "linux", feature = "ebpf"))]
+mod linux;
 #[cfg(feature = "ebpf")]
 mod observation;
 
@@ -220,7 +222,7 @@ fn convert_raw_event(
 ) -> Option<SyscallEvent> {
     use std::time::{Duration, UNIX_EPOCH};
 
-    use crate::event::{Syscall, SyscallResult};
+    use crate::event::Syscall;
 
     if raw.abi_version != izanagi_common::RAW_ABI_VERSION
         || !matches!(
@@ -234,13 +236,7 @@ fn convert_raw_event(
     let syscall_id = izanagi_common::SyscallId::try_from(raw.syscall_id).ok()?;
     let syscall = Syscall::try_from(syscall_id).ok()?;
 
-    // comm を文字列に変換
-    let comm_len = raw
-        .comm
-        .iter()
-        .position(|&b| b == 0)
-        .unwrap_or(raw.comm.len());
-    let process_name: Arc<str> = String::from_utf8_lossy(&raw.comm[..comm_len]).into();
+    let process_name = legacy_process_name(raw);
 
     // タイムスタンプを SystemTime に変換
     let timestamp = UNIX_EPOCH + boot_offset + Duration::from_nanos(raw.timestamp_ns);
@@ -263,16 +259,33 @@ fn convert_raw_event(
         process_name,
         syscall,
         args,
-        result: if raw.kind == izanagi_common::KIND_OPEN_EXIT {
-            if raw.result < 0 {
-                SyscallResult::Err((-raw.result).min(i32::MAX as i64) as i32)
-            } else {
-                SyscallResult::Ok(raw.result)
-            }
-        } else {
-            SyscallResult::Unknown
-        },
+        result: legacy_result(raw),
     })
+}
+
+#[cfg(all(target_os = "linux", feature = "ebpf"))]
+fn legacy_process_name(raw: &izanagi_common::RawSyscallEvent) -> Arc<str> {
+    // comm を文字列に変換
+    let comm_len = raw
+        .comm
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(raw.comm.len());
+    String::from_utf8_lossy(&raw.comm[..comm_len]).into()
+}
+
+#[cfg(all(target_os = "linux", feature = "ebpf"))]
+fn legacy_result(raw: &izanagi_common::RawSyscallEvent) -> crate::event::SyscallResult {
+    use crate::event::SyscallResult;
+    if raw.kind == izanagi_common::KIND_OPEN_EXIT {
+        if raw.result < 0 {
+            SyscallResult::Err((-raw.result).min(i32::MAX as i64) as i32)
+        } else {
+            SyscallResult::Ok(raw.result)
+        }
+    } else {
+        SyscallResult::Unknown
+    }
 }
 
 #[cfg(all(target_os = "linux", feature = "ebpf"))]
@@ -282,162 +295,24 @@ impl Tracer for EbpfTracer {
         &self,
         _filter: &TraceFilter,
     ) -> anyhow::Result<mpsc::Receiver<Arc<SyscallEvent>>> {
-        use std::time::Duration;
-
-        use aya::Ebpf;
-        use aya::maps::RingBuf;
-        use aya::programs::TracePoint;
-        use izanagi_common::RAW_EVENT_SIZE;
-
         let bytes = std::fs::read(&self.ebpf_obj_path)?;
         abi::validate_object(&bytes)?;
-        let mut bpf = Ebpf::load(&bytes)?;
+        let mut bpf = aya::Ebpf::load(&bytes)?;
         let behavior = self
             .observation
             .lock()
             .expect("observation lock poisoned")
             .is_some();
-        let required: &[(&str, &str, &str, &[(&str, usize, usize)])] = &[
-            (
-                "sys_enter_openat",
-                "syscalls",
-                "sys_enter_openat",
-                &[("dfd", 16, 8), ("filename", 24, 8), ("flags", 32, 8)],
-            ),
-            (
-                "sys_exit_openat",
-                "syscalls",
-                "sys_exit_openat",
-                &[("ret", 16, 8)],
-            ),
-            (
-                "sched_process_fork",
-                "sched",
-                "sched_process_fork",
-                &[("parent_pid", 24, 4), ("child_pid", 44, 4)],
-            ),
-            ("sched_process_exec", "sched", "sched_process_exec", &[]),
-            ("sched_process_exit", "sched", "sched_process_exit", &[]),
-            (
-                "inet_sock_set_state",
-                "sock",
-                "inet_sock_set_state",
-                &[
-                    ("skaddr", 8, 8),
-                    ("newstate", 20, 4),
-                    ("sport", 24, 2),
-                    ("dport", 26, 2),
-                    ("family", 28, 2),
-                    ("protocol", 30, 2),
-                ],
-            ),
-        ];
-        if behavior {
-            for map in [
-                "EVENTS",
-                "DROPS",
-                "PROCESS_GENERATIONS",
-                "OPEN_ATTEMPTS",
-                "SOCKET_GENERATIONS",
-            ] {
-                anyhow::ensure!(bpf.map(map).is_some(), "required eBPF map missing: {map}");
-            }
-            for &(program, category, name, fields) in required {
-                abi::validate_tracepoint(category, name, fields)?;
-                let program: &mut TracePoint = bpf
-                    .program_mut(program)
-                    .ok_or_else(|| anyhow::anyhow!("required eBPF probe missing"))?
-                    .try_into()?;
-                program.load()?;
-                program.attach(category, name)?;
-            }
-        } else {
-            // Outcomes are also useful in the legacy stream.
-            let program: &mut TracePoint = bpf
-                .program_mut("sys_exit_openat")
-                .ok_or_else(|| anyhow::anyhow!("required open outcome probe missing"))?
-                .try_into()?;
-            program.load()?;
-            program.attach("syscalls", "sys_exit_openat")?;
-        }
-
-        // Tracepoint をアタッチ。
-        // 各 tracepoint に対応する eBPF プログラムをロードしてアタッチする。
-        let tracepoints: &[(&str, &str, &str)] = &[
-            // (program_name, category, tracepoint_name)
-            // File (#22)
-            ("sys_enter_openat", "syscalls", "sys_enter_openat"),
-            ("sys_enter_read", "syscalls", "sys_enter_read"),
-            ("sys_enter_write", "syscalls", "sys_enter_write"),
-            ("sys_enter_stat", "syscalls", "sys_enter_newstat"),
-            ("sys_enter_access", "syscalls", "sys_enter_access"),
-            // Network (#23)
-            ("sys_enter_connect", "syscalls", "sys_enter_connect"),
-            ("sys_enter_sendto", "syscalls", "sys_enter_sendto"),
-            ("sys_enter_recvfrom", "syscalls", "sys_enter_recvfrom"),
-            ("sys_enter_socket", "syscalls", "sys_enter_socket"),
-            ("sys_enter_bind", "syscalls", "sys_enter_bind"),
-            // Process (#24)
-            ("sys_enter_execve", "syscalls", "sys_enter_execve"),
-            ("sys_enter_clone", "syscalls", "sys_enter_clone"),
-            ("sys_enter_fork", "syscalls", "sys_enter_fork"),
-        ];
-
-        let mut unavailable = 0u64;
-        for &(prog_name, category, tp_name) in tracepoints {
-            if behavior && prog_name == "sys_enter_openat" {
-                continue;
-            }
-            let program: &mut TracePoint = match bpf.program_mut(prog_name) {
-                Some(p) => match p.try_into() {
-                    Ok(tp) => tp,
-                    Err(e) => {
-                        eprintln!("eBPF: skipping '{}' (not a tracepoint: {})", prog_name, e);
-                        unavailable += 1;
-                        continue;
-                    }
-                },
-                None => {
-                    eprintln!(
-                        "eBPF: program '{}' not found in object, skipping",
-                        prog_name
-                    );
-                    unavailable += 1;
-                    continue;
-                }
-            };
-            program.load()?;
-            // tracepoint が存在しない場合はスキップ（aarch64 等で一部の syscall がないため）
-            if let Err(e) = program.attach(category, tp_name) {
-                unavailable += 1;
-                eprintln!(
-                    "eBPF: skipping tracepoint '{}/{}' (not available: {})",
-                    category, tp_name, e
-                );
-            }
-        }
-
-        // Ring buffer からイベントを読み取るタスクを起動。
+        linux::attach_required(&mut bpf, behavior)?;
+        let unavailable = linux::attach_syscalls(&mut bpf, behavior)?;
         let (tx, rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
-
-        // take_map で map の所有権を bpf から分離し、RingBuf を作成する。
-        // bpf は全ての fallible な処理が成功した後に self.bpf に格納する。
-        let events_map = bpf
-            .take_map("EVENTS")
-            .ok_or_else(|| anyhow::anyhow!("eBPF map 'EVENTS' not found"))?;
-
-        let ring_buf = RingBuf::try_from(events_map)?;
-        let drop_map = bpf
-            .take_map("DROPS")
-            .ok_or_else(|| anyhow::anyhow!("required drop counter missing"))?;
-        let drops = aya::maps::PerCpuArray::<_, u64>::try_from(drop_map)?;
-        let boot_offset = boot_time_offset()?;
-        let mut observation = self
+        // Finish all fallible map/clock setup before publishing the loaded object.
+        let input = linux::KernelInput::take(&mut bpf)?;
+        let observation = self
             .observation
             .lock()
             .expect("observation lock poisoned")
             .take();
-
         {
             let mut guard = self.bpf.lock().expect("EbpfTracer lock poisoned");
             if guard.is_some() {
@@ -445,129 +320,7 @@ impl Tracer for EbpfTracer {
             }
             *guard = Some(bpf);
         }
-
-        let worker = tokio::spawn(async move {
-            use izanagi_telemetry::schema::{QualityIssue, TelemetryPayload};
-            let mut lost_pending = 0u64;
-            let mut kernel_losses = 0u64;
-            let mut checked = tokio::time::Instant::now();
-            if let Some((collector, tx)) = observation.as_mut() {
-                let event = collector.envelope(
-                    0,
-                    None,
-                    None,
-                    TelemetryPayload::CollectorHealth { healthy: true },
-                    vec![
-                        QualityIssue::MissingWriter,
-                        QualityIssue::UnsupportedProtocol,
-                    ],
-                );
-                if tx.try_send(event).is_err() {
-                    lost_pending += 1;
-                }
-                if unavailable > 0 {
-                    lost_pending += unavailable;
-                }
-            }
-            let mut ring = ring_buf;
-            // adaptive backoff: データがないときは 1ms から 10ms まで徐々にスリープ時間を増やす
-            let mut backoff_ms: u64 = 1;
-            const MIN_BACKOFF_MS: u64 = 1;
-            const MAX_BACKOFF_MS: u64 = 10;
-
-            // TODO: aya の AsyncRingBuf (epoll ベース) が安定したら移行する。
-            // 現在の polling 方式は CPU 負荷が高いため、非同期 API が利用可能になり次第
-            // `ring.next()` ループを `AsyncRingBuf` のストリームに置き換えること。
-            loop {
-                let mut got_event = false;
-
-                while let Some(item) = ring.next() {
-                    got_event = true;
-                    let data = &*item;
-                    if data.len() != RAW_EVENT_SIZE {
-                        lost_pending += 1;
-                        continue;
-                    }
-
-                    // アライメントを検証してから読み取り (#2)
-                    let raw = read_raw_event(data);
-
-                    if let Some((collector, telemetry)) = observation.as_mut()
-                        && raw.tgid != std::process::id()
-                    {
-                        for event in collector.convert(&raw) {
-                            if telemetry.try_send(event).is_err() {
-                                lost_pending += 1;
-                            }
-                        }
-                    }
-                    // RawSyscallEvent → SyscallEvent 変換 (#93)
-                    let event = match convert_raw_event(&raw, boot_offset) {
-                        Some(e) => e,
-                        None => continue,
-                    };
-
-                    // try_send でブロックを回避し、Full の場合のみ await (#8)
-                    let event = Arc::new(event);
-                    match tx.try_send(event) {
-                        Ok(()) => {}
-                        Err(mpsc::error::TrySendError::Full(event)) => {
-                            if tx.send(event).await.is_err() {
-                                // receiver が drop された → 終了
-                                return;
-                            }
-                        }
-                        Err(mpsc::error::TrySendError::Closed(_)) => {
-                            // receiver が drop された → 終了
-                            return;
-                        }
-                    }
-                }
-
-                if checked.elapsed() >= Duration::from_millis(100) {
-                    checked = tokio::time::Instant::now();
-                    match drops.get(&0, 0) {
-                        Ok(values) => {
-                            let total = values.iter().copied().sum::<u64>();
-                            lost_pending =
-                                lost_pending.saturating_add(total.saturating_sub(kernel_losses));
-                            kernel_losses = total;
-                        }
-                        Err(_) => {
-                            lost_pending += 1;
-                        }
-                    }
-                    if lost_pending > 0
-                        && let Some((collector, telemetry)) = observation.as_mut()
-                    {
-                        let timestamp = monotonic_ns();
-                        let event = collector.envelope(
-                            timestamp,
-                            None,
-                            None,
-                            TelemetryPayload::ObservationGap {
-                                dropped: lost_pending,
-                                reason: QualityIssue::EventLoss,
-                            },
-                            vec![QualityIssue::EventLoss],
-                        );
-                        if telemetry.try_send(event).is_ok() {
-                            lost_pending = 0;
-                        }
-                    }
-                }
-                if tx.is_closed() {
-                    return;
-                }
-                // adaptive backoff (#7): データがあればリセット、なければ増加
-                if got_event {
-                    backoff_ms = MIN_BACKOFF_MS;
-                } else {
-                    backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
-                }
-                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-            }
-        });
+        let worker = tokio::spawn(input.run(tx, observation, unavailable));
         *self.worker.lock().expect("worker lock poisoned") = Some(worker);
         Ok(rx)
     }

@@ -155,47 +155,11 @@ pub fn build_run_args(
         container_name.to_string(),
     ];
 
-    // ポートフォワード: --network none と非互換。
-    // Config::validate() でガードされているが、防御的にここでもチェックする。
-    if network.is_none() {
-        // 127.0.0.1 にバインドし、ホスト外部からの接続を防ぐ
-        args.extend_from_slice(&[
-            "-p".to_string(),
-            format!("127.0.0.1:{}:{}", host_port, AGENT_PORT),
-        ]);
-    }
+    push_container_port(&mut args, host_port, network);
 
-    // コンテナ環境には fw_cfg がないため、トークン認証をスキップする。
-    // コマンド実行はホスト側で HMAC 認証済みのため、agent 側は全コマンドを許可する。
-    // ポートは 127.0.0.1 にバインドされるため、外部からの接続は不可。
-    args.extend_from_slice(&[
-        "-e".to_string(),
-        "IZANAGI_ALLOW_NO_TOKEN=1".to_string(),
-        "-e".to_string(),
-        "IZANAGI_ALLOW_ALL_COMMANDS=1".to_string(),
-    ]);
+    push_container_agent_env(&mut args, env_file);
 
-    // シークレットは --env-file 経由で渡す
-    if let Some(path) = env_file {
-        args.extend_from_slice(&["--env-file".to_string(), path.to_string()]);
-    }
-
-    // ボリュームマウント（最初のパスのみマウント）
-    if let Some(host_path) = share.host_paths.first() {
-        let path_str = host_path.to_string_lossy();
-        let abs_path = if path_str.starts_with('~') {
-            let home = std::env::var("HOME").unwrap_or_default();
-            PathBuf::from(path_str.replacen('~', &home, 1))
-        } else if host_path.is_relative() {
-            std::env::current_dir().unwrap_or_default().join(host_path)
-        } else {
-            host_path.clone()
-        };
-        args.extend_from_slice(&[
-            "--volume".to_string(),
-            format!("{}:{}", abs_path.display(), share.mount_point.display()),
-        ]);
-    }
+    push_container_share(&mut args, share);
 
     // DNS プロキシ
     if let Some(dns_ip) = dns_proxy {
@@ -214,6 +178,58 @@ pub fn build_run_args(
     args.push(image.to_string());
 
     args
+}
+
+fn push_container_agent_env(args: &mut Vec<String>, env_file: Option<&str>) {
+    // コンテナ環境には fw_cfg がないため、トークン認証をスキップする。
+    // コマンド実行はホスト側で HMAC 認証済みのため、agent 側は全コマンドを許可する。
+    // ポートは 127.0.0.1 にバインドされるため、外部からの接続は不可。
+    args.extend_from_slice(&[
+        "-e".to_string(),
+        "IZANAGI_ALLOW_NO_TOKEN=1".to_string(),
+        "-e".to_string(),
+        "IZANAGI_ALLOW_ALL_COMMANDS=1".to_string(),
+    ]);
+
+    // シークレットは --env-file 経由で渡す
+    if let Some(path) = env_file {
+        args.extend_from_slice(&["--env-file".to_string(), path.to_string()]);
+    }
+}
+
+fn push_container_port(
+    args: &mut Vec<String>,
+    host_port: u16,
+    network: Option<crate::config::ContainerNetworkMode>,
+) {
+    // ポートフォワード: --network none と非互換。
+    // Config::validate() でガードされているが、防御的にここでもチェックする。
+    if network.is_none() {
+        // 127.0.0.1 にバインドし、ホスト外部からの接続を防ぐ
+        args.extend_from_slice(&[
+            "-p".to_string(),
+            format!("127.0.0.1:{}:{}", host_port, AGENT_PORT),
+        ]);
+    }
+}
+
+fn push_container_share(args: &mut Vec<String>, share: &ShareConfig) {
+    // ボリュームマウント（最初のパスのみマウント）
+    if let Some(host_path) = share.host_paths.first() {
+        let path_str = host_path.to_string_lossy();
+        let abs_path = if path_str.starts_with('~') {
+            let home = std::env::var("HOME").unwrap_or_default();
+            PathBuf::from(path_str.replacen('~', &home, 1))
+        } else if host_path.is_relative() {
+            std::env::current_dir().unwrap_or_default().join(host_path)
+        } else {
+            host_path.clone()
+        };
+        args.extend_from_slice(&[
+            "--volume".to_string(),
+            format!("{}:{}", abs_path.display(), share.mount_point.display()),
+        ]);
+    }
 }
 
 /// `container exec` コマンドの引数を構築する。
@@ -276,7 +292,114 @@ pub struct AppleContainerSandbox {
     container_binary: String,
 }
 
+struct ContainerBootSettings {
+    image: String,
+    share: ShareConfig,
+    dns_proxy: Option<String>,
+    network: Option<crate::config::ContainerNetworkMode>,
+}
+
 impl AppleContainerSandbox {
+    async fn boot_settings(
+        &mut self,
+        config: &SandboxConfig,
+    ) -> anyhow::Result<ContainerBootSettings> {
+        let (image, share, dns_proxy, network) = match config {
+            SandboxConfig::AppleContainer {
+                image,
+                share,
+                dns_proxy,
+                network,
+            } => (image.clone(), share.clone(), dns_proxy.clone(), *network),
+            _ => {
+                self.status = SandboxStatus::Stopped;
+                anyhow::bail!("AppleContainerSandbox requires SandboxConfig::AppleContainer");
+            }
+        };
+
+        // イメージの存在確認
+        if let Err(e) = check_image_exists_with(&image, &self.container_binary).await {
+            self.status = SandboxStatus::Stopped;
+            return Err(e);
+        }
+
+        Ok(ContainerBootSettings {
+            image,
+            share,
+            dns_proxy,
+            network,
+        })
+    }
+
+    fn prepare_env_file(&mut self) -> anyhow::Result<Option<EnvFileGuard>> {
+        // シークレットを load_shared_secret_from_env で取得し、env-file に書き出す
+        // EnvFileGuard により、成功・失敗・パニック問わず env-file は確実に削除される
+        let shared_secret = crate::protocol::load_shared_secret_from_env()?
+            .map(|bytes| String::from_utf8_lossy(&bytes).to_string());
+        let env_file_guard = if let Some(ref secret) = shared_secret {
+            Some(write_secret_env_file(secret).map_err(|e| {
+                self.status = SandboxStatus::Stopped;
+                anyhow::anyhow!("Failed to write env-file: {}", e)
+            })?)
+        } else {
+            None
+        };
+
+        Ok(env_file_guard)
+    }
+
+    fn boot_args(
+        &self,
+        container_name: &str,
+        boot: &ContainerBootSettings,
+        env_file_guard: &Option<EnvFileGuard>,
+    ) -> Vec<String> {
+        // 複数 host_paths 指定時は警告（build_run_args は純関数なので呼び出し元で警告）
+        if boot.share.host_paths.len() > 1 {
+            eprintln!(
+                "警告: 複数の host_paths が指定されていますが、同一マウントポイントには最初のパスのみマウントされます。"
+            );
+        }
+
+        // container run コマンドを実行
+        let env_file_str = env_file_guard
+            .as_ref()
+            .and_then(|g| g.path())
+            .and_then(|p| p.to_str());
+        build_run_args(
+            container_name,
+            &boot.image,
+            self.host_port,
+            &boot.share,
+            env_file_str,
+            boot.dns_proxy.as_deref(),
+            boot.network,
+        )
+    }
+
+    async fn run_container(&mut self, args: &[String]) -> anyhow::Result<()> {
+        let output = Command::new(&self.container_binary)
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .await
+            .map_err(|e| {
+                // env_file_guard の Drop で env-file は自動削除される
+                self.status = SandboxStatus::Stopped;
+                anyhow::anyhow!("Failed to start container: {}", e)
+            })?;
+
+        if !output.status.success() {
+            // env_file_guard の Drop で env-file は自動削除される
+            self.status = SandboxStatus::Stopped;
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("container run failed: {}", stderr);
+        }
+
+        Ok(())
+    }
+
     /// デフォルトのコンテナランタイム ("container") で作成する。
     pub fn new() -> Self {
         // デフォルトは許可リストに含まれるため unwrap は安全
@@ -351,24 +474,7 @@ impl Sandbox for AppleContainerSandbox {
 
         self.status = SandboxStatus::Starting;
 
-        let (image, share, dns_proxy, network) = match config {
-            SandboxConfig::AppleContainer {
-                image,
-                share,
-                dns_proxy,
-                network,
-            } => (image.clone(), share.clone(), dns_proxy.clone(), *network),
-            _ => {
-                self.status = SandboxStatus::Stopped;
-                anyhow::bail!("AppleContainerSandbox requires SandboxConfig::AppleContainer");
-            }
-        };
-
-        // イメージの存在確認
-        if let Err(e) = check_image_exists_with(&image, &self.container_binary).await {
-            self.status = SandboxStatus::Stopped;
-            return Err(e);
-        }
+        let boot = self.boot_settings(config).await?;
 
         // 空きポートを取得
         self.host_port = find_available_port().await?;
@@ -376,63 +482,15 @@ impl Sandbox for AppleContainerSandbox {
         // コンテナ名を生成
         let container_name = generate_container_name();
 
-        // シークレットを load_shared_secret_from_env で取得し、env-file に書き出す
-        // EnvFileGuard により、成功・失敗・パニック問わず env-file は確実に削除される
-        let shared_secret = crate::protocol::load_shared_secret_from_env()?
-            .map(|bytes| String::from_utf8_lossy(&bytes).to_string());
-        let env_file_guard = if let Some(ref secret) = shared_secret {
-            Some(write_secret_env_file(secret).map_err(|e| {
-                self.status = SandboxStatus::Stopped;
-                anyhow::anyhow!("Failed to write env-file: {}", e)
-            })?)
-        } else {
-            None
-        };
+        let env_file_guard = self.prepare_env_file()?;
 
-        // 複数 host_paths 指定時は警告（build_run_args は純関数なので呼び出し元で警告）
-        if share.host_paths.len() > 1 {
-            eprintln!(
-                "警告: 複数の host_paths が指定されていますが、同一マウントポイントには最初のパスのみマウントされます。"
-            );
-        }
+        let args = self.boot_args(&container_name, &boot, &env_file_guard);
 
-        // container run コマンドを実行
-        let env_file_str = env_file_guard
-            .as_ref()
-            .and_then(|g| g.path())
-            .and_then(|p| p.to_str());
-        let args = build_run_args(
-            &container_name,
-            &image,
-            self.host_port,
-            &share,
-            env_file_str,
-            dns_proxy.as_deref(),
-            network,
-        );
-
-        let output = Command::new(&self.container_binary)
-            .args(&args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .await
-            .map_err(|e| {
-                // env_file_guard の Drop で env-file は自動削除される
-                self.status = SandboxStatus::Stopped;
-                anyhow::anyhow!("Failed to start container: {}", e)
-            })?;
-
-        if !output.status.success() {
-            // env_file_guard の Drop で env-file は自動削除される
-            self.status = SandboxStatus::Stopped;
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("container run failed: {}", stderr);
-        }
+        self.run_container(&args).await?;
 
         self.container_name = Some(container_name);
-        self.image = Some(image);
-        self.mount_point = Some(share.mount_point.to_string_lossy().to_string());
+        self.image = Some(boot.image);
+        self.mount_point = Some(boot.share.mount_point.to_string_lossy().to_string());
         // env_file_guard の Drop でコンテナ起動成功後に env-file は自動削除される
         drop(env_file_guard);
 
@@ -559,6 +617,34 @@ impl Sandbox for AppleContainerSandbox {
 
 impl AppleContainerSandbox {
     /// コンテナを停止・削除する。
+    async fn remove_container(&self, name: &str) {
+        // --rm 付きで起動しているが、異常終了時に残留する場合があるため明示的に削除
+        let rm_output = Command::new(&self.container_binary)
+            .args(["rm", "-f", name])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .await;
+
+        // rm -f の結果もチェック (#218)
+        match rm_output {
+            Ok(output) if !output.status.success() => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let stderr_lower = stderr.to_ascii_lowercase();
+                // コンテナが既に存在しない場合は正常
+                if !stderr_lower.contains("not found")
+                    && !stderr_lower.contains("no such container")
+                {
+                    eprintln!("警告: container rm failed: {}", stderr);
+                }
+            }
+            Err(e) => {
+                eprintln!("警告: container rm の実行に失敗: {}", e);
+            }
+            _ => {}
+        }
+    }
+
     async fn stop_container(&mut self) -> anyhow::Result<()> {
         if let Some(ref name) = self.container_name {
             // コンテナを停止（--rm で既に削除済みの場合はエラーを無視）
@@ -581,31 +667,7 @@ impl AppleContainerSandbox {
                 }
             }
 
-            // --rm 付きで起動しているが、異常終了時に残留する場合があるため明示的に削除
-            let rm_output = Command::new(&self.container_binary)
-                .args(["rm", "-f", name])
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output()
-                .await;
-
-            // rm -f の結果もチェック (#218)
-            match rm_output {
-                Ok(output) if !output.status.success() => {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    let stderr_lower = stderr.to_ascii_lowercase();
-                    // コンテナが既に存在しない場合は正常
-                    if !stderr_lower.contains("not found")
-                        && !stderr_lower.contains("no such container")
-                    {
-                        eprintln!("警告: container rm failed: {}", stderr);
-                    }
-                }
-                Err(e) => {
-                    eprintln!("警告: container rm の実行に失敗: {}", e);
-                }
-                _ => {}
-            }
+            self.remove_container(name).await;
         }
         self.container_name = None;
         Ok(())
@@ -617,6 +679,20 @@ mod tests {
     use super::*;
     use crate::sandbox::ShareConfig;
     use std::path::PathBuf;
+
+    #[tokio::test]
+    async fn container_spawn_and_unsuccessful_exit_restore_stopped_state() {
+        for binary in ["/nonexistent/izanagi-container", "/usr/bin/false"] {
+            let mut sandbox = AppleContainerSandbox {
+                container_binary: binary.into(),
+                status: SandboxStatus::Starting,
+                ..Default::default()
+            };
+            assert!(sandbox.run_container(&[]).await.is_err());
+            assert_eq!(sandbox.status, SandboxStatus::Stopped);
+            assert!(sandbox.container_name.is_none());
+        }
+    }
 
     // --- イメージ存在確認テスト (#149) ---
 

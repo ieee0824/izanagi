@@ -274,28 +274,7 @@ impl Config {
 
     /// プラットフォーム判定を引数として受け取るバリデーション。テストで各プラットフォームの挙動を検証可能。
     fn validate_for_platform(&self, is_linux: bool, is_macos: bool) -> anyhow::Result<Vec<String>> {
-        self.behavior.validate()?;
-        if self.behavior.enabled
-            && (self.sandbox.backend != SandboxBackend::Qemu
-                || self.sandbox.tracer != TracerBackend::VmAgent)
-        {
-            bail!("behavior PoC requires sandbox.backend=qemu and tracer=vm-agent");
-        }
-        if self.behavior.enabled && self.sandbox.require_auth == Some(false) {
-            bail!("behavior PoC requires token/HMAC authentication");
-        }
-        // backend=qemu の場合は qemu セクションが必要
-        if self.sandbox.backend == SandboxBackend::Qemu && self.sandbox.qemu.is_none() {
-            bail!("sandbox.backend が \"qemu\" の場合、[sandbox.qemu] セクションが必要です");
-        }
-
-        // qemu セクションのバリデーション
-        if let Some(ref qemu) = self.sandbox.qemu
-            && qemu.cpus == 0
-        {
-            bail!("sandbox.qemu.cpus は 1 以上でなければなりません");
-        }
-
+        self.validate_behavior_backend()?;
         // プラットフォームに応じたバックエンド利用可能性チェック
         if self.sandbox.backend == SandboxBackend::Native && !is_linux && !is_macos {
             bail!(
@@ -321,6 +300,43 @@ impl Config {
             _ => {}
         }
 
+        self.validate_container_network()?;
+
+        let mut warnings = Vec::new();
+
+        // share.paths のバリデーション
+        warnings.extend(self.validate_share_paths()?);
+
+        Ok(warnings)
+    }
+
+    fn validate_behavior_backend(&self) -> anyhow::Result<()> {
+        self.behavior.validate()?;
+        if self.behavior.enabled
+            && (self.sandbox.backend != SandboxBackend::Qemu
+                || self.sandbox.tracer != TracerBackend::VmAgent)
+        {
+            bail!("behavior PoC requires sandbox.backend=qemu and tracer=vm-agent");
+        }
+        if self.behavior.enabled && self.sandbox.require_auth == Some(false) {
+            bail!("behavior PoC requires token/HMAC authentication");
+        }
+        // backend=qemu の場合は qemu セクションが必要
+        if self.sandbox.backend == SandboxBackend::Qemu && self.sandbox.qemu.is_none() {
+            bail!("sandbox.backend が \"qemu\" の場合、[sandbox.qemu] セクションが必要です");
+        }
+
+        // qemu セクションのバリデーション
+        if let Some(ref qemu) = self.sandbox.qemu
+            && qemu.cpus == 0
+        {
+            bail!("sandbox.qemu.cpus は 1 以上でなければなりません");
+        }
+
+        Ok(())
+    }
+
+    fn validate_container_network(&self) -> anyhow::Result<()> {
         // apple-container の network=none はポートフォワードと非互換のためエラーにする。
         // エージェントとの TCP 通信ができなくなり、起動がタイムアウトする。
         // 将来的に container exec ベースの Ready 判定を実装した際に解除予定。
@@ -337,12 +353,7 @@ impl Config {
             );
         }
 
-        let mut warnings = Vec::new();
-
-        // share.paths のバリデーション
-        warnings.extend(self.validate_share_paths()?);
-
-        Ok(warnings)
+        Ok(())
     }
 
     /// 共有パスのバリデーション。
@@ -351,40 +362,13 @@ impl Config {
         let mut warnings = Vec::new();
 
         for path in &self.share.paths {
-            // ルートパスの共有を禁止
-            if path == "/" {
-                bail!("share.paths にルートパス \"/\" を指定することはできません");
-            }
-
-            // ".." コンポーネントを含むパスを拒否（パストラバーサル防止）
-            let p = Path::new(path);
-            for component in p.components() {
-                if component == std::path::Component::ParentDir {
-                    bail!(
-                        "share.paths に \"..\" を含むパス \"{}\" を指定することはできません",
-                        path
-                    );
-                }
-            }
+            validate_share_path_shape(path)?;
 
             // パスを正規化して機密パス判定を行う
             let normalized = normalize_share_path(path)?;
 
             // 存在するパスはシンボリックリンクを解決して実パスを取得する
-            let resolved = {
-                let normalized_path = Path::new(&normalized);
-                if normalized_path.exists() {
-                    let canon = std::fs::canonicalize(normalized_path).with_context(|| {
-                        format!(
-                            "share.paths のパス \"{}\" のシンボリックリンク解決に失敗しました",
-                            path
-                        )
-                    })?;
-                    canon.to_string_lossy().to_string()
-                } else {
-                    normalized.clone()
-                }
-            };
+            let resolved = resolve_share_path(path, &normalized)?;
 
             // システムディレクトリの共有を禁止（正規化後のパスで判定）
             // resolved がシステムディレクトリそのものである場合のみ拒否。
@@ -413,12 +397,8 @@ impl Config {
                 }
             }
 
-            // パスが存在するか警告
-            if !path.starts_with('~') && p.is_absolute() && !p.exists() {
-                warnings.push(format!(
-                    "警告: share.paths のパス \"{}\" は存在しません",
-                    path
-                ));
+            if let Some(warning) = missing_share_path_warning(path) {
+                warnings.push(warning);
             }
         }
 
@@ -463,46 +443,35 @@ impl Config {
                 if is_linux {
                     Ok(SandboxConfig::Landlock { share })
                 } else {
-                    let ac = self
-                        .sandbox
-                        .apple_container
-                        .as_ref()
-                        .cloned()
-                        .unwrap_or_default();
-                    if ac.network == Some(ContainerNetworkMode::None) {
-                        anyhow::bail!(
-                            "sandbox.apple_container.network = \"none\" は現在サポートされていません"
-                        );
-                    }
-                    Ok(SandboxConfig::AppleContainer {
-                        image: ac.image,
-                        share,
-                        dns_proxy: dns_proxy_ip,
-                        network: ac.network,
-                    })
+                    self.apple_sandbox_config(share, dns_proxy_ip)
                 }
             }
-            SandboxBackend::AppleContainer => {
-                let ac = self
-                    .sandbox
-                    .apple_container
-                    .as_ref()
-                    .cloned()
-                    .unwrap_or_default();
-                // 防御的チェック: network = "none" は未サポート（validate() でも検証済み）
-                if ac.network == Some(ContainerNetworkMode::None) {
-                    anyhow::bail!(
-                        "sandbox.apple_container.network = \"none\" は現在サポートされていません"
-                    );
-                }
-                Ok(SandboxConfig::AppleContainer {
-                    image: ac.image,
-                    share,
-                    dns_proxy: dns_proxy_ip,
-                    network: ac.network,
-                })
-            }
+            SandboxBackend::AppleContainer => self.apple_sandbox_config(share, dns_proxy_ip),
         }
+    }
+
+    fn apple_sandbox_config(
+        &self,
+        share: ShareConfig,
+        dns_proxy: Option<String>,
+    ) -> anyhow::Result<SandboxConfig> {
+        let ac = self
+            .sandbox
+            .apple_container
+            .as_ref()
+            .cloned()
+            .unwrap_or_default();
+        if ac.network == Some(ContainerNetworkMode::None) {
+            anyhow::bail!(
+                "sandbox.apple_container.network = \"none\" は現在サポートされていません"
+            );
+        }
+        Ok(SandboxConfig::AppleContainer {
+            image: ac.image,
+            share,
+            dns_proxy,
+            network: ac.network,
+        })
     }
 
     /// DNS プロキシが有効な場合、listen アドレスから IP 部分を抽出する。
@@ -719,6 +688,55 @@ pub fn resolve_config_path() -> anyhow::Result<PathBuf> {
     }
     // どちらもない場合は settings パスを返す
     Ok(settings)
+}
+
+fn missing_share_path_warning(path: &str) -> Option<String> {
+    let p = Path::new(path);
+    if !path.starts_with('~') && p.is_absolute() && !p.exists() {
+        Some(format!(
+            "警告: share.paths のパス \"{}\" は存在しません",
+            path
+        ))
+    } else {
+        None
+    }
+}
+
+fn validate_share_path_shape(path: &str) -> anyhow::Result<()> {
+    // ルートパスの共有を禁止
+    if path == "/" {
+        bail!("share.paths にルートパス \"/\" を指定することはできません");
+    }
+
+    // ".." コンポーネントを含むパスを拒否（パストラバーサル防止）
+    let p = Path::new(path);
+    for component in p.components() {
+        if component == std::path::Component::ParentDir {
+            bail!(
+                "share.paths に \"..\" を含むパス \"{}\" を指定することはできません",
+                path
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn resolve_share_path(path: &str, normalized: &str) -> anyhow::Result<String> {
+    Ok({
+        let normalized_path = Path::new(&normalized);
+        if normalized_path.exists() {
+            let canon = std::fs::canonicalize(normalized_path).with_context(|| {
+                format!(
+                    "share.paths のパス \"{}\" のシンボリックリンク解決に失敗しました",
+                    path
+                )
+            })?;
+            canon.to_string_lossy().to_string()
+        } else {
+            normalized.to_owned()
+        }
+    })
 }
 
 #[cfg(test)]

@@ -87,35 +87,7 @@ impl ProxyManager {
 
         let binary = find_binary("izanagi-http-capture")?;
 
-        let mut cmd = Command::new(&binary);
-        cmd.arg("--listen-http")
-            .arg(section.listen_http.to_string())
-            .arg("--listen-https")
-            .arg(section.listen_https.to_string())
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .kill_on_drop(true);
-
-        if let Some(ref ca_out) = section.ca_cert_out {
-            cmd.arg("--ca-cert-out").arg(ca_out);
-        }
-
-        // allowed_hosts は detect セクションから取得
-        for host in &config.detect.allowed_hosts {
-            cmd.arg("--allowed-host").arg(host);
-        }
-
-        // シークレット置換マッピング (#273)
-        // コマンドライン引数では ps でシークレットが漏洩するため、
-        // 一時ファイル (0600) 経由で渡す。
-        // TempFileGuard は ProxyManager に所有され、stop() 時に削除される。
-        let secret_guard = if !section.secret_maps.is_empty() {
-            let (tmp, guard) = write_secret_map_file(&section.secret_maps)?;
-            cmd.arg("--secret-map-file").arg(&tmp);
-            Some(guard)
-        } else {
-            None
-        };
+        let (mut cmd, secret_guard) = http_capture_command(&binary, section, config)?;
 
         let child = cmd.spawn().map_err(|e| {
             anyhow::anyhow!(
@@ -156,6 +128,44 @@ impl ProxyManager {
         }
         *child = None;
     }
+}
+
+fn http_capture_command(
+    binary: &Path,
+    section: &crate::config::HttpCaptureSection,
+    config: &Config,
+) -> anyhow::Result<(Command, Option<TempFileGuard>)> {
+    let mut cmd = Command::new(binary);
+    cmd.arg("--listen-http")
+        .arg(section.listen_http.to_string())
+        .arg("--listen-https")
+        .arg(section.listen_https.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true);
+
+    if let Some(ref ca_out) = section.ca_cert_out {
+        cmd.arg("--ca-cert-out").arg(ca_out);
+    }
+
+    // allowed_hosts は detect セクションから取得
+    for host in &config.detect.allowed_hosts {
+        cmd.arg("--allowed-host").arg(host);
+    }
+
+    // シークレット置換マッピング (#273)
+    // コマンドライン引数では ps でシークレットが漏洩するため、
+    // 一時ファイル (0600) 経由で渡す。
+    // TempFileGuard は ProxyManager に所有され、stop() 時に削除される。
+    let secret_guard = if !section.secret_maps.is_empty() {
+        let (tmp, guard) = write_secret_map_file(&section.secret_maps)?;
+        cmd.arg("--secret-map-file").arg(&tmp);
+        Some(guard)
+    } else {
+        None
+    };
+
+    Ok((cmd, secret_guard))
 }
 
 /// 一時ファイルの RAII ガード。Drop 時にファイルを削除する。
@@ -247,18 +257,7 @@ fn validate_ca_cert_path(path: &Path) -> anyhow::Result<()> {
     }
 
     // 親ディレクトリを canonicalize して symlink を解決した上でチェック
-    let check_path = if let Some(parent) = path.parent() {
-        if parent.exists() {
-            parent
-                .canonicalize()
-                .unwrap_or_else(|_| parent.to_path_buf())
-                .join(path.file_name().unwrap_or_default())
-        } else {
-            path.to_path_buf()
-        }
-    } else {
-        path.to_path_buf()
-    };
+    let check_path = resolved_ca_cert_path(path);
 
     // システムディレクトリへの書き込みを禁止
     // macOS では /etc → /private/etc, /var → /private/var のシンボリックリンクがあるため、
@@ -286,6 +285,21 @@ fn validate_ca_cert_path(path: &Path) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn resolved_ca_cert_path(path: &Path) -> PathBuf {
+    if let Some(parent) = path.parent() {
+        if parent.exists() {
+            parent
+                .canonicalize()
+                .unwrap_or_else(|_| parent.to_path_buf())
+                .join(path.file_name().unwrap_or_default())
+        } else {
+            path.to_path_buf()
+        }
+    } else {
+        path.to_path_buf()
+    }
 }
 
 /// PID の表示用ヘルパー。取得できない場合は "unknown"。

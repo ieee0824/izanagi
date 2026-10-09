@@ -43,6 +43,21 @@ impl Collector {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn fixture() -> Self {
+        Self {
+            session: "s".into(),
+            boot: "b".into(),
+            source: "c".into(),
+            pid_namespace: 1,
+            net_namespace: 2,
+            sequence: 0,
+            seen: BTreeSet::new(),
+            sockets: BTreeMap::new(),
+            socket_sequence: 0,
+        }
+    }
+
     fn key(&self, tgid: u32, start: u64) -> Option<ProcessKey> {
         if tgid == 0 || start == 0 {
             return None;
@@ -97,6 +112,41 @@ impl Collector {
             return result;
         }
         let process = self.key(raw.tgid, raw.process_start_ns);
+        self.record_process_identity(raw, &process, &mut result);
+        let mut issues = Vec::new();
+        let payload = match raw.kind {
+            KIND_ENTER if raw.syscall_id == SyscallId::OpenAt as u32 => {
+                self.open_attempt(raw, &mut issues)
+            }
+            KIND_OPEN_EXIT => self.open_outcome(raw, &mut issues),
+            KIND_EXEC => TelemetryPayload::ProcessExec {
+                exec_generation: raw.exec_generation,
+            },
+            KIND_EXIT => {
+                if let Some(key) = &process {
+                    self.seen.remove(key);
+                }
+                TelemetryPayload::ProcessExit
+            }
+            KIND_SOCKET => {
+                let socket = self.record_socket_identity(raw, &mut result);
+                let Some(payload) = self.socket_payload(raw, socket, &mut issues) else {
+                    return result;
+                };
+                payload
+            }
+            _ => return result,
+        };
+        result.push(self.envelope(raw.timestamp_ns, process, Some(raw.pid), payload, issues));
+        result
+    }
+
+    fn record_process_identity(
+        &mut self,
+        raw: &RawSyscallEvent,
+        process: &Option<ProcessKey>,
+        result: &mut Vec<TelemetryEnvelope>,
+    ) {
         // The first TGID-bearing event confirms that sched_process_fork's child
         // was a process, rather than a thread. Preexisting processes remain None.
         if let Some(key) = process.as_ref()
@@ -136,132 +186,134 @@ impl Collector {
                 ));
             }
         }
-        let mut issues = Vec::new();
-        let payload = match raw.kind {
-            KIND_ENTER if raw.syscall_id == SyscallId::OpenAt as u32 => {
-                let length = (raw.path_len as usize).min(PATH_BUF_SIZE);
-                if raw.flags & FLAG_PATH_FAILED != 0 || length == 0 {
-                    issues.push(QualityIssue::PathUnresolved);
-                }
-                if raw.flags & FLAG_PATH_TRUNCATED != 0 || raw.path_len as usize > PATH_BUF_SIZE {
-                    issues.push(QualityIssue::PathTruncated);
-                }
-                let path = std::str::from_utf8(&raw.path_buf[..length])
-                    .ok()
-                    .filter(|s| !s.is_empty());
-                if path.is_some_and(|s| !s.starts_with('/')) {
-                    issues.push(QualityIssue::PathUnresolved);
-                }
-                let role = path.map(file_role).unwrap_or(FileRole::Unknown);
-                TelemetryPayload::FileAccessAttempt {
-                    attempt_id: self.attempt(raw.pid, raw.timestamp_ns),
-                    role,
-                    path: path.map(str::to_owned),
-                }
+    }
+
+    fn open_attempt(
+        &self,
+        raw: &RawSyscallEvent,
+        issues: &mut Vec<QualityIssue>,
+    ) -> TelemetryPayload {
+        let length = (raw.path_len as usize).min(PATH_BUF_SIZE);
+        if raw.flags & FLAG_PATH_FAILED != 0 || length == 0 {
+            issues.push(QualityIssue::PathUnresolved);
+        }
+        if raw.flags & FLAG_PATH_TRUNCATED != 0 || raw.path_len as usize > PATH_BUF_SIZE {
+            issues.push(QualityIssue::PathTruncated);
+        }
+        let path = std::str::from_utf8(&raw.path_buf[..length])
+            .ok()
+            .filter(|s| !s.is_empty());
+        if path.is_some_and(|s| !s.starts_with('/')) {
+            issues.push(QualityIssue::PathUnresolved);
+        }
+        let role = path.map(file_role).unwrap_or(FileRole::Unknown);
+        TelemetryPayload::FileAccessAttempt {
+            attempt_id: self.attempt(raw.pid, raw.timestamp_ns),
+            role,
+            path: path.map(str::to_owned),
+        }
+    }
+
+    fn open_outcome(
+        &self,
+        raw: &RawSyscallEvent,
+        issues: &mut Vec<QualityIssue>,
+    ) -> TelemetryPayload {
+        if raw.flags & FLAG_STATE_MISSING != 0 {
+            issues.push(QualityIssue::MissingOutcome);
+        }
+        let outcome = if raw.flags & FLAG_STATE_MISSING != 0 {
+            OpenOutcome::Unknown
+        } else if raw.result < 0 {
+            OpenOutcome::Failed {
+                errno: (-raw.result).min(i32::MAX as i64) as i32,
             }
-            KIND_OPEN_EXIT => {
-                if raw.flags & FLAG_STATE_MISSING != 0 {
-                    issues.push(QualityIssue::MissingOutcome);
-                }
-                let outcome = if raw.flags & FLAG_STATE_MISSING != 0 {
-                    OpenOutcome::Unknown
-                } else if raw.result < 0 {
-                    OpenOutcome::Failed {
-                        errno: (-raw.result).min(i32::MAX as i64) as i32,
-                    }
-                } else if raw.result <= i32::MAX as i64 {
-                    OpenOutcome::Succeeded {
-                        fd: raw.result as i32,
-                    }
-                } else {
-                    issues.push(QualityIssue::InvalidEvent);
-                    OpenOutcome::Unknown
-                };
-                TelemetryPayload::FileOpenOutcome {
-                    attempt_id: self.attempt(raw.pid, raw.attempt_ns),
-                    outcome,
-                }
+        } else if raw.result <= i32::MAX as i64 {
+            OpenOutcome::Succeeded {
+                fd: raw.result as i32,
             }
-            KIND_EXEC => TelemetryPayload::ProcessExec {
-                exec_generation: raw.exec_generation,
-            },
-            KIND_EXIT => {
-                if let Some(key) = &process {
-                    self.seen.remove(key);
-                }
-                TelemetryPayload::ProcessExit
-            }
-            KIND_SOCKET => {
-                let key = (raw.socket_address, raw.socket_generation);
-                if !self.sockets.contains_key(&key) && self.sockets.len() >= 4096 {
-                    self.sockets.clear();
-                    result.push(self.envelope(
-                        raw.timestamp_ns,
-                        None,
-                        None,
-                        TelemetryPayload::ObservationGap {
-                            dropped: 1,
-                            reason: QualityIssue::StateEvicted,
-                        },
-                        vec![QualityIssue::StateEvicted],
-                    ));
-                }
-                let identity = *self.sockets.entry(key).or_insert_with(|| {
-                    self.socket_sequence += 1;
-                    self.socket_sequence
-                });
-                let socket = SocketIdentity {
-                    net_namespace: self.net_namespace,
-                    kernel_identity: identity,
-                    generation: raw.socket_generation,
-                    kind: SocketIdentityKind::OpaqueKernelIdentity,
-                };
-                // inet_sock_set_state has no namespace ID. This PoC is initial
-                // namespace scoped; unproven namespace/writer attribution remains unknown.
-                issues.push(QualityIssue::SocketAmbiguous);
-                if raw.socket_state == 7 {
-                    self.sockets.remove(&key);
-                }
-                match raw.socket_state {
-                    // SYN_SENT can be emitted before the kernel assigns the
-                    // ephemeral port. The established transition retains the
-                    // original connector and supplies the completed tuple.
-                    1 | 2 if raw.source_port != 0 => {
-                        let Some(client) = address(raw.family, raw.source_address, raw.source_port)
-                        else {
-                            return result;
-                        };
-                        let Some(local) =
-                            address(raw.family, raw.destination_address, raw.destination_port)
-                        else {
-                            return result;
-                        };
-                        issues.push(QualityIssue::MissingWriter);
-                        TelemetryPayload::SocketConnect {
-                            socket,
-                            tuple: SocketTuple {
-                                net_namespace: self.net_namespace,
-                                client,
-                                local,
-                            },
-                            binding: ProcessBinding::Connector,
-                        }
-                    }
-                    1 => TelemetryPayload::SocketLifecycle {
-                        socket,
-                        state: SocketState::Connected,
-                    },
-                    7 => TelemetryPayload::SocketLifecycle {
-                        socket,
-                        state: SocketState::Closed,
-                    },
-                    _ => return result,
-                }
-            }
-            _ => return result,
+        } else {
+            issues.push(QualityIssue::InvalidEvent);
+            OpenOutcome::Unknown
         };
-        result.push(self.envelope(raw.timestamp_ns, process, Some(raw.pid), payload, issues));
-        result
+        TelemetryPayload::FileOpenOutcome {
+            attempt_id: self.attempt(raw.pid, raw.attempt_ns),
+            outcome,
+        }
+    }
+
+    fn record_socket_identity(
+        &mut self,
+        raw: &RawSyscallEvent,
+        result: &mut Vec<TelemetryEnvelope>,
+    ) -> SocketIdentity {
+        let key = (raw.socket_address, raw.socket_generation);
+        if !self.sockets.contains_key(&key) && self.sockets.len() >= 4096 {
+            self.sockets.clear();
+            result.push(self.envelope(
+                raw.timestamp_ns,
+                None,
+                None,
+                TelemetryPayload::ObservationGap {
+                    dropped: 1,
+                    reason: QualityIssue::StateEvicted,
+                },
+                vec![QualityIssue::StateEvicted],
+            ));
+        }
+        let identity = *self.sockets.entry(key).or_insert_with(|| {
+            self.socket_sequence += 1;
+            self.socket_sequence
+        });
+        let socket = SocketIdentity {
+            net_namespace: self.net_namespace,
+            kernel_identity: identity,
+            generation: raw.socket_generation,
+            kind: SocketIdentityKind::OpaqueKernelIdentity,
+        };
+        if raw.socket_state == 7 {
+            self.sockets.remove(&key);
+        }
+        socket
+    }
+
+    fn socket_payload(
+        &self,
+        raw: &RawSyscallEvent,
+        socket: SocketIdentity,
+        issues: &mut Vec<QualityIssue>,
+    ) -> Option<TelemetryPayload> {
+        // inet_sock_set_state has no namespace ID. This PoC is initial
+        // namespace scoped; unproven namespace/writer attribution remains unknown.
+        issues.push(QualityIssue::SocketAmbiguous);
+        Some(match raw.socket_state {
+            // SYN_SENT can be emitted before the kernel assigns the
+            // ephemeral port. The established transition retains the
+            // original connector and supplies the completed tuple.
+            1 | 2 if raw.source_port != 0 => {
+                let client = address(raw.family, raw.source_address, raw.source_port)?;
+                let local = address(raw.family, raw.destination_address, raw.destination_port)?;
+                issues.push(QualityIssue::MissingWriter);
+                TelemetryPayload::SocketConnect {
+                    socket,
+                    tuple: SocketTuple {
+                        net_namespace: self.net_namespace,
+                        client,
+                        local,
+                    },
+                    binding: ProcessBinding::Connector,
+                }
+            }
+            1 => TelemetryPayload::SocketLifecycle {
+                socket,
+                state: SocketState::Connected,
+            },
+            7 => TelemetryPayload::SocketLifecycle {
+                socket,
+                state: SocketState::Closed,
+            },
+            _ => return None,
+        })
     }
 
     fn attempt(&self, tid: u32, time: u64) -> String {
@@ -299,17 +351,7 @@ fn file_role(path: &str) -> FileRole {
 mod tests {
     use super::*;
     fn collector() -> Collector {
-        Collector {
-            session: "s".into(),
-            boot: "b".into(),
-            source: "c".into(),
-            pid_namespace: 1,
-            net_namespace: 2,
-            sequence: 0,
-            seen: BTreeSet::new(),
-            sockets: BTreeMap::new(),
-            socket_sequence: 0,
-        }
+        Collector::fixture()
     }
     fn raw() -> RawSyscallEvent {
         let mut raw: RawSyscallEvent = unsafe { std::mem::zeroed() };

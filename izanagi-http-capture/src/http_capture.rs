@@ -106,6 +106,40 @@ pub(crate) async fn parse_http_request<S: AsyncRead + Unpin>(
     max_body_bytes: usize,
     src: SocketAddr,
 ) -> anyhow::Result<ParsedRequest> {
+    let (buf, total, header_end) = read_request_header(stream).await?;
+
+    let header_bytes = &buf[..header_end];
+    let header_str = String::from_utf8_lossy(header_bytes);
+
+    let (method, path) = parse_request_line(&header_str);
+
+    // ヘッダーを (key, value) リストとしてパース
+    let mut headers = Vec::new();
+    for line in header_str.lines().skip(1) {
+        if let Some((k, v)) = line.split_once(':') {
+            headers.push((k.trim().to_string(), v.trim().to_string()));
+        }
+    }
+
+    let host = extract_header(&header_str, "host");
+    let content_length =
+        extract_header(&header_str, "content-length").and_then(|v| v.parse::<u64>().ok());
+
+    let body = read_request_body(stream, &buf[..total], content_length, max_body_bytes, src).await;
+
+    Ok(ParsedRequest {
+        method,
+        path,
+        host,
+        content_length,
+        body,
+        headers,
+    })
+}
+
+async fn read_request_header<S: AsyncRead + Unpin>(
+    stream: &mut S,
+) -> anyhow::Result<(Vec<u8>, usize, usize)> {
     let mut buf = vec![0u8; 8192];
     let mut total = 0;
     let header_end;
@@ -135,30 +169,21 @@ pub(crate) async fn parse_http_request<S: AsyncRead + Unpin>(
         }
     }
 
-    let header_bytes = &buf[..header_end];
-    let header_str = String::from_utf8_lossy(header_bytes);
+    Ok((buf, total, header_end))
+}
 
-    let (method, path) = parse_request_line(&header_str);
-
-    // ヘッダーを (key, value) リストとしてパース
-    let mut headers = Vec::new();
-    for line in header_str.lines().skip(1) {
-        if let Some((k, v)) = line.split_once(':') {
-            headers.push((k.trim().to_string(), v.trim().to_string()));
-        }
-    }
-
-    let host = extract_header(&header_str, "host");
-    let content_length =
-        extract_header(&header_str, "content-length").and_then(|v| v.parse::<u64>().ok());
-
-    let body = if let Some(cl) = content_length {
+async fn read_request_body<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    buf: &[u8],
+    content_length: Option<u64>,
+    max_body_bytes: usize,
+    src: SocketAddr,
+) -> Vec<u8> {
+    if let Some(cl) = content_length {
         if cl > 0 {
             let to_read = (cl as usize).min(max_body_bytes);
-            let header_with_sep = find_header_end(&buf[..total])
-                .map(|p| p + 4)
-                .unwrap_or(total);
-            let already_read = &buf[header_with_sep..total];
+            let header_with_sep = find_header_end(buf).map(|p| p + 4).unwrap_or(buf.len());
+            let already_read = &buf[header_with_sep..];
             let mut body = already_read.to_vec();
 
             // 要求サイズに達するまでループで読み切る
@@ -181,16 +206,7 @@ pub(crate) async fn parse_http_request<S: AsyncRead + Unpin>(
         }
     } else {
         Vec::new()
-    };
-
-    Ok(ParsedRequest {
-        method,
-        path,
-        host,
-        content_length,
-        body,
-        headers,
-    })
+    }
 }
 
 /// 403 Forbidden レスポンスを書き込む。
@@ -230,6 +246,46 @@ fn extract_header(header: &str, key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn parser_limits_prefetched_and_separately_read_bodies_equally() {
+        let header = b"POST /upload HTTP/1.1\r\nHost: example.test\r\nContent-Length: 8\r\n\r\n";
+        let mut bytes = header.to_vec();
+        bytes.extend_from_slice(b"12345678extra");
+        for split in [header.len(), bytes.len()] {
+            let mut input =
+                std::io::Cursor::new(&bytes[..split]).chain(std::io::Cursor::new(&bytes[split..]));
+            let parsed = parse_http_request(&mut input, 4, "127.0.0.1:1".parse().unwrap())
+                .await
+                .unwrap();
+            assert_eq!(parsed.method, "POST");
+            assert_eq!(parsed.path, "/upload");
+            assert_eq!(parsed.host.as_deref(), Some("example.test"));
+            assert_eq!(parsed.content_length, Some(8));
+            assert_eq!(parsed.body, b"1234");
+        }
+    }
+
+    #[tokio::test]
+    async fn parser_keeps_a_short_body_on_eof() {
+        let mut input = std::io::Cursor::new(b"POST / HTTP/1.1\r\nContent-Length: 8\r\n\r\n123");
+        let parsed = parse_http_request(&mut input, 8, "127.0.0.1:1".parse().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(parsed.body, b"123");
+    }
+
+    #[tokio::test]
+    async fn parser_rejects_empty_incomplete_and_oversized_headers() {
+        for bytes in [Vec::new(), b"GET / HTTP/1.1\r\n".to_vec(), vec![b'x'; 8193]] {
+            let mut input = std::io::Cursor::new(bytes);
+            assert!(
+                parse_http_request(&mut input, 8, "127.0.0.1:1".parse().unwrap())
+                    .await
+                    .is_err()
+            );
+        }
+    }
 
     #[test]
     fn parse_request_line_get() {
