@@ -368,7 +368,8 @@ private file persistence, DNS/IP restrictions and secret-free telemetry.
 Local final checks on macOS pass:
 
 - Root and all seven component/tool manifests: `cargo fmt -- --check`.
-- Root all-target tests: 402 library, 78 binary and 51 integration tests.
+- Root all-target tests: 402 library, 78 binary and 51 integration tests; the follow-up adds one
+  authenticated CLI-display integration regression (52 total).
 - All five userspace components: `cargo check --offline --all-targets`.
 - HTTP/TLS: all 64 tests, including 12 added regressions across this PR.
 - Root Linux cross-target all-target/all-feature Clippy with `-D warnings`.
@@ -385,6 +386,18 @@ review and secret scanning. Existing HTTP legacy dead-code/argument-count and
 collapsible-condition warnings are outside the root Clippy gate and do not
 prevent its component check/test; no new argument-count warning remains.
 
-The follow-up commit only finalizes this audit record. Merge of
+The final CodeQL aggregation reported a path-sensitive logging warning even
+though its extraction/analysis job succeeded: the SARIF flow runs from
+`validate_cli_auth`'s result through `load_cli_config`'s tuple to the displayed
+configuration path. The authentication validator returns only `Result<()>` and
+never returns credential bytes. Authentication validation and verbose reporting
+now run in the caller after loading/validation, in the identical order, keeping
+credential-check results separate from returned configuration data. No warning
+suppression or logging behavior change is introduced. Five config integration
+tests and Linux all-feature Clippy pass; the added subprocess regression verifies
+missing credentials stop before verbose/config output, authenticated display
+succeeds, and credential canaries never appear in either output stream.
+
+Merge of
 [PR #52](https://github.com/ieee0824/izanagi/pull/52) is gated on its final-head
 CI, Security and CodeQL results; their authoritative state is available on the PR.

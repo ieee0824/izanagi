@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
@@ -493,6 +493,8 @@ pub(crate) async fn run_with(cli: Cli) -> anyhow::Result<u8> {
 
 async fn run_configured(cli: Cli) -> anyhow::Result<u8> {
     let (config_path, config) = load_cli_config(&cli)?;
+    validate_cli_auth(&config)?;
+    report_cli_config(&cli, &config, &config_path);
 
     // サブコマンド分岐
     match cli.command {
@@ -547,15 +549,15 @@ fn load_cli_config(cli: &Cli) -> anyhow::Result<(PathBuf, Config)> {
         anyhow::bail!("behavior analysis and raw --pcap capture cannot be enabled together");
     }
 
-    validate_cli_auth(&config)?;
+    Ok((config_path, config))
+}
 
+fn report_cli_config(cli: &Cli, config: &Config, config_path: &Path) {
     if cli.verbose {
         eprintln!("設定ファイル: {:?}", config_path);
         eprintln!("バックエンド: {:?}", config.sandbox.backend);
         eprintln!("トレーサー: {:?}", config.sandbox.tracer);
     }
-
-    Ok((config_path, config))
 }
 
 fn validate_cli_auth(config: &Config) -> anyhow::Result<()> {
