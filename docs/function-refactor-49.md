@@ -322,9 +322,29 @@ unchanged. The 59 component tests pass; a new regression verifies certificate
 output occurs before invalid mapping failure and logger setup. All-target check
 and formatting pass with the same legacy unused-path warnings.
 
-## Outstanding work
+### HTTP metadata forwarding and MITM lifecycle
 
-The remaining inventory contains six HTTP-capture functions requiring
-responsibility decomposition and the documented declarative telemetry exception.
-Full fmt/check/test and Linux/feature CI gates, final inventory, PR and merge
-remain required before closing #49.
+All six remaining original HTTP candidates and every new helper are below
+50 lines. Metadata forwarding separates absolute targets, header-name/framing
+validation, upstream request construction, bounded response reading, response
+validation/writing, socket identity, request/outcome emission and configuration
+validation. MITM separates TLS setup, accepted-connection scheduling, handshake,
+decrypted HTTP parsing, allowlist routing, substitution/forwarding and original
+request logging. Timeouts, permits, error priority, partial byte counts, HEAD
+content length, capture-before-forward behavior and secret-free logging are
+preserved. Public interfaces remain unchanged.
+
+All 64 HTTP component tests pass on macOS. Five new regressions cover ambiguous
+response framing, HEAD length versus invalid GET bodies before any write,
+partial failed-transfer counters/policy classification, port parsing fallback,
+and malformed/idle TLS handshakes. All-target check and formatting pass.
+Component Clippy succeeds with existing unused-path, public argument-count and
+collapsible-condition warnings; the extracted forwarder introduces no new
+argument-count warning. The final syntax inventory contains only the documented
+50-line declarative telemetry snapshot constructor.
+
+## Final verification pending
+
+All production candidates have been decomposed. Full fmt/check/test and
+Linux/feature CI gates at the final head, final scope audit, PR reviewability and
+merge remain required before closing #49.
