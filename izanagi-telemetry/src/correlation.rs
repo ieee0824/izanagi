@@ -710,47 +710,86 @@ fn bind_socket(
     events: &[&TelemetryEnvelope],
     state: &mut SnapshotEvidence,
 ) -> (Option<ProcessKey>, ProcessBinding) {
-    let SnapshotEvidence { quality, evidence } = state;
     let (process, binding) = if candidates.len() == 1 {
-        let connection = candidates[0];
-        evidence.insert(connection.event_id.clone());
-        let TelemetryPayload::SocketConnect {
-            binding, socket, ..
-        } = &connection.payload
-        else {
-            unreachable!()
-        };
-        let shared = events.iter().any(|e| {
-            e.observed_monotonic_ns >= connection.observed_monotonic_ns
-                && e.observed_monotonic_ns <= post.observed_monotonic_ns
-                && matches!(&e.payload, TelemetryPayload::SocketLifecycle { socket: changed,
-                    state: SocketState::Shared | SocketState::Transferred } if changed == socket)
-        });
-        for issue in &connection.quality.issues {
-            add_issue(quality, *issue);
+        bind_connection(post, candidates[0], events, state)
+    } else {
+        add_issue(&mut state.quality, QualityIssue::SocketAmbiguous);
+        (None, ProcessBinding::Unknown)
+    };
+    if process.is_none() {
+        add_issue(&mut state.quality, QualityIssue::MissingProcessIdentity);
+    }
+    (process, binding)
+}
+
+fn bind_connection(
+    post: &TelemetryEnvelope,
+    connection: &TelemetryEnvelope,
+    events: &[&TelemetryEnvelope],
+    state: &mut SnapshotEvidence,
+) -> (Option<ProcessKey>, ProcessBinding) {
+    let SnapshotEvidence { quality, evidence } = state;
+    evidence.insert(connection.event_id.clone());
+    let TelemetryPayload::SocketConnect {
+        binding, socket, ..
+    } = &connection.payload
+    else {
+        unreachable!()
+    };
+    let shared = socket_shared(post, connection, socket, events);
+    let proof = crate::stream_writer::prove(post, connection, events);
+    let proven = matches!(&proof, Ok(Some(_)));
+    record_connection_quality(connection, proven, quality);
+    if shared {
+        add_issue(quality, QualityIssue::SocketShared);
+    }
+    if *binding != ProcessBinding::ConfirmedWriter && !proven {
+        add_issue(quality, QualityIssue::MissingWriter);
+    }
+    match proof {
+        Ok(Some((writer, ids))) if !shared => {
+            evidence.extend(ids);
+            (Some(writer), ProcessBinding::ConfirmedWriter)
         }
-        if shared {
-            add_issue(quality, QualityIssue::SocketShared);
+        Err(issue) => {
+            add_issue(quality, issue);
+            (connection.process.clone(), ProcessBinding::Unknown)
         }
-        if *binding != ProcessBinding::ConfirmedWriter {
-            add_issue(quality, QualityIssue::MissingWriter);
-        }
-        (
+        _ => (
             connection.process.clone(),
             if shared {
                 ProcessBinding::Unknown
             } else {
                 *binding
             },
-        )
-    } else {
-        add_issue(quality, QualityIssue::SocketAmbiguous);
-        (None, ProcessBinding::Unknown)
-    };
-    if process.is_none() {
-        add_issue(quality, QualityIssue::MissingProcessIdentity);
+        ),
     }
-    (process, binding)
+}
+
+fn record_connection_quality(
+    connection: &TelemetryEnvelope,
+    proven: bool,
+    quality: &mut ObservationQuality,
+) {
+    for issue in &connection.quality.issues {
+        if !proven || *issue != QualityIssue::MissingWriter {
+            add_issue(quality, *issue);
+        }
+    }
+}
+
+fn socket_shared(
+    post: &TelemetryEnvelope,
+    connection: &TelemetryEnvelope,
+    socket: &SocketIdentity,
+    events: &[&TelemetryEnvelope],
+) -> bool {
+    events.iter().any(|e| {
+        e.observed_monotonic_ns >= connection.observed_monotonic_ns
+            && e.observed_monotonic_ns <= post.observed_monotonic_ns
+            && matches!(&e.payload, TelemetryPayload::SocketLifecycle { socket: changed,
+                state: SocketState::Shared | SocketState::Transferred } if changed == socket)
+    })
 }
 
 fn record_observation_quality(e: &TelemetryEnvelope, state: &mut SnapshotEvidence) {

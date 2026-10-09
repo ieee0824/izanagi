@@ -9,7 +9,6 @@ pub(crate) struct Collector {
     boot: String,
     source: String,
     pid_namespace: u64,
-    net_namespace: u64,
     sequence: u64,
     seen: BTreeSet<ProcessKey>,
     sockets: BTreeMap<(u64, u64), u64>,
@@ -35,7 +34,6 @@ impl Collector {
             boot,
             source: format!("ebpf-{:032x}", rand::random::<u128>()),
             pid_namespace: initial,
-            net_namespace: std::fs::metadata("/proc/self/ns/net")?.ino(),
             sequence: 0,
             seen: BTreeSet::new(),
             sockets: BTreeMap::new(),
@@ -50,7 +48,6 @@ impl Collector {
             boot: "b".into(),
             source: "c".into(),
             pid_namespace: 1,
-            net_namespace: 2,
             sequence: 0,
             seen: BTreeSet::new(),
             sockets: BTreeMap::new(),
@@ -128,7 +125,7 @@ impl Collector {
                 }
                 TelemetryPayload::ProcessExit
             }
-            KIND_SOCKET => {
+            KIND_SOCKET | KIND_SOCKET_WRITE => {
                 let socket = self.record_socket_identity(raw, &mut result);
                 let Some(payload) = self.socket_payload(raw, socket, &mut issues) else {
                     return result;
@@ -266,7 +263,7 @@ impl Collector {
             self.socket_sequence
         });
         let socket = SocketIdentity {
-            net_namespace: self.net_namespace,
+            net_namespace: raw.net_namespace,
             kernel_identity: identity,
             generation: raw.socket_generation,
             kind: SocketIdentityKind::OpaqueKernelIdentity,
@@ -283,9 +280,12 @@ impl Collector {
         socket: SocketIdentity,
         issues: &mut Vec<QualityIssue>,
     ) -> Option<TelemetryPayload> {
-        // inet_sock_set_state has no namespace ID. This PoC is initial
-        // namespace scoped; unproven namespace/writer attribution remains unknown.
-        issues.push(QualityIssue::SocketAmbiguous);
+        if raw.net_namespace == 0 {
+            issues.push(QualityIssue::SocketAmbiguous);
+        }
+        if raw.kind == KIND_SOCKET_WRITE {
+            return socket_write_payload(raw, socket);
+        }
         Some(match raw.socket_state {
             // SYN_SENT can be emitted before the kernel assigns the
             // ephemeral port. The established transition retains the
@@ -297,7 +297,7 @@ impl Collector {
                 TelemetryPayload::SocketConnect {
                     socket,
                     tuple: SocketTuple {
-                        net_namespace: self.net_namespace,
+                        net_namespace: raw.net_namespace,
                         client,
                         local,
                     },
@@ -319,6 +319,21 @@ impl Collector {
     fn attempt(&self, tid: u32, time: u64) -> String {
         format!("{}:{}:open:{}:{}", self.session, self.source, tid, time)
     }
+}
+
+fn socket_write_payload(raw: &RawSyscallEvent, socket: SocketIdentity) -> Option<TelemetryPayload> {
+    let client = address(raw.family, raw.source_address, raw.source_port)?;
+    let local = address(raw.family, raw.destination_address, raw.destination_port)?;
+    Some(TelemetryPayload::SocketWrite {
+        socket,
+        tuple: SocketTuple {
+            net_namespace: raw.net_namespace,
+            client,
+            local,
+        },
+        stream_start: raw.stream_start,
+        stream_end: raw.stream_end,
+    })
 }
 
 fn address(family: u16, bytes: [u8; 16], port: u16) -> Option<SocketAddr> {

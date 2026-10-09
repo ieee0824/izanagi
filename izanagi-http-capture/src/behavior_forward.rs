@@ -509,6 +509,7 @@ async fn handle(
     let Some(tuple) = connection_tuple(&client) else {
         return;
     };
+    let mut stream_offset = 0;
     for sequence in 0..128u64 {
         let request = match tokio::time::timeout(config.timeout, read_request(&mut client)).await {
             Ok(Ok(Some(r))) => r,
@@ -519,19 +520,19 @@ async fn handle(
             }
         };
         let id = format!("{}:{}", connection_id, sequence);
-        emit_request(&tx, &config, &request, &connection_id, &id, &tuple);
-        let mut counts = ForwardCounts::default();
-        let result = tokio::time::timeout(
-            config.timeout,
-            forward(&config, &request, &mut client, &mut counts),
-        )
-        .await;
-        let success = match result {
-            Ok(Ok(value)) => Some(value),
-            _ => None,
+        let Some(end) = emit_complete_request(
+            &tx,
+            &config,
+            &request,
+            &connection_id,
+            &id,
+            &tuple,
+            stream_offset,
+        ) else {
+            break;
         };
-        emit_outcome(&tx, &config, &request, id, &counts, success);
-        if success.is_none() {
+        stream_offset = end;
+        if !forward_request(&tx, &config, &request, id, &mut client).await {
             reject(&mut client, 502).await;
             break;
         }
@@ -539,6 +540,27 @@ async fn handle(
             break;
         }
     }
+}
+
+async fn forward_request(
+    tx: &mpsc::Sender<SidecarRecord>,
+    config: &ForwardConfig,
+    request: &Request,
+    id: String,
+    client: &mut TcpStream,
+) -> bool {
+    let mut counts = ForwardCounts::default();
+    let result = tokio::time::timeout(
+        config.timeout,
+        forward(config, request, client, &mut counts),
+    )
+    .await;
+    let success = match result {
+        Ok(Ok(value)) => Some(value),
+        _ => None,
+    };
+    emit_outcome(tx, config, request, id, &counts, success);
+    success.is_some()
 }
 
 fn connection_tuple(client: &TcpStream) -> Option<SocketTuple> {
@@ -587,6 +609,32 @@ fn emit_request(
             raw_host: Some(request.host.clone()),
         },
     );
+}
+
+fn emit_complete_request(
+    tx: &mpsc::Sender<SidecarRecord>,
+    config: &ForwardConfig,
+    request: &Request,
+    connection_id: &str,
+    id: &str,
+    tuple: &SocketTuple,
+    stream_start: u64,
+) -> Option<u64> {
+    let stream_end = stream_start.checked_add(request.received_bytes)?;
+    if stream_end > izanagi_telemetry::MAX_STREAM_BYTES {
+        return None;
+    }
+    emit(
+        tx,
+        TelemetryPayload::HttpStreamRange {
+            connection_id: connection_id.to_owned(),
+            request_id: id.to_owned(),
+            stream_start,
+            stream_end,
+        },
+    );
+    emit_request(tx, config, request, connection_id, id, tuple);
+    Some(stream_end)
 }
 
 fn emit_outcome(
@@ -869,9 +917,19 @@ mod tests {
         while let Some(r) = rx.recv().await {
             records.push(r);
         }
-        assert_eq!(records.len(), 4);
+        assert_eq!(records.len(), 6);
         assert!(
-            matches!(&records[1].payload,TelemetryPayload::HttpOutcome{client_bytes_received,outcome:TransferOutcome::Completed,..} if *client_bytes_received==first.len() as u64)
+            matches!(&records[2].payload,TelemetryPayload::HttpOutcome{client_bytes_received,outcome:TransferOutcome::Completed,..} if *client_bytes_received==first.len() as u64)
+        );
+        assert!(
+            matches!(&records[0].payload, TelemetryPayload::HttpStreamRange {
+            stream_start: 0, stream_end, ..
+        } if *stream_end == first.len() as u64)
+        );
+        assert!(
+            matches!(&records[3].payload, TelemetryPayload::HttpStreamRange {
+            stream_start, stream_end, ..
+        } if *stream_start == first.len() as u64 && *stream_end == (first.len() + second.len()) as u64)
         );
         let json = serde_json::to_string(&records).unwrap();
         assert!(!json.contains("CANARY"));

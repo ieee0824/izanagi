@@ -11,6 +11,8 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 #[cfg(feature = "ebpf")]
 mod abi;
+#[cfg(any(all(target_os = "linux", feature = "ebpf"), test))]
+mod kernel_layout;
 #[cfg(all(target_os = "linux", feature = "ebpf"))]
 mod linux;
 #[cfg(feature = "ebpf")]
@@ -435,6 +437,9 @@ mod tests {
                 flags: 0,
                 source_address: [0; 16],
                 destination_address: [0; 16],
+                net_namespace: 0,
+                stream_start: 0,
+                stream_end: 0,
             };
             let comm_len = comm.len().min(16);
             event.comm[..comm_len].copy_from_slice(&comm[..comm_len]);

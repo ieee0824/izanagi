@@ -4,6 +4,8 @@ use izanagi_telemetry::{AuditStore, StoreConfig, TelemetryEnvelope};
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, path::PathBuf, process::Command};
 
+mod support;
+
 fn fixtures() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/behavior")
 }
@@ -78,14 +80,9 @@ fn remote_export_requires_explicit_flag_and_uses_closed_projection() {
     let granted = command()
         .args(["behavior", "replay", "--input"])
         .arg(input)
-        .args([
-            "--classifier",
-            "jev-mcp",
-            "--allow-export",
-            "--mcp-command",
-            "python3",
-            "--mcp-arg",
-        ])
+        .args(["--classifier", "jev-mcp", "--allow-export", "--mcp-command"])
+        .arg(support::python())
+        .arg("--mcp-arg")
         .arg(fixtures().join("mock_mcp.py"))
         .args(["--mcp-arg", "normal"])
         .output()

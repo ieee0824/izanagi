@@ -326,12 +326,8 @@ fn forward_record(
             *lost = 0;
         }
     }
-    let issues = if matches!(record.payload, TelemetryPayload::HttpRequest { .. }) {
-        vec![QualityIssue::MissingWriter]
-    } else {
-        vec![]
-    };
-    let event = source.envelope(record.observed_monotonic_ns, record.payload, issues);
+    // Writer eligibility belongs to the host's kernel/HTTP byte-range proof.
+    let event = source.envelope(record.observed_monotonic_ns, record.payload, vec![]);
     if tx.try_send(event).is_err() {
         *lost += 1;
     }
@@ -342,6 +338,7 @@ fn allowed_payload(payload: &TelemetryPayload) -> bool {
         payload,
         TelemetryPayload::HttpRequest { .. }
             | TelemetryPayload::HttpOutcome { .. }
+            | TelemetryPayload::HttpStreamRange { .. }
             | TelemetryPayload::ObservationGap { .. }
             | TelemetryPayload::CollectorHealth { .. }
     )

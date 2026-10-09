@@ -149,3 +149,15 @@ eBPF と HTTP が共有する優先枠により HTTP が滞留し、さらに遅
 | guest sidecar 配置と lifecycle | Makefile/Packer 配置、Packer validate、同版の実 guest 起動/stop |
 
 実 VM artifacts は `/private/tmp/izanagi-jev-vm-39-final-3/`。認証キーは artifact/manifest/projection に保存しません。Jev は必須ではなく、機能は既定で無効・有効化時も mock が既定。実 Jev は追加の export opt-in がある場合だけ起動します。
+
+## 2026-10-09: issues #54–#56 の回帰検証
+
+修正前に絶対パス制約、MCP 子孫終了、Connector から実送信範囲を証明する回帰テストが失敗することを確認し、修正後に成功した。MCP は絶対パスのみ許可し、Unix の専用プロセスグループを成功・不正応答・タイムアウト・キャンセル時に終了する。自ら別セッションへ逃れる悪意ある実行ファイルの隔離を保証する機能ではない。
+
+TCP の成功送信範囲と HTTP proxy の受信リクエスト範囲を照合する。BTF による構造体と関数シグネチャの検証が失敗すると監視起動を拒否する。raw kernel ABI は 2 のため agent と eBPF object を一緒に更新する。
+
+macOS ARM64 の root 536 tests、agent 42、HTTP 64、telemetry 27、common (`--features user`) 8 が成功した。root clippy `-D warnings`、各変更 component の rustfmt、Linux GNU guest と no_std eBPF のクロスビルドも成功した。Linux 専用 feature の lint/test は PR CI で確認する。
+
+Debian aarch64 / Linux `6.12.74+deb13+1-arm64` の専用 QEMU overlay で `tests/manual/behavior_vm.py` を実行した。通常 POST と資格情報アクセス試行後の keep-alive POST の計 4 件は confirmed_writer・quality 問題なしとなり、mock 分類が成功した。fork 共有と SCM_RIGHTS による親子の分割送信 2 件は socket_shared として棄権した。HTTP canary の本文・header・path は audit に残らなかった。shell の終了コード 7・端末復元、監視消失時の up/exec/shell の失敗と約 0.61 秒での状態解放も成功した。
+
+同じ VM の metadata audit を実 Jev `jev-1.13.0` で replay し、正常 2 件は分類成功、アクセス後 POST 2 件は低 confidence により棄権した。混在送信 2 件は incomplete_observation で API 前に棄権した。API キーはローカル MCP 設定から子プロセス環境へ渡し、記録していない。この少数のシナリオは実装経路の確認であり、分類精度の測定ではない。

@@ -28,7 +28,7 @@ baseline_hosts = []
 
 [behavior.classifier]
 provider = "mock"                # mock | jev-mcp (mock does not call an API)
-command = "jev-mcp"
+command = "jev-mcp"              # For jev-mcp, replace with a trusted absolute executable path.
 args = []
 credential_env = "TYPESAFE_API_KEY" # Name only. Never place an API key in TOML or args.
 model = "jev-1.13.0"

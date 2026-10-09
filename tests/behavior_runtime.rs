@@ -133,6 +133,7 @@ async fn real_provider_requires_export_opt_in_and_invalid_session_is_reported() 
     let calls = Arc::new(AtomicU64::new(0));
     let mut cfg = config();
     cfg.classifier.provider = "jev-mcp".into();
+    cfg.classifier.command = "/provider-must-not-be-started".into();
     let mut runtime = BehaviorRuntime::spawn_with_classifier(
         &cfg,
         vec![],

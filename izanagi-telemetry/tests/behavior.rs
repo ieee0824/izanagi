@@ -139,6 +139,99 @@ fn replay(events: Vec<TelemetryEnvelope>, config: CorrelationConfig) -> FeatureS
     results.into_values().last().unwrap()
 }
 
+fn writer_payload(start: u64, end: u64) -> TelemetryPayload {
+    serde_json::from_value(serde_json::json!({"SocketWrite": {
+        "socket": socket(2), "tuple": tuple(), "stream_start": start, "stream_end": end
+    }}))
+    .unwrap()
+}
+
+fn writer_fixture() -> Vec<TelemetryEnvelope> {
+    let mut events = fixture(ProcessBinding::Connector);
+    events[3].quality.issues.push(QualityIssue::MissingWriter);
+    for index in [4, 5] {
+        events[index].source_seq += 1;
+        events[index].event_id = events[index].expected_event_id();
+    }
+    events.push(event(
+        "http",
+        1,
+        2_900_000_000,
+        None,
+        serde_json::from_value(serde_json::json!({"HttpStreamRange": {
+            "request_id": "request-1", "connection_id": "connection-1",
+            "stream_start": 0, "stream_end": 8
+        }}))
+        .unwrap(),
+    ));
+    events.push(event(
+        "ebpf",
+        5,
+        2_500_000_000,
+        Some(process(42, 1)),
+        writer_payload(0, 4),
+    ));
+    events.push(event(
+        "ebpf",
+        6,
+        2_600_000_000,
+        Some(process(42, 1)),
+        writer_payload(4, 8),
+    ));
+    events
+}
+
+#[test]
+fn complete_stream_range_proves_writer_without_promoting_connector() {
+    let snapshot = replay(writer_fixture(), CorrelationConfig::default());
+    assert_eq!(snapshot.binding, ProcessBinding::ConfirmedWriter);
+    assert_eq!(snapshot.process, Some(process(42, 1)));
+    assert!(
+        snapshot.projection(FeatureMode::Correlated).eligible(),
+        "{snapshot:?}"
+    );
+}
+
+#[test]
+fn incomplete_mixed_or_mismatched_stream_writers_remain_ineligible() {
+    for mode in [
+        "gap",
+        "mixed",
+        "namespace",
+        "generation",
+        "loss",
+        "missing_identity",
+        "overlap",
+    ] {
+        let mut events = writer_fixture();
+        let last = events.last_mut().unwrap();
+        match mode {
+            "gap" => last.payload = writer_payload(5, 8),
+            "mixed" => last.process = Some(process(43, 1)),
+            "loss" => last.quality.issues.push(QualityIssue::EventLoss),
+            "missing_identity" => last.process = None,
+            "overlap" => last.payload = writer_payload(3, 8),
+            _ => {
+                let mut value = serde_json::to_value(&last.payload).unwrap();
+                if mode == "namespace" {
+                    value["SocketWrite"]["tuple"]["net_namespace"] = 8.into();
+                } else {
+                    value["SocketWrite"]["socket"]["generation"] = 3.into();
+                }
+                last.payload = serde_json::from_value(value).unwrap();
+            }
+        }
+        if events.last().unwrap().validate().is_err() {
+            events.pop(); // Invalid namespace proof is rejected at ingestion.
+        }
+        let snapshot = replay(events, CorrelationConfig::default());
+        assert!(
+            !snapshot.projection(FeatureMode::Correlated).eligible(),
+            "{mode}"
+        );
+    }
+}
+
 #[test]
 fn transfer_interval_gaps_and_socket_sharing_remain_in_evidence() {
     for payload in [

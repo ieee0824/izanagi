@@ -49,6 +49,6 @@ IZANAGI_SECRET_FILE=/absolute/path/to/test-key \
 
 Python 3.11 以上、macOS の PTY と QEMU HVF を使用する。停止した fixture instance から開始し、通常系列と資格情報参照系列それぞれで約 31 秒の startup lookback 除外後に POST を送る。通常 down に加え、再起動後に専用 QEMU 子プロセスを停止して monitor loss と exec/shell/up の失敗・state 削除も確認する。`finally` で shell と VM を停止する。再実行は新しい artifact directory を使用する。
 
-`observed-events-second.jsonl`、`results-second.json`、`resources.json`、`shell-results.json`、`up-second.log` を保存する。host は 0.5 秒間隔の RSS と `ps` の lifetime `%cpu`、guest は実行前後の RSS/CPU、HTTP は各系列 2 requests の round-trip 時間を記録する。これらを profiler の瞬時 CPU、推論時間、一般性能と呼ばない。overlay/collector/host/fixture の SHA256 と source commit は実行前に別途記録する。
+`observed-events-second.jsonl`、`results-second.json`、`writer-negative-results.json`、`resources.json`、`shell-results.json`、`up-second.log` を保存する。host は 0.5 秒間隔の RSS と `ps` の lifetime `%cpu`、guest は実行前後の RSS/CPU、HTTP は各系列 2 requests の round-trip 時間を記録する。これらを profiler の瞬時 CPU、推論時間、一般性能と呼ばない。overlay/collector/host/fixture の SHA256 と source commit は実行前に別途記録する。
 
-現在の Linux collector は connector を観測するが、writer と namespace の完全な証明はない。試験は open/POST の関連を確認しつつ、ライブ C の結果が `Abstained` であることも確認する。通常 install/build や広い攻撃集合の精度は、この 4 requests から推定しない。
+Linux collector は成功した `tcp_sendmsg_locked` の送信範囲と実 socket namespace を取得する。kernel BTF の layout・関数 signature 検証と writer probe の装着が開始条件。raw ABI v2 の agent/object を使う。試験は正例 4 requests が `ConfirmedWriter` で mock 分類されることを確認する。続いて fork/dup と SCM_RIGHTS により同じ HTTP リクエストの header/body を別プロセスで送り、転送は完了しても複数 writer として棄権することを確認する。欠落や unsupported な転送を成功した writer proof に昇格させない。通常 install/build や広い攻撃集合の精度は、この小さな試験から推定しない。

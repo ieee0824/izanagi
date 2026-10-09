@@ -196,6 +196,22 @@ pub enum TelemetryPayload {
     RuleMatch {
         rule_code: String,
     },
+    /// Successful TCP sends, scoped to one kernel socket incarnation. Byte
+    /// offsets count stream data from the completed handshake, excluding SYN.
+    SocketWrite {
+        socket: SocketIdentity,
+        tuple: SocketTuple,
+        stream_start: u64,
+        stream_end: u64,
+    },
+    /// Proxy-parsed request bounds; separate variant preserves existing wire
+    /// discriminants and layouts for legacy HttpRequest / HttpOutcome records.
+    HttpStreamRange {
+        connection_id: String,
+        request_id: String,
+        stream_start: u64,
+        stream_end: u64,
+    },
 }
 
 /// A credential-checked sidecar cannot choose envelope or process identities.
@@ -263,6 +279,7 @@ impl TelemetryEnvelope {
 
     fn validate_payload(&self) -> Result<(), crate::TelemetryError> {
         use crate::TelemetryError;
+        self.validate_stream_payload()?;
         match &self.payload {
             TelemetryPayload::ProcessFork { parent, child }
                 if !self.valid_process(parent)
@@ -300,6 +317,43 @@ impl TelemetryEnvelope {
                 return Err(TelemetryError::InvalidEvent);
             }
             _ => {}
+        }
+        Ok(())
+    }
+
+    fn validate_stream_payload(&self) -> Result<(), crate::TelemetryError> {
+        use crate::TelemetryError;
+        let range = match &self.payload {
+            TelemetryPayload::SocketWrite {
+                socket,
+                tuple,
+                stream_start,
+                stream_end,
+            } => {
+                if socket.net_namespace == 0
+                    || socket.net_namespace != tuple.net_namespace
+                    || socket.generation == 0
+                    || socket.kernel_identity == 0
+                {
+                    return Err(TelemetryError::InvalidEvent);
+                }
+                Some((*stream_start, *stream_end))
+            }
+            TelemetryPayload::HttpStreamRange {
+                connection_id,
+                request_id,
+                stream_start,
+                stream_end,
+            } => {
+                if !valid_id(connection_id) || !valid_id(request_id) {
+                    return Err(TelemetryError::InvalidEvent);
+                }
+                Some((*stream_start, *stream_end))
+            }
+            _ => None,
+        };
+        if range.is_some_and(|(start, end)| start >= end || end > crate::MAX_STREAM_BYTES) {
+            return Err(TelemetryError::InvalidEvent);
         }
         Ok(())
     }

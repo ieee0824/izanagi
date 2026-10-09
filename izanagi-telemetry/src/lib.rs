@@ -3,6 +3,7 @@ pub mod correlation;
 pub mod privacy;
 pub mod schema;
 pub mod store;
+mod stream_writer;
 
 pub use correlation::*;
 pub use privacy::*;
@@ -12,6 +13,8 @@ pub use store::*;
 pub const SCHEMA_VERSION: u16 = 1;
 pub const FEATURE_VERSION: u16 = 1;
 pub const MAX_PROJECTION_BYTES: usize = 8 * 1024;
+/// Well below TCP sequence wrap; proxy connections are capped at 128 requests.
+pub const MAX_STREAM_BYTES: u64 = 256 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TelemetryError {
