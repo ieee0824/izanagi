@@ -19,6 +19,7 @@ use aya_ebpf::{
 };
 use izanagi_common::*;
 use izanagi_common::{RawSyscallEvent, SyscallCategoryId, SyscallId};
+mod writer;
 
 /// ring buffer マップ。ユーザー空間とイベントデータを共有する。
 /// サイズは 256KB (65536 エントリ × 4 ページ)。
@@ -278,6 +279,7 @@ pub fn sys_exit_openat(ctx: TracePointContext) -> u32 {
     let id = aya_ebpf::helpers::bpf_get_current_pid_tgid();
     let attempt = unsafe { OPEN_ATTEMPTS.get(&id).copied() };
     let _ = OPEN_ATTEMPTS.remove(&id);
+    writer::process_exit(id);
     let Some(mut entry) = EVENTS.reserve::<RawSyscallEvent>(0) else {
         lost();
         return 1;
@@ -401,11 +403,12 @@ pub fn inet_sock_set_state(ctx: TracePointContext) -> u32 {
     if protocol != 6 {
         return 0;
     }
+    if state == 7 {
+        writer::close(address);
+    }
     let now = unsafe { aya_ebpf::helpers::bpf_ktime_get_ns() };
-    if state == 2 {
-        if record_connector(address, now).is_err() {
-            return 1;
-        }
+    if state == 2 && record_connector(address, now).is_err() {
+        return 1;
     }
     let generation = unsafe { SOCKET_GENERATIONS.get(&address).copied() };
     let Some(generation) = generation else {
@@ -422,6 +425,7 @@ pub fn inet_sock_set_state(ctx: TracePointContext) -> u32 {
             entry.discard(0);
             return 0;
         }
+        writer::socket_state(event, address, state);
     }
     entry.submit(0);
     if state == 7 {

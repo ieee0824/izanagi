@@ -11,6 +11,8 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 #[cfg(feature = "ebpf")]
 mod abi;
+#[cfg(any(all(target_os = "linux", feature = "ebpf"), test))]
+mod kernel_layout;
 #[cfg(all(target_os = "linux", feature = "ebpf"))]
 mod linux;
 #[cfg(feature = "ebpf")]

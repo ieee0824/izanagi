@@ -164,6 +164,10 @@ API の shape は [API reference](https://docs.typesafe.ai/api) に従う。MCP 
 
 Jev MCP の command は operator が信頼する絶対パスを必須とし、PATH/cwd による暗黙解決を拒否する。mock/recorded は外部実行しないためこの制約の対象外。Unix では MCP を専用 process group で起動し、成功・失敗・timeout・cancel 時に group を停止して直接の子を回収する。これは通常の子孫の lifecycle 管理であり、悪意ある provider の setsid 等による離脱を防ぐ OS 隔離ではない。
 
+writer のライブ証明は TCP 接続世代・socket の net namespace・process 起動世代と stream byte range を使う。`tcp_sendmsg_locked` の entry/return を照合し、write_seq の差分が成功 byte 数と一致した場合だけ `SocketWrite` を生成する。proxy は header/body をすべて受信したリクエストの `HttpStreamRange` を別イベントで出す。単一 process の write events が gap/overlap なく全範囲を覆う場合だけ ConfirmedWriter とする。Fast Open や handshake 前の send は byte zero を再定義せず unproven に固定する。blocking send の lock 解放中の interleave は sequence 差分が一致しないため proof を生成しない。範囲は 256 MiB、proxy は 128 requests に制限し TCP sequence の再周回を対象外とする。両イベントは enum の末尾へ追加し既存 wire v3 の variant/layout を維持する。raw ABI は v2 へ変更し、古い eBPF object を明示拒否する。旧 audit/fixture は従来の形式で再生できる。
+
+socket field と tcp_sendmsg_locked signature は実 kernel BTF で検証する。64-bit little-endian kernel と対象の型・関数がない場合は監視開始を拒否し、固定オフセットへ fallback しない。この証明は本文を読まないため、credential open の成功と関連送信があっても情報流出の確定ではない。TCP repair・非 HTTP proxy・未観測の経路を含む広い workload の精度保証には使わない。
+
 - [behavior]: enabled=false、audit only、backend capability と各上限。
 - [behavior.classifier]: provider=mock/jev-mcp、model、profile、command/args、API credential の env 名。秘密値を TOML に書かない。MCP commit は operator が別途確認して指定する。未確認の commit は null と保存し、参考実装の commit を実行版と偽らない。質問 digest と feature/question/host policy 版、usage も監査に保存する。
 - [behavior.classifier].allow_export: 外部 TypeSafe API への送信を明示許可。許可する特徴フィールドは型の固定 projection で制限する。

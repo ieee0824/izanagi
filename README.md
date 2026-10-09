@@ -206,7 +206,7 @@ izanagi behavior evaluate --manifest tests/fixtures/behavior/manifest.json \
 
 ライブ収集は `[behavior] enabled = true` で明示的に有効化します。Jev のライブ送信には `[behavior.classifier] provider = "jev-mcp"` と `allow_export = true` が必要です。設定例は [configs/default.toml](configs/default.toml)、設計と検証は [行動分析設計](docs/jev-behavior-analysis-design.md)・[検証記録](docs/jev-behavior-validation.md) を参照してください。行動分析と raw `--pcap` の併用は拒否します。
 
-guest には同じ版の `izanagi-agent` と eBPF object に加え、root 所有・非特権ユーザーから書き換え不能な `/usr/local/bin/izanagi-http-capture` が必要です。guest exec/shell に `http_proxy` / `HTTP_PROXY` を設定しますが、proxy を使用しない通信はこの PoC の対象外です。現在の kernel 観測は connector を識別し、writer / namespace の証明が不足するライブ window を明示的に棄権します。実モデルの小規模試験でも D に対する改善は確認できていないため、運用判定へ昇格させていません。評価 manifest に feature/host policy 版と監査専用の昇格方針を保存し、応答には質問 digest と usage を残します。MCP commit は operator が別途確認した版を `--mcp-commit` / `behavior.classifier.mcp_commit` で指定でき、未確認の場合は null と記録します。
+guest には同じ版の `izanagi-agent` と eBPF object に加え、root 所有・非特権ユーザーから書き換え不能な `/usr/local/bin/izanagi-http-capture` が必要です。guest exec/shell に `http_proxy` / `HTTP_PROXY` を設定しますが、proxy を使用しない通信はこの PoC の対象外です。kernel が観測した成功した TCP 送信の byte range と、proxy が受信した HTTP リクエストの全範囲を照合し、単一 writer を確認できる場合だけライブ分類へ進みます。namespace は実行中の kernel BTF で検証した socket の情報を使います。欠落、複数 writer、Fast Open、未対応の kernel layout 等では分類を棄権するか監視開始を拒否します。raw ABI は v2 のため agent と eBPF object を一緒に更新してください。実モデルの小規模試験でも D に対する改善は確認できていないため、運用判定へ昇格させていません。評価 manifest に feature/host policy 版と監査専用の昇格方針を保存し、応答には質問 digest と usage を残します。MCP commit は operator が別途確認した版を `--mcp-commit` / `behavior.classifier.mcp_commit` で指定でき、未確認の場合は null と記録します。
 
 境界 fixture の比較は `tests/fixtures/behavior/boundary-manifest.json`、実 VM での再検証手順は [tests/manual/README.md](tests/manual/README.md) を参照してください。
 
