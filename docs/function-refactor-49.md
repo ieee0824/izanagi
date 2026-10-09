@@ -12,7 +12,17 @@ the starting main commit `0857e26` (after the shared-helper consolidation in #51
 The issue's original reference is `de356ea`; its three large shell test functions
 are excluded, along with other test-only definitions. No issue production
 candidate is dropped from scope. `function-refactor-49-remaining.tsv` records the
-latest remaining definitions, including helpers introduced by this work.
+final remaining definitions, including helpers introduced by this work.
+
+The syntax audit was repeated against the issue reference `de356ea`: it finds
+79 production candidates, exactly the same file/function set as the starting
+main baseline. All 79 were decomposed; no production candidate was excluded.
+The remaining inventory has one entry: the new 50-line declarative
+`finish_snapshot` helper, justified below.
+
+The per-component validation notes below record checks performed during
+implementation. The final verification section supersedes earlier pending-CI
+notes.
 
 ## Completed responsibilities
 
@@ -343,8 +353,38 @@ collapsible-condition warnings; the extracted forwarder introduces no new
 argument-count warning. The final syntax inventory contains only the documented
 50-line declarative telemetry snapshot constructor.
 
-## Final verification pending
+## Final verification
 
-All production candidates have been decomposed. Full fmt/check/test and
-Linux/feature CI gates at the final head, final scope audit, PR reviewability and
-merge remain required before closing #49.
+The final implementation is `a84f542`. All 79 original production candidates and
+all newly extracted production helpers are below 50 physical lines except the
+single justified `finish_snapshot` constructor (50 lines). The checked-in final
+inventory is reproduced by the command in `tools/function-audit/README.md`.
+The public signature diff contains only internal host-eBPF module helpers and
+a cfg(test) collector fixture; existing public APIs and wire definitions are
+unchanged. Tests and source review cover error ordering, authentication,
+startup rollback, cancellation, process/PTY cleanup, bounded queues/output,
+private file persistence, DNS/IP restrictions and secret-free telemetry.
+
+Local final checks on macOS pass:
+
+- Root and all seven component/tool manifests: `cargo fmt -- --check`.
+- Root all-target tests: 402 library, 78 binary and 51 integration tests.
+- All five userspace components: `cargo check --offline --all-targets`.
+- HTTP/TLS: all 64 tests, including 12 added regressions across this PR.
+- Root Linux cross-target all-target/all-feature Clippy with `-D warnings`.
+- Kernel eBPF no_std release build and before/after ELF inspection, as described
+  above. This is build/code-generation validation, not a live privileged kernel
+  load/verifier test.
+
+[CI run 37864255646](https://github.com/ieee0824/izanagi/actions/runs/37864255646)
+at `a84f542` passes all ten jobs: root Linux tests with `landlock,ebpf`, root
+macOS tests, all five component test suites, common no-default-features check,
+agent eBPF feature check, actual no_std BPF release build, formatting and
+all-feature/all-target Clippy. The associated Security workflow passes dependency
+review and secret scanning. Existing HTTP legacy dead-code/argument-count and
+collapsible-condition warnings are outside the root Clippy gate and do not
+prevent its component check/test; no new argument-count warning remains.
+
+The follow-up commit only finalizes this audit record. Merge of
+[PR #52](https://github.com/ieee0824/izanagi/pull/52) is gated on its final-head
+CI, Security and CodeQL results; their authoritative state is available on the PR.
