@@ -294,10 +294,26 @@ optimization. No extracted helper remains as an independent function. This
 confirms inlining/code-generation scope, not a live kernel-verifier/load test.
 Linux CI no_std build remains required at the final head.
 
+### HTTP request parsing, HTTPS upstream and TLS SNI
+
+Four original HTTP-capture candidates and all new helpers are below 50 lines.
+Header/body reads, public-address resolution/selection, bounded upstream response
+reading, extra-header construction and ClientHello prefix/extension parsing now
+have separate responsibilities. Existing body caps, EOF/error handling, first
+public address selection, one overall forwarding timeout, CRLF sanitation and
+SNI bounds-check ordering remain unchanged.
+
+All 58 component tests pass on macOS, including six added regressions: prefetched
+versus separately read body caps, short-body EOF, invalid/oversized headers,
+empty/private/mixed upstream address selection, the exact 1 MiB response limit,
+and every truncated ClientHello prefix plus oversized extensions. Component
+all-target check and formatting pass; existing unused legacy SNI/logger warnings
+remain. CI at `8ee22b1` passes all standard CI and secret scanning; final-head
+Linux/no_std and CodeQL gates remain required.
+
 ## Outstanding work
 
-The remaining inventory is work to complete, except explicitly documented
-declarative exceptions. Other tracer, MCP/CLI, sandbox and
-proxy candidates still require decomposition and appropriate boundary tests.
+The remaining inventory contains seven HTTP-capture functions requiring
+responsibility decomposition and the documented declarative telemetry exception.
 Full fmt/check/test and Linux/feature CI gates, final inventory, PR and merge
 remain required before closing #49.
