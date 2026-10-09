@@ -1,6 +1,8 @@
 use std::net::Ipv4Addr;
 
-use hickory_proto::op::{Message, MessageType, OpCode, ResponseCode};
+#[cfg(test)]
+use hickory_proto::op::MessageType;
+use hickory_proto::op::{Message, OpCode, ResponseCode};
 use hickory_proto::rr::rdata::A;
 use hickory_proto::rr::{RData, Record, RecordType};
 
@@ -18,15 +20,15 @@ pub fn build_blocked_response(query: &Message, dummy_ip: Ipv4Addr) -> Message {
     }
 
     // A レコードのクエリにのみダミー IP で応答する
-    if let Some(q) = query.queries.first() {
-        if q.query_type() == RecordType::A {
-            let record = Record::from_rdata(
-                q.name().clone(),
-                60, // TTL 60秒
-                RData::A(A(dummy_ip)),
-            );
-            resp.add_answer(record);
-        }
+    if let Some(q) = query.queries.first()
+        && q.query_type() == RecordType::A
+    {
+        let record = Record::from_rdata(
+            q.name().clone(),
+            60, // TTL 60秒
+            RData::A(A(dummy_ip)),
+        );
+        resp.add_answer(record);
         // AAAA, MX, TXT 等は NODATA（空の Answer セクション）
     }
 

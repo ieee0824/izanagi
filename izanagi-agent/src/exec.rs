@@ -55,116 +55,116 @@ pub(crate) async fn execute_command(
     // EXEC_USER が存在するか確認（結果はキャッシュされる）
     let use_su = check_exec_user_exists().await;
 
-    let mut child = if use_su {
-        // 非特権ユーザーとしてコマンドを実行。
-        // su を使わず pre_exec 内で直接 setgid/setuid + prctl を行うことで、
-        // exec 後も PR_SET_DUMPABLE=0 が維持され /proc/self/environ が保護される。
-        // (su 経由だと su の exec 時に dumpable がリセットされる問題を回避)
-        let cmd_str = cmd
-            .iter()
-            .map(|s| shell_escape(s))
-            .collect::<Vec<_>>()
-            .join(" ");
+    let mut child = spawn_exec(cmd, &env, use_su)?;
+    collect_exec_output(&mut child, EXEC_TIMEOUT_SECS).await
+}
 
-        let exec_user = EXEC_USER.to_string();
-        let mut command = tokio::process::Command::new("/bin/sh");
-        command
-            .args(["-c", &cmd_str])
-            .env_clear()
-            .envs(&env)
-            .env("PATH", "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")
-            .env("HOME", format!("/home/{}", EXEC_USER))
-            .env("USER", EXEC_USER)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        #[cfg(unix)]
-        {
-            #[allow(unused_imports)]
-            use std::os::unix::process::CommandExt;
-            unsafe {
-                command.pre_exec(move || {
-                    // 新しいプロセスグループを作成（タイムアウト時に孫プロセスも含めて kill するため）
-                    if libc::setsid() == -1 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    // 非特権ユーザーに権限降格
-                    let c_user = std::ffi::CString::new(exec_user.as_str())
-                        .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
-                    let pw = libc::getpwnam(c_user.as_ptr());
-                    if pw.is_null() {
-                        return Err(std::io::Error::from_raw_os_error(libc::ENOENT));
-                    }
-                    if libc::setgid((*pw).pw_gid) != 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    if libc::setuid((*pw).pw_uid) != 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    // /proc/self/environ のパーミッションを制限。
-                    // setuid 後かつ exec 前に設定するため、exec される /bin/sh と
-                    // その子プロセス (node 等) でも dumpable=0 が維持される。
-                    #[cfg(target_os = "linux")]
-                    if libc::prctl(libc::PR_SET_DUMPABLE, 0 as libc::c_ulong) != 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    Ok(())
-                });
-            }
-        }
-        command.spawn().map_err(|e| sanitize_exec_error(&e))?
-    } else {
+fn spawn_exec(
+    cmd: &[String],
+    env: &HashMap<String, String>,
+    user_exists: bool,
+) -> Result<tokio::process::Child> {
+    if !user_exists {
         anyhow::bail!(
             "execution user '{}' not found. Refusing to execute as root.",
             EXEC_USER
         );
-    };
+    }
+    // 非特権ユーザーとしてコマンドを実行。
+    // su を使わず pre_exec 内で直接 setgid/setuid + prctl を行うことで、
+    // exec 後も PR_SET_DUMPABLE=0 が維持され /proc/self/environ が保護される。
+    // (su 経由だと su の exec 時に dumpable がリセットされる問題を回避)
+    let cmd_str = cmd
+        .iter()
+        .map(|s| shell_escape(s))
+        .collect::<Vec<_>>()
+        .join(" ");
 
-    // stdout/stderr のハンドルを取り出す（wait と並行読み取りするため所有権を分離）
-    let child_stdout = child.stdout.take();
-    let child_stderr = child.stderr.take();
+    let mut command = tokio::process::Command::new("/bin/sh");
+    command
+        .args(["-c", &cmd_str])
+        .env_clear()
+        .envs(env)
+        .env("PATH", "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")
+        .env("HOME", format!("/home/{}", EXEC_USER))
+        .env("USER", EXEC_USER)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    configure_exec_credentials(&mut command);
+    command.spawn().map_err(|e| sanitize_exec_error(&e))
+}
 
-    // タイムアウト付きで子プロセスの完了を待つ
-    let timeout_secs = EXEC_TIMEOUT_SECS;
-    let timeout_duration = std::time::Duration::from_secs(timeout_secs);
+fn configure_exec_credentials(command: &mut tokio::process::Command) {
+    #[cfg(unix)]
+    {
+        #[allow(unused_imports)]
+        use std::os::unix::process::CommandExt;
+        let exec_user = EXEC_USER.to_string();
+        unsafe {
+            command.pre_exec(move || drop_exec_privileges(&exec_user));
+        }
+    }
+}
 
-    // stdout/stderr の読み取りと wait を並行実行（デッドロック防止）
-    //
-    // take(MAX_OUTPUT_SIZE + 1) でメモリ使用量を制限する (#190)。
-    // +1 バイトで truncation を検出し、後段の truncate_output() で正確に切り詰める。
-    // take() 後も残りのストリームを drain して、子プロセスがパイプ詰まりで
-    // ハングするのを防止する。
+#[cfg(unix)]
+fn drop_exec_privileges(exec_user: &str) -> std::io::Result<()> {
+    // Preserve the child setup order: session, group, user, then dumpability.
+    unsafe {
+        // 新しいプロセスグループを作成（タイムアウト時に孫プロセスも含めて kill するため）
+        if libc::setsid() == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // 非特権ユーザーに権限降格
+        let c_user = std::ffi::CString::new(exec_user)
+            .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+        let pw = libc::getpwnam(c_user.as_ptr());
+        if pw.is_null() {
+            return Err(std::io::Error::from_raw_os_error(libc::ENOENT));
+        }
+        if libc::setgid((*pw).pw_gid) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if libc::setuid((*pw).pw_uid) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // /proc/self/environ のパーミッションを制限。
+        // setuid 後かつ exec 前に設定するため、exec される /bin/sh と
+        // その子プロセス (node 等) でも dumpable=0 が維持される。
+        #[cfg(target_os = "linux")]
+        if libc::prctl(libc::PR_SET_DUMPABLE, 0 as libc::c_ulong) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+}
+
+async fn read_exec_pipe<R: tokio::io::AsyncRead + Unpin>(
+    pipe: Option<R>,
+) -> std::io::Result<Vec<u8>> {
     let read_limit = (MAX_OUTPUT_SIZE + 1) as u64;
+    let mut buf = Vec::with_capacity(read_limit as usize);
+    if let Some(mut pipe) = pipe {
+        let mut limited = (&mut pipe).take(read_limit);
+        tokio::io::AsyncReadExt::read_to_end(&mut limited, &mut buf).await?;
+        // Drain beyond the retained cap to prevent pipe backpressure deadlocks.
+        tokio::io::copy(&mut pipe, &mut tokio::io::sink()).await?;
+    }
+    Ok(buf)
+}
+
+async fn collect_exec_output(
+    child: &mut tokio::process::Child,
+    timeout_secs: u64,
+) -> Result<(i32, Vec<u8>, Vec<u8>)> {
+    // Own both pipes before concurrently waiting and reading.
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
     let wait_fut = async {
-        let stdout_fut = async {
-            let mut buf = Vec::with_capacity(read_limit as usize);
-            if let Some(mut out) = child_stdout {
-                let mut limited = (&mut out).take(read_limit);
-                tokio::io::AsyncReadExt::read_to_end(&mut limited, &mut buf).await?;
-                // 残りを読み捨ててパイプ詰まりを防止
-                tokio::io::copy(&mut out, &mut tokio::io::sink()).await?;
-            }
-            Ok::<_, std::io::Error>(buf)
-        };
-        let stderr_fut = async {
-            let mut buf = Vec::with_capacity(read_limit as usize);
-            if let Some(mut err) = child_stderr {
-                let mut limited = (&mut err).take(read_limit);
-                tokio::io::AsyncReadExt::read_to_end(&mut limited, &mut buf).await?;
-                // 残りを読み捨ててパイプ詰まりを防止
-                tokio::io::copy(&mut err, &mut tokio::io::sink()).await?;
-            }
-            Ok::<_, std::io::Error>(buf)
-        };
-
-        let (status, stdout_result, stderr_result) =
-            tokio::join!(child.wait(), stdout_fut, stderr_fut);
-        let status = status?;
-        let stdout_buf = stdout_result?;
-        let stderr_buf = stderr_result?;
-        Ok::<_, anyhow::Error>((status, stdout_buf, stderr_buf))
+        let (status, stdout, stderr) =
+            tokio::join!(child.wait(), read_exec_pipe(stdout), read_exec_pipe(stderr));
+        Ok::<_, anyhow::Error>((status?, stdout?, stderr?))
     };
-
-    match tokio::time::timeout(timeout_duration, wait_fut).await {
+    match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), wait_fut).await {
         Ok(Ok((status, stdout_buf, stderr_buf))) => {
             let stdout = truncate_output(stdout_buf);
             let stderr = truncate_output(stderr_buf);
@@ -177,19 +177,7 @@ pub(crate) async fn execute_command(
             anyhow::bail!(EXEC_ERROR_PREFIX);
         }
         Err(_) => {
-            // タイムアウト: プロセスグループ全体を kill して孫プロセスも含めて停止する
-            #[cfg(unix)]
-            if let Some(pid) = child.id()
-                && let Ok(pid_i32) = i32::try_from(pid)
-            {
-                // 負の PID でプロセスグループ全体に SIGKILL を送信
-                unsafe {
-                    libc::kill(-pid_i32, libc::SIGKILL);
-                }
-                // i32 変換失敗時は child.kill() にフォールバック
-            }
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+            kill_exec_group(child).await;
             eprintln!(
                 "WARNING: command timed out after {} seconds, killed process group",
                 timeout_secs
@@ -197,6 +185,22 @@ pub(crate) async fn execute_command(
             Ok((-1, Vec::new(), b"timeout".to_vec()))
         }
     }
+}
+
+async fn kill_exec_group(child: &mut tokio::process::Child) {
+    // タイムアウト: プロセスグループ全体を kill して孫プロセスも含めて停止する
+    #[cfg(unix)]
+    if let Some(pid) = child.id()
+        && let Ok(pid_i32) = i32::try_from(pid)
+    {
+        // 負の PID でプロセスグループ全体に SIGKILL を送信
+        unsafe {
+            libc::kill(-pid_i32, libc::SIGKILL);
+        }
+        // i32 変換失敗時は child.kill() にフォールバック
+    }
+    let _ = child.kill().await;
+    let _ = child.wait().await;
 }
 
 /// 環境変数 `IZANAGI_ALLOWED_COMMANDS` によるコマンド allowlist を検証する。
@@ -243,6 +247,42 @@ fn check_command_allowlist(cmd: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn large_output_is_drained_and_both_streams_are_truncated() {
+        let size = MAX_OUTPUT_SIZE + 1024;
+        let mut child = tokio::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                &format!("head -c {size} /dev/zero; head -c {size} /dev/zero >&2"),
+            ])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let (code, stdout, stderr) = super::collect_exec_output(&mut child, 5).await.unwrap();
+        assert_eq!(code, 0);
+        for output in [stdout, stderr] {
+            assert_eq!(output.len(), MAX_OUTPUT_SIZE + b"\n[truncated]".len());
+            assert!(output.ends_with(b"\n[truncated]"));
+        }
+        assert!(child.id().is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timed_out_command_is_killed_and_reaped() {
+        let mut child = tokio::process::Command::new("/bin/sh")
+            .args(["-c", "exec sleep 60"])
+            .process_group(0)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let result = super::collect_exec_output(&mut child, 0).await.unwrap();
+        assert_eq!(result, (-1, Vec::new(), b"timeout".to_vec()));
+        assert!(child.id().is_none());
+    }
+
     use super::*;
 
     /// 環境変数を操作するテストの排他制御用。テストの並行実行で競合を防ぐ。

@@ -6,6 +6,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
+type AuditSegment = (u64, PathBuf, u64);
+
 #[derive(Debug, Clone)]
 pub struct StoreConfig {
     pub max_session_bytes: u64,
@@ -43,6 +45,32 @@ pub struct AuditRecord {
     /// first retained record after rotation. Never silently reported as complete.
     pub storage_gap: bool,
     pub payload: AuditPayload,
+}
+
+impl AuditRecord {
+    fn validate(&self) -> Result<(), TelemetryError> {
+        match &self.payload {
+            AuditPayload::Event(event) => {
+                if sanitize_event(event)? != *event {
+                    return Err(TelemetryError::MalformedRecord);
+                }
+            }
+            AuditPayload::Assessment {
+                snapshot,
+                projection_digest,
+                rule_class,
+            } => {
+                if sanitize_snapshot(snapshot)? != *snapshot
+                    || snapshot.projection(FeatureMode::Correlated).digest()? != *projection_digest
+                    || deterministic_rule(snapshot) != *rule_class
+                {
+                    return Err(TelemetryError::MalformedRecord);
+                }
+            }
+            AuditPayload::Classification(record) => record.validate()?,
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -104,19 +132,12 @@ pub struct ClassificationAudit {
 
 impl ClassificationAudit {
     pub fn validate(&self) -> Result<(), TelemetryError> {
-        let valid_model = |model: &str| {
-            model == "mock"
-                || model == "mock-v1"
-                || model == "recorded"
-                || model == "recorded-v1"
-                || model.strip_prefix("jev-").is_some_and(|v| {
-                    let parts: Vec<_> = v.split('.').collect();
-                    parts.len() == 3
-                        && parts.iter().all(|p| {
-                            !p.is_empty() && p.len() <= 5 && p.bytes().all(|b| b.is_ascii_digit())
-                        })
-                })
-        };
+        self.validate_metadata()?;
+        self.validate_probabilities()?;
+        self.validate_status()
+    }
+
+    fn validate_metadata(&self) -> Result<(), TelemetryError> {
         if !valid_local_id(&self.session_id)
             || !valid_local_id(&self.window_id)
             || self.projection_digest.len() != 64
@@ -145,6 +166,10 @@ impl ClassificationAudit {
         {
             return Err(TelemetryError::InvalidEvent);
         }
+        Ok(())
+    }
+
+    fn validate_probabilities(&self) -> Result<(), TelemetryError> {
         if let Some(probabilities) = self.probabilities
             && (probabilities
                 .iter()
@@ -170,6 +195,10 @@ impl ClassificationAudit {
                 return Err(TelemetryError::InvalidEvent);
             }
         }
+        Ok(())
+    }
+
+    fn validate_status(&self) -> Result<(), TelemetryError> {
         match self.status {
             ClassificationStatus::Classified
                 if self.class.is_none()
@@ -195,6 +224,20 @@ impl ClassificationAudit {
             _ => Ok(()),
         }
     }
+}
+
+fn valid_model(model: &str) -> bool {
+    model == "mock"
+        || model == "mock-v1"
+        || model == "recorded"
+        || model == "recorded-v1"
+        || model.strip_prefix("jev-").is_some_and(|v| {
+            let parts: Vec<_> = v.split('.').collect();
+            parts.len() == 3
+                && parts
+                    .iter()
+                    .all(|p| !p.is_empty() && p.len() <= 5 && p.bytes().all(|b| b.is_ascii_digit()))
+        })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -326,27 +369,7 @@ impl AuditStore {
                 }
                 let record: AuditRecord =
                     serde_json::from_slice(&line).map_err(|_| TelemetryError::MalformedRecord)?;
-                match &record.payload {
-                    AuditPayload::Event(event) => {
-                        if sanitize_event(event)? != *event {
-                            return Err(TelemetryError::MalformedRecord);
-                        }
-                    }
-                    AuditPayload::Assessment {
-                        snapshot,
-                        projection_digest,
-                        rule_class,
-                    } => {
-                        if sanitize_snapshot(snapshot)? != *snapshot
-                            || snapshot.projection(FeatureMode::Correlated).digest()?
-                                != *projection_digest
-                            || deterministic_rule(snapshot) != *rule_class
-                        {
-                            return Err(TelemetryError::MalformedRecord);
-                        }
-                    }
-                    AuditPayload::Classification(record) => record.validate()?,
-                }
+                record.validate()?;
                 records.push(record);
             }
         }
@@ -449,11 +472,30 @@ impl AuditStore {
         if bytes.len() > self.config.max_record_bytes {
             return Err(TelemetryError::Oversize);
         }
+        let (segments, capacity_removed) = self.make_record_room(bytes.len())?;
+        removed += capacity_removed;
+        if removed > 0 && !record.storage_gap {
+            record.storage_gap = true;
+            bytes = serde_json::to_vec(&record).map_err(|_| TelemetryError::InvalidEvent)?;
+            bytes.push(b'\n');
+        }
+        self.write_record(&segments, &bytes, now)?;
+        Ok(StoreWrite {
+            storage_gap: record.storage_gap,
+            removed_segments: removed,
+        })
+    }
+
+    fn make_record_room(
+        &mut self,
+        record_bytes: usize,
+    ) -> Result<(Vec<AuditSegment>, usize), TelemetryError> {
+        let mut removed = 0;
         let mut segments = self.segments()?;
         let mut total: u64 = segments.iter().map(|(_, _, size)| size).sum();
         // Remove old complete segments before writing. Retention guarantees a
         // bounded directory, and storage_gap persists in the new retained record.
-        while total.saturating_add(bytes.len() as u64) > self.config.max_session_bytes {
+        while total.saturating_add(record_bytes as u64) > self.config.max_session_bytes {
             let Some((generation, path, size)) = segments.first().cloned() else {
                 return Err(TelemetryError::Oversize);
             };
@@ -463,11 +505,15 @@ impl AuditStore {
             segments.remove(0);
             removed += 1;
         }
-        if removed > 0 && !record.storage_gap {
-            record.storage_gap = true;
-            bytes = serde_json::to_vec(&record).map_err(|_| TelemetryError::InvalidEvent)?;
-            bytes.push(b'\n');
-        }
+        Ok((segments, removed))
+    }
+
+    fn write_record(
+        &mut self,
+        segments: &[AuditSegment],
+        bytes: &[u8],
+        now: u64,
+    ) -> Result<(), TelemetryError> {
         let path = match segments.last() {
             Some((_, path, size))
                 if size.saturating_add(bytes.len() as u64) <= self.config.max_segment_bytes =>
@@ -480,7 +526,7 @@ impl AuditStore {
             None => self.dir.join("audit-0000000000000001.jsonl"),
         };
         let mut file = open_private(&path, true)?;
-        file.write_all(&bytes)
+        file.write_all(bytes)
             .and_then(|_| file.flush())
             .map_err(|_| TelemetryError::Io)?;
         let generation = path
@@ -492,13 +538,10 @@ impl AuditStore {
             .ok_or(TelemetryError::MalformedRecord)?;
         let newest = self.segment_newest.entry(generation).or_default();
         *newest = (*newest).max(now);
-        Ok(StoreWrite {
-            storage_gap: record.storage_gap,
-            removed_segments: removed,
-        })
+        Ok(())
     }
 
-    fn segments(&self) -> Result<Vec<(u64, PathBuf, u64)>, TelemetryError> {
+    fn segments(&self) -> Result<Vec<AuditSegment>, TelemetryError> {
         let mut segments = Vec::new();
         for entry in fs::read_dir(&self.dir).map_err(|_| TelemetryError::Io)? {
             let entry = entry.map_err(|_| TelemetryError::Io)?;

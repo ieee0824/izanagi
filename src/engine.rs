@@ -209,6 +209,43 @@ impl Engine {
         // tracer は sandbox 内のプロセスを監視するため、先に sandbox が Running である必要がある。
         self.sandbox.up(sandbox_config).await?;
 
+        let rx = self.start_monitoring_source(trace_filter).await?;
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        self.shutdown_tx = Some(shutdown_tx);
+
+        // Detector の参照を clone して監視ループに渡す。
+        // Arc を使うことで stop() → start() 後もルールが保持される。
+        let detector = Arc::clone(&self.detector);
+
+        // on_event / on_alert を Arc でラップし spawn_blocking に渡せるようにする。
+        // Box<dyn Fn + Send> → Arc<dyn Fn + Send + Sync> への変換は
+        // Mutex でラップして Sync を付与する。spawn_blocking の各呼び出しは
+        // 排他的に実行されるため安全。
+        let on_event = shared_event_handler(self.on_event.take());
+        let on_alert = shared_alert_handler(on_alert);
+
+        let (failure_tx, failure_rx) = tokio::sync::watch::channel(None);
+        self.monitoring_failure = failure_rx;
+        let tracer = Arc::clone(&self.tracer);
+        let handle = tokio::spawn(monitor_events(
+            rx,
+            shutdown_rx,
+            detector,
+            on_event,
+            on_alert,
+            tracer,
+            failure_tx,
+        ));
+
+        self.handle = Some(handle);
+        Ok(())
+    }
+
+    async fn start_monitoring_source(
+        &mut self,
+        trace_filter: &TraceFilter,
+    ) -> anyhow::Result<tokio::sync::mpsc::Receiver<Arc<SyscallEvent>>> {
         // QEMU バックエンド使用時、sandbox のセッショントークン・ポート・シークレットを tracer に渡す。
         // Sandbox の up() 後にトークンとポートが確定するため、ここで設定する。
         if let Some(token) = self.sandbox.session_token() {
@@ -229,116 +266,16 @@ impl Engine {
             }
         }
 
-        let mut rx = match self.tracer.start(trace_filter).await {
-            Ok(rx) => rx,
+        match self.tracer.start(trace_filter).await {
+            Ok(rx) => Ok(rx),
             Err(e) => {
                 // tracer の起動に失敗した場合、sandbox を停止してリソースリークを防ぐ
                 if let Err(down_err) = self.sandbox.down().await {
                     eprintln!("警告: sandbox の停止にも失敗しました: {}", down_err);
                 }
-                return Err(e.context("tracer の起動に失敗（sandbox は停止試行済み）"));
+                Err(e.context("tracer の起動に失敗（sandbox は停止試行済み）"))
             }
-        };
-
-        let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
-        self.shutdown_tx = Some(shutdown_tx);
-
-        // Detector の参照を clone して監視ループに渡す。
-        // Arc を使うことで stop() → start() 後もルールが保持される。
-        let detector = Arc::clone(&self.detector);
-
-        // on_event / on_alert を Arc でラップし spawn_blocking に渡せるようにする。
-        // Box<dyn Fn + Send> → Arc<dyn Fn + Send + Sync> への変換は
-        // Mutex でラップして Sync を付与する。spawn_blocking の各呼び出しは
-        // 排他的に実行されるため安全。
-        type EventHandler = Arc<dyn Fn(&SyscallEvent) + Send + Sync>;
-        let on_event: Option<EventHandler> = self.on_event.take().map(|h| {
-            let wrapper = std::sync::Mutex::new(h);
-            Arc::new(move |event: &SyscallEvent| {
-                if let Ok(handler) = wrapper.lock() {
-                    handler(event);
-                }
-            }) as Arc<dyn Fn(&SyscallEvent) + Send + Sync>
-        });
-
-        // on_alert も同様に Arc ラップし、spawn_blocking でオフロードする。
-        // LogStorage::store_alert 等の同期 I/O が tokio ワーカーをブロックするのを防止。
-        let on_alert: Arc<dyn Fn(&Alert) + Send + Sync> = {
-            let wrapper = std::sync::Mutex::new(on_alert);
-            Arc::new(move |alert: &Alert| {
-                if let Ok(handler) = wrapper.lock() {
-                    handler(alert);
-                }
-            })
-        };
-
-        let (failure_tx, failure_rx) = tokio::sync::watch::channel(None);
-        self.monitoring_failure = failure_rx;
-        let tracer = Arc::clone(&self.tracer);
-        let handle = tokio::spawn(async move {
-            // イベント処理総数のカウンタ。
-            // 一定件数ごとにチャネル長をチェックし、飽和状態を検知する。
-            //
-            // NOTE: check_interval と閾値 (capacity * 3/4) がローカル変数のため、
-            // 飽和検知ロジックの単体テストは現時点で困難。リファクタリング Phase で
-            // これらを設定値として外部注入可能にし、テストを追加すること。
-            // (tasks.db Phase 8 / task 320)
-            let mut total_events: u64 = 0;
-            let check_interval: u64 = 1000;
-            let capacity = crate::tracer::EVENT_CHANNEL_CAPACITY as u64;
-
-            loop {
-                tokio::select! {
-                    event = rx.recv() => {
-                        match event {
-                            Some(event) => {
-                                total_events += 1;
-
-                                // 定期的にチャネル長をチェックし、飽和を検知
-                                if total_events.is_multiple_of(check_interval) {
-                                    let pending = rx.len() as u64;
-                                    if pending > capacity * 3 / 4 {
-                                        eprintln!(
-                                            "警告: イベントチャネルが飽和状態です (バッファ: {}/{})。\
-                                             イベントの大量生成による検知回避の可能性があります。",
-                                            pending, capacity
-                                        );
-                                    }
-                                }
-
-                                // レダクション機構は SyscallArg::redacted_display() で適用済み。
-                                if let Some(ref handler) = on_event {
-                                    let handler = Arc::clone(handler);
-                                    let event = Arc::clone(&event);
-                                    tokio::task::spawn_blocking(move || {
-                                        handler(&event);
-                                    });
-                                }
-                                if let Some(alert) = detector.analyze(&event) {
-                                    let handler = Arc::clone(&on_alert);
-                                    let alert = alert.clone();
-                                    tokio::task::spawn_blocking(move || {
-                                        handler(&alert);
-                                    });
-                                }
-                            }
-                            None => {
-                                if tracer.requires_live_monitoring() {
-                                    failure_tx.send_replace(Some(tracer.failure_reason().unwrap_or_else(|| "trace event stream ended unexpectedly".into())));
-                                }
-                                break;
-                            }
-                        }
-                    }
-                    _ = &mut shutdown_rx => {
-                        break;
-                    }
-                }
-            }
-        });
-
-        self.handle = Some(handle);
-        Ok(())
+        }
     }
 
     /// トレーサーとサンドボックスを停止する。
@@ -418,6 +355,104 @@ impl Engine {
     /// 設定・セッション情報の取得用。実行は監視状態を確認する Engine::exec / shell を使う。
     pub fn sandbox(&self) -> &dyn Sandbox {
         self.sandbox.as_ref()
+    }
+}
+
+type SharedEventHandler = Arc<dyn Fn(&SyscallEvent) + Send + Sync>;
+type SharedAlertHandler = Arc<dyn Fn(&Alert) + Send + Sync>;
+
+fn shared_event_handler(handler: Option<EventHandler>) -> Option<SharedEventHandler> {
+    handler.map(|h| {
+        let wrapper = std::sync::Mutex::new(h);
+        Arc::new(move |event: &SyscallEvent| {
+            if let Ok(handler) = wrapper.lock() {
+                handler(event);
+            }
+        }) as Arc<dyn Fn(&SyscallEvent) + Send + Sync>
+    })
+}
+
+fn shared_alert_handler(on_alert: AlertHandler) -> SharedAlertHandler {
+    let wrapper = std::sync::Mutex::new(on_alert);
+    Arc::new(move |alert: &Alert| {
+        if let Ok(handler) = wrapper.lock() {
+            handler(alert);
+        }
+    })
+}
+
+fn warn_saturated_channel(total_events: u64, pending: usize) {
+    let capacity = crate::tracer::EVENT_CHANNEL_CAPACITY as u64;
+    // 定期的にチャネル長をチェックし、飽和を検知
+    if total_events.is_multiple_of(1000) {
+        let pending = pending as u64;
+        if pending > capacity * 3 / 4 {
+            eprintln!(
+                "警告: イベントチャネルが飽和状態です (バッファ: {}/{})。\
+                                             イベントの大量生成による検知回避の可能性があります。",
+                pending, capacity
+            );
+        }
+    }
+}
+
+fn dispatch_event(
+    event: &Arc<SyscallEvent>,
+    detector: &Detector,
+    on_event: &Option<SharedEventHandler>,
+    on_alert: &SharedAlertHandler,
+) {
+    // レダクション機構は SyscallArg::redacted_display() で適用済み。
+    if let Some(handler) = on_event {
+        let handler = Arc::clone(handler);
+        let event = Arc::clone(event);
+        tokio::task::spawn_blocking(move || {
+            handler(&event);
+        });
+    }
+    if let Some(alert) = detector.analyze(event) {
+        let handler = Arc::clone(on_alert);
+        let alert = alert.clone();
+        tokio::task::spawn_blocking(move || {
+            handler(&alert);
+        });
+    }
+}
+
+async fn monitor_events(
+    mut rx: tokio::sync::mpsc::Receiver<Arc<SyscallEvent>>,
+    mut shutdown_rx: oneshot::Receiver<()>,
+    detector: Arc<Detector>,
+    on_event: Option<SharedEventHandler>,
+    on_alert: SharedAlertHandler,
+    tracer: Arc<dyn Tracer>,
+    failure_tx: tokio::sync::watch::Sender<Option<String>>,
+) {
+    let mut total_events: u64 = 0;
+
+    loop {
+        tokio::select! {
+            event = rx.recv() => {
+                match event {
+                    Some(event) => {
+                        total_events += 1;
+
+                        warn_saturated_channel(total_events, rx.len());
+
+                        dispatch_event(&event, &detector, &on_event, &on_alert);
+                    }
+                    None => {
+                        if tracer.requires_live_monitoring() {
+                            failure_tx.send_replace(Some(tracer.failure_reason().unwrap_or_else(|| "trace event stream ended unexpectedly".into())));
+                        }
+                        break;
+                    }
+                }
+            }
+            _ = &mut shutdown_rx => {
+                break;
+            }
+        }
     }
 }
 

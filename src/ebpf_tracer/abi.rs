@@ -2,72 +2,107 @@
 use izanagi_common::{ABI_MAGIC, ABI_SECTION, RAW_ABI_VERSION, RAW_EVENT_SIZE};
 
 pub(crate) fn validate_object(bytes: &[u8]) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        bytes.len() >= 64 && bytes.starts_with(b"\x7fELF") && bytes[4] == 2 && bytes[5] == 1,
-        "unsupported eBPF ELF format"
-    );
-    fn number(bytes: &[u8], start: usize, length: usize) -> anyhow::Result<usize> {
-        let data = bytes
-            .get(
-                start
-                    ..start
-                        .checked_add(length)
-                        .ok_or_else(|| anyhow::anyhow!("invalid ELF offset"))?,
-            )
-            .ok_or_else(|| anyhow::anyhow!("truncated ELF"))?;
-        let mut array = [0; 8];
-        array[..length].copy_from_slice(data);
-        usize::try_from(u64::from_le_bytes(array)).map_err(Into::into)
-    }
-    let table = number(bytes, 40, 8)?;
-    let size = number(bytes, 58, 2)?;
-    let count = number(bytes, 60, 2)?;
-    let string_index = number(bytes, 62, 2)?;
-    anyhow::ensure!(
-        size >= 64 && count > 0 && count < 4096 && string_index < count,
-        "invalid ELF section table"
-    );
-    let end = table
-        .checked_add(
-            size.checked_mul(count)
-                .ok_or_else(|| anyhow::anyhow!("invalid ELF sections"))?,
-        )
-        .ok_or_else(|| anyhow::anyhow!("invalid ELF sections"))?;
-    anyhow::ensure!(end <= bytes.len(), "truncated ELF sections");
-    let header = table + size * string_index;
-    let offset = number(bytes, header + 24, 8)?;
-    let length = number(bytes, header + 32, 8)?;
-    let strings = bytes
+    let sections = ElfSections::parse(bytes)?;
+    validate_metadata(sections.abi_metadata()?)
+}
+
+fn number(bytes: &[u8], start: usize, length: usize) -> anyhow::Result<usize> {
+    let data = bytes
         .get(
-            offset
-                ..offset
+            start
+                ..start
                     .checked_add(length)
-                    .ok_or_else(|| anyhow::anyhow!("invalid ELF strings"))?,
+                    .ok_or_else(|| anyhow::anyhow!("invalid ELF offset"))?,
         )
-        .ok_or_else(|| anyhow::anyhow!("truncated ELF strings"))?;
-    let mut metadata = None;
-    for index in 0..count {
-        let header = table + size * index;
-        let name = number(bytes, header, 4)?;
-        let name = strings
-            .get(name..)
-            .and_then(|s| s.split(|b| *b == 0).next())
-            .ok_or_else(|| anyhow::anyhow!("invalid ELF section name"))?;
-        if name == ABI_SECTION.as_bytes() {
-            anyhow::ensure!(metadata.is_none(), "duplicate raw ABI section");
-            let offset = number(bytes, header + 24, 8)?;
-            let length = number(bytes, header + 32, 8)?;
-            metadata = bytes.get(
+        .ok_or_else(|| anyhow::anyhow!("truncated ELF"))?;
+    let mut array = [0; 8];
+    array[..length].copy_from_slice(data);
+    usize::try_from(u64::from_le_bytes(array)).map_err(Into::into)
+}
+
+struct ElfSections<'a> {
+    bytes: &'a [u8],
+    table: usize,
+    size: usize,
+    count: usize,
+    strings: &'a [u8],
+}
+impl<'a> ElfSections<'a> {
+    fn parse(bytes: &'a [u8]) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            bytes.len() >= 64 && bytes.starts_with(b"\x7fELF") && bytes[4] == 2 && bytes[5] == 1,
+            "unsupported eBPF ELF format"
+        );
+        let table = number(bytes, 40, 8)?;
+        let size = number(bytes, 58, 2)?;
+        let count = number(bytes, 60, 2)?;
+        let string_index = number(bytes, 62, 2)?;
+        anyhow::ensure!(
+            size >= 64 && count > 0 && count < 4096 && string_index < count,
+            "invalid ELF section table"
+        );
+        let end = table
+            .checked_add(
+                size.checked_mul(count)
+                    .ok_or_else(|| anyhow::anyhow!("invalid ELF sections"))?,
+            )
+            .ok_or_else(|| anyhow::anyhow!("invalid ELF sections"))?;
+        anyhow::ensure!(end <= bytes.len(), "truncated ELF sections");
+        let header = table + size * string_index;
+        let offset = number(bytes, header + 24, 8)?;
+        let length = number(bytes, header + 32, 8)?;
+        let strings = bytes
+            .get(
                 offset
                     ..offset
                         .checked_add(length)
-                        .ok_or_else(|| anyhow::anyhow!("invalid ABI offset"))?,
-            );
-        }
+                        .ok_or_else(|| anyhow::anyhow!("invalid ELF strings"))?,
+            )
+            .ok_or_else(|| anyhow::anyhow!("truncated ELF strings"))?;
+        Ok(Self {
+            bytes,
+            table,
+            size,
+            count,
+            strings,
+        })
     }
-    let metadata = metadata.ok_or_else(|| {
-        anyhow::anyhow!("raw ABI metadata missing; update agent and eBPF object together")
-    })?;
+
+    fn abi_metadata(&self) -> anyhow::Result<&'a [u8]> {
+        let Self {
+            bytes,
+            table,
+            size,
+            count,
+            strings,
+        } = *self;
+        let mut metadata = None;
+        for index in 0..count {
+            let header = table + size * index;
+            let name = number(bytes, header, 4)?;
+            let name = strings
+                .get(name..)
+                .and_then(|s| s.split(|b| *b == 0).next())
+                .ok_or_else(|| anyhow::anyhow!("invalid ELF section name"))?;
+            if name == ABI_SECTION.as_bytes() {
+                anyhow::ensure!(metadata.is_none(), "duplicate raw ABI section");
+                let offset = number(bytes, header + 24, 8)?;
+                let length = number(bytes, header + 32, 8)?;
+                metadata = bytes.get(
+                    offset
+                        ..offset
+                            .checked_add(length)
+                            .ok_or_else(|| anyhow::anyhow!("invalid ABI offset"))?,
+                );
+            }
+        }
+        metadata.ok_or_else(|| {
+            anyhow::anyhow!("raw ABI metadata missing; update agent and eBPF object together")
+        })
+    }
+}
+
+fn validate_metadata(metadata: &[u8]) -> anyhow::Result<()> {
     anyhow::ensure!(
         metadata.len() == 16 && metadata[..8] == ABI_MAGIC,
         "invalid raw ABI metadata"
@@ -120,6 +155,27 @@ pub(crate) fn validate_tracepoint(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn malformed_section_offsets_and_duplicate_metadata_are_rejected() {
+        let good = object(RAW_ABI_VERSION, RAW_EVENT_SIZE as u32);
+        for offset in [152, 160, 216, 224] {
+            let mut bad = good.clone();
+            bad[offset..offset + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+            assert!(validate_object(&bad).is_err());
+        }
+        let mut duplicate = good;
+        duplicate.splice(256..256, [0; 64]);
+        duplicate[60..62].copy_from_slice(&4u16.to_le_bytes());
+        duplicate[152..160].copy_from_slice(&320u64.to_le_bytes());
+        let offset = u64::from_le_bytes(duplicate[216..224].try_into().unwrap()) + 64;
+        duplicate[216..224].copy_from_slice(&offset.to_le_bytes());
+        let header = duplicate[192..256].to_vec();
+        duplicate[256..320].copy_from_slice(&header);
+        assert_eq!(
+            validate_object(&duplicate).unwrap_err().to_string(),
+            "duplicate raw ABI section"
+        );
+    }
     fn object(version: u32, size: u32) -> Vec<u8> {
         let names = b"\0.shstrtab\0.izanagi_abi\0";
         let mut object = vec![0; 64 + 3 * 64];

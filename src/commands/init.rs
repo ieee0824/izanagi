@@ -32,6 +32,39 @@ pub fn cmd_init(explicit_path: Option<&PathBuf>) -> Result<u8> {
     println!("izanagi.toml を対話形式で生成します。");
     println!("出力先: {}\n", output.display());
 
+    let backend = prompt_backend()?;
+    let qemu_section = prompt_qemu(backend)?;
+    let tracer = prompt_tracer(backend)?;
+    let require_auth = Confirm::new()
+        .with_prompt("HMAC 認証を必須にしますか？ (シークレット設定が必要)")
+        .default(false)
+        .interact()?;
+    let (share_paths, mount_point) = prompt_share()?;
+    let syscalls = prompt_syscalls()?;
+    let suspicious_paths = prompt_suspicious_paths()?;
+    let allowed_hosts = prompt_allowed_hosts()?;
+    let mitm_config = prompt_mitm()?;
+    if !confirm_overwrite(&output)? {
+        return Ok(0);
+    }
+    let toml = generate_toml(
+        backend,
+        qemu_section.as_ref(),
+        tracer,
+        require_auth,
+        &share_paths,
+        &mount_point,
+        &syscalls,
+        &suspicious_paths,
+        &allowed_hosts,
+        mitm_config.as_ref(),
+    );
+    write_private_config(&output, &toml)?;
+    println!("\n{} を生成しました。", output.display());
+    Ok(0)
+}
+
+fn prompt_backend() -> Result<&'static str> {
     // --- Sandbox backend ---
     let backends = &["native", "qemu", "apple-container"];
     let backend_idx = Select::new()
@@ -39,27 +72,29 @@ pub fn cmd_init(explicit_path: Option<&PathBuf>) -> Result<u8> {
         .items(backends)
         .default(0)
         .interact()?;
-    let backend = backends[backend_idx];
+    Ok(backends[backend_idx])
+}
 
-    // --- QEMU 設定 (backend=qemu の場合のみ) ---
-    let qemu_section = if backend == "qemu" {
-        let cpus: u32 = Input::new()
-            .with_prompt("QEMU CPUs")
-            .default(2)
-            .interact_text()?;
-        let memory: String = Input::new()
-            .with_prompt("QEMU メモリ")
-            .default("4G".to_string())
-            .interact_text()?;
-        let image: String = Input::new()
-            .with_prompt("QEMU イメージ (\"default\" で組み込みイメージを使用)")
-            .default("default".to_string())
-            .interact_text()?;
-        Some((cpus, memory, image))
-    } else {
-        None
-    };
+fn prompt_qemu(backend: &str) -> Result<Option<(u32, String, String)>> {
+    if backend != "qemu" {
+        return Ok(None);
+    }
+    let cpus: u32 = Input::new()
+        .with_prompt("QEMU CPUs")
+        .default(2)
+        .interact_text()?;
+    let memory: String = Input::new()
+        .with_prompt("QEMU メモリ")
+        .default("4G".to_string())
+        .interact_text()?;
+    let image: String = Input::new()
+        .with_prompt("QEMU イメージ (\"default\" で組み込みイメージを使用)")
+        .default("default".to_string())
+        .interact_text()?;
+    Ok(Some((cpus, memory, image)))
+}
 
+fn prompt_tracer(backend: &str) -> Result<&'static str> {
     // --- Tracer ---
     // backend に応じて適切なデフォルトを選択
     let tracers = &["auto", "none", "ebpf", "dtrace", "vm-agent"];
@@ -73,14 +108,10 @@ pub fn cmd_init(explicit_path: Option<&PathBuf>) -> Result<u8> {
         .items(tracers)
         .default(tracer_default)
         .interact()?;
-    let tracer = tracers[tracer_idx];
+    Ok(tracers[tracer_idx])
+}
 
-    // --- 認証 ---
-    let require_auth = Confirm::new()
-        .with_prompt("HMAC 認証を必須にしますか？ (シークレット設定が必要)")
-        .default(false)
-        .interact()?;
-
+fn prompt_share() -> Result<(String, String)> {
     // --- Share ---
     let share_paths: String = Input::new()
         .with_prompt("共有するホストパス (カンマ区切り)")
@@ -91,6 +122,10 @@ pub fn cmd_init(explicit_path: Option<&PathBuf>) -> Result<u8> {
         .default("/workspace".to_string())
         .interact_text()?;
 
+    Ok((share_paths, mount_point))
+}
+
+fn prompt_syscalls() -> Result<Vec<String>> {
     // --- Monitor syscalls ---
     let syscall_options = &["file", "network", "process", "env"];
     let syscall_defaults = &[true, true, true, false];
@@ -104,6 +139,10 @@ pub fn cmd_init(explicit_path: Option<&PathBuf>) -> Result<u8> {
         .map(|&i| syscall_options[i].to_string())
         .collect();
 
+    Ok(syscalls)
+}
+
+fn prompt_suspicious_paths() -> Result<Vec<String>> {
     // --- Detect: suspicious paths ---
     let use_default_paths = Confirm::new()
         .with_prompt("デフォルトの機密パス検知を使用しますか？")
@@ -134,6 +173,10 @@ pub fn cmd_init(explicit_path: Option<&PathBuf>) -> Result<u8> {
             .collect()
     };
 
+    Ok(suspicious_paths)
+}
+
+fn prompt_allowed_hosts() -> Result<Vec<String>> {
     // --- Detect: allowed hosts ---
     let allowed_hosts_input: String = Input::new()
         .with_prompt("許可するホスト (カンマ区切り、空でスキップ)")
@@ -145,76 +188,68 @@ pub fn cmd_init(explicit_path: Option<&PathBuf>) -> Result<u8> {
         .filter(|s| !s.is_empty())
         .collect();
 
-    // --- パケット検閲 (MITM) ---
-    let enable_mitm = Confirm::new()
+    Ok(allowed_hosts)
+}
+
+fn prompt_mitm() -> Result<Option<MitmConfig>> {
+    let enable = Confirm::new()
         .with_prompt("パケット検閲 (DNS プロキシ + HTTP キャプチャ) を有効にしますか？")
         .default(false)
         .interact()?;
+    if !enable {
+        return Ok(None);
+    }
+    let dns_listen = prompt_address("DNS プロキシのリッスンアドレス", "127.0.0.1:15353")?;
+    let http_listen = prompt_address("HTTP リッスンアドレス", "127.0.0.1:18080")?;
+    let https_listen = prompt_address("HTTPS (TLS MITM) リッスンアドレス", "127.0.0.1:18443")?;
+    let ca_cert_out = Input::new()
+        .with_prompt("CA 証明書の出力先パス")
+        .default("/tmp/izanagi-ca.pem".to_string())
+        .interact_text()?;
+    let secret_maps = prompt_secret_maps()?;
+    Ok(Some(MitmConfig {
+        dns_listen,
+        http_listen,
+        https_listen,
+        ca_cert_out,
+        secret_maps,
+    }))
+}
 
-    let mitm_config = if enable_mitm {
-        let dns_listen: String = Input::new()
-            .with_prompt("DNS プロキシのリッスンアドレス")
-            .default("127.0.0.1:15353".to_string())
-            .validate_with(|input: &String| -> Result<(), String> {
-                input
-                    .parse::<std::net::SocketAddr>()
-                    .map(|_| ())
-                    .map_err(|_| "無効なアドレスです (例: 127.0.0.1:15353)".to_string())
-            })
-            .interact_text()?;
-        let http_listen: String = Input::new()
-            .with_prompt("HTTP リッスンアドレス")
-            .default("127.0.0.1:18080".to_string())
-            .validate_with(|input: &String| -> Result<(), String> {
-                input
-                    .parse::<std::net::SocketAddr>()
-                    .map(|_| ())
-                    .map_err(|_| "無効なアドレスです (例: 127.0.0.1:18080)".to_string())
-            })
-            .interact_text()?;
-        let https_listen: String = Input::new()
-            .with_prompt("HTTPS (TLS MITM) リッスンアドレス")
-            .default("127.0.0.1:18443".to_string())
-            .validate_with(|input: &String| -> Result<(), String> {
-                input
-                    .parse::<std::net::SocketAddr>()
-                    .map(|_| ())
-                    .map_err(|_| "無効なアドレスです (例: 127.0.0.1:18443)".to_string())
-            })
-            .interact_text()?;
-        let ca_cert_out: String = Input::new()
-            .with_prompt("CA 証明書の出力先パス")
-            .default("/tmp/izanagi-ca.pem".to_string())
-            .interact_text()?;
-
-        let mut secret_maps = Vec::new();
-        println!("シークレットマッピング (DUMMY=REAL 形式、空行で終了):");
-        loop {
-            let input: String = Input::new()
-                .with_prompt("追加するマッピング")
-                .allow_empty(true)
-                .interact_text()?;
-            if input.is_empty() {
-                break;
-            }
-            if !input.contains('=') {
-                eprintln!("形式が正しくありません。DUMMY=REAL の形式で入力してください。");
-                continue;
-            }
-            secret_maps.push(input);
-        }
-
-        Some(MitmConfig {
-            dns_listen,
-            http_listen,
-            https_listen,
-            ca_cert_out,
-            secret_maps,
+fn prompt_address(prompt: &str, default: &str) -> Result<String> {
+    Ok(Input::new()
+        .with_prompt(prompt)
+        .default(default.to_string())
+        .validate_with(|input: &String| -> Result<(), String> {
+            input
+                .parse::<std::net::SocketAddr>()
+                .map(|_| ())
+                .map_err(|_| format!("無効なアドレスです (例: {default})"))
         })
-    } else {
-        None
-    };
+        .interact_text()?)
+}
 
+fn prompt_secret_maps() -> Result<Vec<String>> {
+    let mut secret_maps = Vec::new();
+    println!("シークレットマッピング (DUMMY=REAL 形式、空行で終了):");
+    loop {
+        let input: String = Input::new()
+            .with_prompt("追加するマッピング")
+            .allow_empty(true)
+            .interact_text()?;
+        if input.is_empty() {
+            break;
+        }
+        if !input.contains('=') {
+            eprintln!("形式が正しくありません。DUMMY=REAL の形式で入力してください。");
+            continue;
+        }
+        secret_maps.push(input);
+    }
+    Ok(secret_maps)
+}
+
+fn confirm_overwrite(output: &Path) -> Result<bool> {
     // --- 上書き確認 ---
     if output.exists() {
         let overwrite = Confirm::new()
@@ -226,24 +261,14 @@ pub fn cmd_init(explicit_path: Option<&PathBuf>) -> Result<u8> {
             .interact()?;
         if !overwrite {
             println!("キャンセルしました。");
-            return Ok(0);
+            return Ok(false);
         }
     }
 
-    // --- TOML 生成 ---
-    let toml = generate_toml(
-        backend,
-        qemu_section.as_ref(),
-        tracer,
-        require_auth,
-        &share_paths,
-        &mount_point,
-        &syscalls,
-        &suspicious_paths,
-        &allowed_hosts,
-        mitm_config.as_ref(),
-    );
+    Ok(true)
+}
 
+fn write_private_config(output: &Path, toml: &str) -> Result<()> {
     // 親ディレクトリを作成 (パーミッション 0o700)
     if let Some(parent) = output.parent() {
         std::fs::create_dir_all(parent)?;
@@ -266,18 +291,16 @@ pub fn cmd_init(explicit_path: Option<&PathBuf>) -> Result<u8> {
             .create(true)
             .truncate(true)
             .mode(0o600)
-            .open(&output)?;
+            .open(output)?;
         file.write_all(toml.as_bytes())?;
         // 既存ファイルの場合に備えてパーミッションを強制
-        std::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o600))?;
+        std::fs::set_permissions(output, std::fs::Permissions::from_mode(0o600))?;
     }
     #[cfg(not(unix))]
     {
-        std::fs::write(&output, &toml)?;
+        std::fs::write(output, toml)?;
     }
-    println!("\n{} を生成しました。", output.display());
-
-    Ok(0)
+    Ok(())
 }
 
 /// ユーザー入力を TOML 文字列としてエスケープする。
@@ -310,7 +333,27 @@ fn generate_toml(
     mitm: Option<&MitmConfig>,
 ) -> String {
     let mut out = String::new();
+    append_sandbox(&mut out, backend, qemu, tracer, require_auth);
+    append_share(&mut out, share_paths, mount_point);
+    append_monitor(&mut out, syscalls);
+    out.push_str("\n[detect]\n");
+    append_array(&mut out, "suspicious_paths", suspicious_paths);
+    append_array(&mut out, "allowed_hosts", allowed_hosts);
+    if let Some(mitm) = mitm {
+        append_mitm(&mut out, mitm);
+    } else {
+        append_advanced_comments(&mut out);
+    }
+    out
+}
 
+fn append_sandbox(
+    out: &mut String,
+    backend: &str,
+    qemu: Option<&(u32, String, String)>,
+    tracer: &str,
+    require_auth: bool,
+) {
     // [sandbox]
     out.push_str("[sandbox]\n");
     out.push_str(&format!("backend = {}\n", escape_toml_string(backend)));
@@ -324,7 +367,9 @@ fn generate_toml(
         out.push_str(&format!("memory = {}\n", escape_toml_string(memory)));
         out.push_str(&format!("image = {}\n", escape_toml_string(image)));
     }
+}
 
+fn append_share(out: &mut String, share_paths: &str, mount_point: &str) {
     // [share]
     out.push_str("\n[share]\n");
     let paths: Vec<String> = share_paths
@@ -336,81 +381,134 @@ fn generate_toml(
         "mount_point = {}\n",
         escape_toml_string(mount_point)
     ));
+}
 
+fn append_monitor(out: &mut String, syscalls: &[String]) {
     // [monitor]
     out.push_str("\n[monitor]\n");
     let sc: Vec<String> = syscalls.iter().map(|s| escape_toml_string(s)).collect();
     out.push_str(&format!("syscalls = [{}]\n", sc.join(", ")));
+}
 
-    // [detect]
-    out.push_str("\n[detect]\n");
-    if suspicious_paths.is_empty() {
-        out.push_str("suspicious_paths = []\n");
+fn append_array(out: &mut String, name: &str, values: &[String]) {
+    if values.is_empty() {
+        out.push_str(&format!("{name} = []\n"));
     } else {
-        out.push_str("suspicious_paths = [\n");
-        for p in suspicious_paths {
-            out.push_str(&format!("    {},\n", escape_toml_string(p)));
+        out.push_str(&format!("{name} = [\n"));
+        for value in values {
+            out.push_str(&format!("    {},\n", escape_toml_string(value)));
         }
         out.push_str("]\n");
     }
-    if allowed_hosts.is_empty() {
-        out.push_str("allowed_hosts = []\n");
-    } else {
-        out.push_str("allowed_hosts = [\n");
-        for h in allowed_hosts {
-            out.push_str(&format!("    {},\n", escape_toml_string(h)));
-        }
-        out.push_str("]\n");
-    }
+}
 
-    // MITM セクション
-    if let Some(m) = mitm {
-        out.push_str("\n[dns_proxy]\n");
-        out.push_str("enabled = true\n");
-        out.push_str(&format!("listen = {}\n", escape_toml_string(&m.dns_listen)));
+fn append_mitm(out: &mut String, m: &MitmConfig) {
+    out.push_str("\n[dns_proxy]\n");
+    out.push_str("enabled = true\n");
+    out.push_str(&format!("listen = {}\n", escape_toml_string(&m.dns_listen)));
 
-        out.push_str("\n[http_capture]\n");
-        out.push_str("enabled = true\n");
-        out.push_str(&format!(
-            "listen_http = {}\n",
-            escape_toml_string(&m.http_listen)
-        ));
-        out.push_str(&format!(
-            "listen_https = {}\n",
-            escape_toml_string(&m.https_listen)
-        ));
-        out.push_str(&format!(
-            "ca_cert_out = {}\n",
-            escape_toml_string(&m.ca_cert_out)
-        ));
-        if m.secret_maps.is_empty() {
-            out.push_str("secret_maps = []\n");
-        } else {
-            out.push_str("secret_maps = [\n");
-            for s in &m.secret_maps {
-                out.push_str(&format!("    {},\n", escape_toml_string(s)));
-            }
-            out.push_str("]\n");
-        }
-    } else {
-        out.push_str("\n# --- 高度な設定 (必要に応じてコメントを外してください) ---\n");
-        out.push_str("\n# [dns_proxy]\n");
-        out.push_str("# enabled = true\n");
-        out.push_str("# listen = \"127.0.0.1:15353\"\n");
-        out.push_str("\n# [http_capture]\n");
-        out.push_str("# enabled = true\n");
-        out.push_str("# listen_http = \"127.0.0.1:18080\"\n");
-        out.push_str("# listen_https = \"127.0.0.1:18443\"\n");
-        out.push_str("# ca_cert_out = \"/tmp/izanagi-ca.pem\"\n");
-        out.push_str("# secret_maps = []\n");
-    }
+    out.push_str("\n[http_capture]\n");
+    out.push_str("enabled = true\n");
+    out.push_str(&format!(
+        "listen_http = {}\n",
+        escape_toml_string(&m.http_listen)
+    ));
+    out.push_str(&format!(
+        "listen_https = {}\n",
+        escape_toml_string(&m.https_listen)
+    ));
+    out.push_str(&format!(
+        "ca_cert_out = {}\n",
+        escape_toml_string(&m.ca_cert_out)
+    ));
+    append_array(out, "secret_maps", &m.secret_maps);
+}
 
-    out
+fn append_advanced_comments(out: &mut String) {
+    out.push_str("\n# --- 高度な設定 (必要に応じてコメントを外してください) ---\n");
+    out.push_str("\n# [dns_proxy]\n");
+    out.push_str("# enabled = true\n");
+    out.push_str("# listen = \"127.0.0.1:15353\"\n");
+    out.push_str("\n# [http_capture]\n");
+    out.push_str("# enabled = true\n");
+    out.push_str("# listen_http = \"127.0.0.1:18080\"\n");
+    out.push_str("# listen_https = \"127.0.0.1:18443\"\n");
+    out.push_str("# ca_cert_out = \"/tmp/izanagi-ca.pem\"\n");
+    out.push_str("# secret_maps = []\n");
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn config_creation_and_overwrite_enforce_private_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory =
+            std::env::temp_dir().join(format!("izanagi-init-{:032x}", rand::random::<u128>()));
+        let output = directory.join("nested/izanagi.toml");
+        write_private_config(&output, "first = true\n").unwrap();
+        assert_eq!(
+            std::fs::metadata(output.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&output).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        std::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_private_config(&output, "x=1\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&output).unwrap(), "x=1\n");
+        assert_eq!(
+            std::fs::metadata(&output).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn mitm_sections_preserve_empty_and_escaped_mapping_arrays() {
+        for secret_maps in [vec![], vec!["DUMMY=quote\"\\\nvalue".into()]] {
+            let mitm = MitmConfig {
+                dns_listen: "127.0.0.1:15353".into(),
+                http_listen: "127.0.0.1:18080".into(),
+                https_listen: "127.0.0.1:18443".into(),
+                ca_cert_out: "/tmp/test-ca.pem".into(),
+                secret_maps: secret_maps.clone(),
+            };
+            let text = generate_toml(
+                "qemu",
+                Some(&(2, "4G".into(), "default".into())),
+                "vm-agent",
+                true,
+                ".",
+                "/workspace",
+                &[],
+                &[],
+                &[],
+                Some(&mitm),
+            );
+            let parsed: toml::Value = toml::from_str(&text).unwrap();
+            assert_eq!(parsed["dns_proxy"]["enabled"].as_bool(), Some(true));
+            assert_eq!(
+                parsed["http_capture"]["listen_https"].as_str(),
+                Some("127.0.0.1:18443")
+            );
+            let actual: Vec<_> = parsed["http_capture"]["secret_maps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_owned())
+                .collect();
+            assert_eq!(actual, secret_maps);
+            assert!(!text.contains("# --- 高度な設定"));
+        }
+    }
 
     #[test]
     fn generate_toml_default() {

@@ -71,30 +71,10 @@ pub async fn cmd_mcp() -> anyhow::Result<u8> {
 /// 1 行の JSON-RPC メッセージを処理し、レスポンスを返す。
 /// notification の場合は `None` を返す。
 async fn handle_message(input: &str) -> Option<JsonRpcResponse> {
-    // 2段階パース: JSON 構文エラー → PARSE_ERROR、スキーマ不一致 → INVALID_REQUEST
-    let raw: Value = match serde_json::from_str(input) {
-        Ok(v) => v,
-        Err(_) => {
-            return Some(JsonRpcResponse::error(
-                Value::Null,
-                PARSE_ERROR,
-                "Parse error",
-            ));
-        }
+    let request = match parse_request(input) {
+        Ok(request) => request,
+        Err(error) => return Some(*error),
     };
-    let request: JsonRpcRequest = match serde_json::from_value(raw.clone()) {
-        Ok(req) => req,
-        Err(e) => {
-            // id が取得できればレスポンスに含める
-            let id = raw.get("id").cloned().unwrap_or(Value::Null);
-            return Some(JsonRpcResponse::error(
-                id,
-                INVALID_REQUEST,
-                format!("Invalid Request: {e}"),
-            ));
-        }
-    };
-
     // notification: id が None の場合はレスポンス不要
     let id = request.id?;
 
@@ -131,30 +111,56 @@ async fn handle_message(input: &str) -> Option<JsonRpcResponse> {
                 serde_json::to_value(result).expect("ToolsListResult のシリアライズは常に成功する");
             Some(JsonRpcResponse::success(id, value))
         }
-        "tools/call" => {
-            let params: ToolCallParams = match request.params {
-                Some(v) => match serde_json::from_value(v) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        return Some(JsonRpcResponse::error(
-                            id,
-                            INVALID_PARAMS,
-                            format!("Invalid params: {e}"),
-                        ));
-                    }
-                },
-                None => {
-                    return Some(JsonRpcResponse::error(id, INVALID_PARAMS, "Missing params"));
-                }
-            };
-            Some(dispatch_tool_call(id, &params).await)
-        }
+        "tools/call" => Some(handle_tool_call(id, request.params).await),
         _ => Some(JsonRpcResponse::error(
             id,
             METHOD_NOT_FOUND,
             format!("Method not found: {}", request.method),
         )),
     }
+}
+
+async fn handle_tool_call(id: Value, params: Option<Value>) -> JsonRpcResponse {
+    let params: ToolCallParams = match params {
+        Some(v) => match serde_json::from_value(v) {
+            Ok(p) => p,
+            Err(e) => {
+                return JsonRpcResponse::error(id, INVALID_PARAMS, format!("Invalid params: {e}"));
+            }
+        },
+        None => {
+            return JsonRpcResponse::error(id, INVALID_PARAMS, "Missing params");
+        }
+    };
+    dispatch_tool_call(id, &params).await
+}
+
+fn parse_request(input: &str) -> Result<JsonRpcRequest, Box<JsonRpcResponse>> {
+    // 2段階パース: JSON 構文エラー → PARSE_ERROR、スキーマ不一致 → INVALID_REQUEST
+    let raw: Value = match serde_json::from_str(input) {
+        Ok(v) => v,
+        Err(_) => {
+            return Err(Box::new(JsonRpcResponse::error(
+                Value::Null,
+                PARSE_ERROR,
+                "Parse error",
+            )));
+        }
+    };
+    let request: JsonRpcRequest = match serde_json::from_value(raw.clone()) {
+        Ok(req) => req,
+        Err(e) => {
+            // id が取得できればレスポンスに含める
+            let id = raw.get("id").cloned().unwrap_or(Value::Null);
+            return Err(Box::new(JsonRpcResponse::error(
+                id,
+                INVALID_REQUEST,
+                format!("Invalid Request: {e}"),
+            )));
+        }
+    };
+
+    Ok(request)
 }
 
 /// ツール名に応じてディスパッチする。

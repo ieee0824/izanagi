@@ -234,6 +234,31 @@ impl JevMcpClassifier {
         &self,
         projection: &FeatureProjection,
     ) -> Result<Value, ClassificationErrorKind> {
+        let mut child = self.spawn_process()?;
+        let (mut transport, stderr) = McpExchange::take(&mut child, &self.config)?;
+        let stderr_drain = drain_stderr(stderr, self.config.max_stderr_bytes);
+        let exchange = transport.exchange(projection, &self.config);
+        tokio::pin!(exchange, stderr_drain);
+        let (mut result, stderr_finished) = tokio::select! {
+            result = &mut exchange => (result, false),
+            result = &mut stderr_drain => (match result { Ok(()) => exchange.await, Err(error) => Err(error) }, true),
+        };
+        // A provider has no authority to outlive the request or the sandbox session.
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        if !stderr_finished {
+            // Account for buffered stderr even if a successful stdout response won the select.
+            // A descendant holding the pipe open cannot extend the request indefinitely.
+            if let Ok(Err(error)) =
+                tokio::time::timeout(Duration::from_millis(100), &mut stderr_drain).await
+            {
+                result = Err(error);
+            }
+        }
+        result
+    }
+
+    fn spawn_process(&self) -> Result<tokio::process::Child, ClassificationErrorKind> {
         let mut command = Command::new(&self.config.command);
         command
             .args(&self.config.args)
@@ -254,10 +279,21 @@ impl JevMcpClassifier {
                 command.env(name, value);
             }
         }
-        let mut child = command
-            .spawn()
-            .map_err(|_| ClassificationErrorKind::Spawn)?;
-        let mut stdin = child
+        command.spawn().map_err(|_| ClassificationErrorKind::Spawn)
+    }
+}
+
+struct McpExchange {
+    stdin: tokio::process::ChildStdin,
+    reader: CappedLines<tokio::process::ChildStdout>,
+    max_request_bytes: usize,
+}
+impl McpExchange {
+    fn take(
+        child: &mut tokio::process::Child,
+        config: &ClassifierConfig,
+    ) -> Result<(Self, tokio::process::ChildStderr), ClassificationErrorKind> {
+        let stdin = child
             .stdin
             .take()
             .ok_or(ClassificationErrorKind::Transport)?;
@@ -265,96 +301,104 @@ impl JevMcpClassifier {
             .stdout
             .take()
             .ok_or(ClassificationErrorKind::Transport)?;
-        let mut stderr = child
+        let stderr = child
             .stderr
             .take()
             .ok_or(ClassificationErrorKind::Transport)?;
-        let mut reader = CappedLines::new(stdout, self.config.max_response_bytes);
-        let stderr_limit = self.config.max_stderr_bytes;
-        // Never store or echo stderr: remote messages can contain submitted data or credentials.
-        let stderr_drain = async move {
-            let mut total = 0usize;
-            let mut buffer = [0u8; 4096];
-            loop {
-                let read = stderr
-                    .read(&mut buffer)
-                    .await
-                    .map_err(|_| ClassificationErrorKind::Transport)?;
-                if read == 0 {
-                    return Ok::<(), ClassificationErrorKind>(());
-                }
-                total = total.saturating_add(read);
-                if total > stderr_limit {
-                    return Err(ClassificationErrorKind::StderrTooLarge);
-                }
-            }
-        };
-        let exchange = async {
-            send(&mut stdin, &json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
-                "protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"izanagi-behavior","version":"1"}}}), self.config.max_request_bytes).await?;
-            let initialized = reader.response(1).await?;
-            let protocol = initialized
-                .get("protocolVersion")
-                .and_then(Value::as_str)
-                .ok_or(ClassificationErrorKind::Capability)?;
-            if !matches!(protocol, "2024-11-05" | "2025-03-26" | "2025-06-18")
-                || !initialized
-                    .pointer("/capabilities/tools")
-                    .is_some_and(Value::is_object)
-            {
-                return Err(ClassificationErrorKind::Capability);
-            }
-            send(
-                &mut stdin,
-                &json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
-                self.config.max_request_bytes,
-            )
-            .await?;
-            send(
-                &mut stdin,
-                &json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}),
-                self.config.max_request_bytes,
-            )
-            .await?;
-            let listing = reader.response(2).await?;
-            let tools = listing
-                .get("tools")
-                .and_then(Value::as_array)
-                .ok_or(ClassificationErrorKind::Capability)?;
-            let choice = tools
-                .iter()
-                .find(|tool| tool.get("name").and_then(Value::as_str) == Some("jev.choice"))
-                .ok_or(ClassificationErrorKind::Capability)?;
-            if !choice.get("inputSchema").is_some_and(Value::is_object) {
-                return Err(ClassificationErrorKind::Capability);
-            }
-            send(
-                &mut stdin,
-                &choice_request(projection, &self.config),
-                self.config.max_request_bytes,
-            )
-            .await?;
-            let result = reader.response(3).await?;
-            extract_evaluation(result)
-        };
-        tokio::pin!(exchange, stderr_drain);
-        let (mut result, stderr_finished) = tokio::select! {
-            result = &mut exchange => (result, false),
-            result = &mut stderr_drain => (match result { Ok(()) => exchange.await, Err(error) => Err(error) }, true),
-        };
-        // A provider has no authority to outlive the request or the sandbox session.
-        let _ = child.start_kill();
-        let _ = child.wait().await;
-        if !stderr_finished {
-            // Account for buffered stderr even if a successful stdout response won the select.
-            // A descendant holding the pipe open cannot extend the request indefinitely.
-            if let Ok(Err(error)) =
-                tokio::time::timeout(Duration::from_millis(100), &mut stderr_drain).await
-            {
-                result = Err(error);
-            }
+        let reader = CappedLines::new(stdout, config.max_response_bytes);
+        Ok((
+            Self {
+                stdin,
+                reader,
+                max_request_bytes: config.max_request_bytes,
+            },
+            stderr,
+        ))
+    }
+
+    async fn initialize(&mut self) -> Result<(), ClassificationErrorKind> {
+        send(&mut self.stdin, &json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+                "protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"izanagi-behavior","version":"1"}}}), self.max_request_bytes).await?;
+        let initialized = self.reader.response(1).await?;
+        let protocol = initialized
+            .get("protocolVersion")
+            .and_then(Value::as_str)
+            .ok_or(ClassificationErrorKind::Capability)?;
+        if !matches!(protocol, "2024-11-05" | "2025-03-26" | "2025-06-18")
+            || !initialized
+                .pointer("/capabilities/tools")
+                .is_some_and(Value::is_object)
+        {
+            return Err(ClassificationErrorKind::Capability);
         }
-        result
+        send(
+            &mut self.stdin,
+            &json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+            self.max_request_bytes,
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn discover_choice(&mut self) -> Result<(), ClassificationErrorKind> {
+        send(
+            &mut self.stdin,
+            &json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}),
+            self.max_request_bytes,
+        )
+        .await?;
+        let listing = self.reader.response(2).await?;
+        let tools = listing
+            .get("tools")
+            .and_then(Value::as_array)
+            .ok_or(ClassificationErrorKind::Capability)?;
+        let choice = tools
+            .iter()
+            .find(|tool| tool.get("name").and_then(Value::as_str) == Some("jev.choice"))
+            .ok_or(ClassificationErrorKind::Capability)?;
+        if !choice.get("inputSchema").is_some_and(Value::is_object) {
+            return Err(ClassificationErrorKind::Capability);
+        }
+        Ok(())
+    }
+
+    async fn exchange(
+        &mut self,
+        projection: &FeatureProjection,
+        config: &ClassifierConfig,
+    ) -> Result<Value, ClassificationErrorKind> {
+        self.initialize().await?;
+        self.discover_choice().await?;
+        send(
+            &mut self.stdin,
+            &choice_request(projection, config),
+            self.max_request_bytes,
+        )
+        .await?;
+        let result = self.reader.response(3).await?;
+        extract_evaluation(result)
+    }
+}
+
+// Never retain or echo stderr: it can contain features or credentials.
+async fn drain_stderr(
+    mut stderr: tokio::process::ChildStderr,
+    stderr_limit: usize,
+) -> Result<(), ClassificationErrorKind> {
+    let mut total = 0usize;
+    let mut buffer = [0u8; 4096];
+    loop {
+        let read = stderr
+            .read(&mut buffer)
+            .await
+            .map_err(|_| ClassificationErrorKind::Transport)?;
+        if read == 0 {
+            return Ok::<(), ClassificationErrorKind>(());
+        }
+        total = total.saturating_add(read);
+        if total > stderr_limit {
+            return Err(ClassificationErrorKind::StderrTooLarge);
+        }
     }
 }
 
@@ -576,86 +620,51 @@ pub fn validate_evaluation(
     if let Err(kind) = config.validate() {
         return ClassificationOutcome::failed(kind);
     }
-    let failed = || ClassificationOutcome::failed(ClassificationErrorKind::InvalidResponse);
-    let Some(model) = value.get("model").and_then(Value::as_str) else {
-        return failed();
+    let answer = match decode_evaluation(&value, projection, config, elapsed) {
+        Ok(answer) => answer,
+        Err(kind) => return ClassificationOutcome::failed(kind),
     };
-    if model != config.model {
-        return ClassificationOutcome::failed(ClassificationErrorKind::ModelMismatch);
-    }
-    let Some(answers) = value.get("answers").and_then(Value::as_object) else {
-        return failed();
-    };
-    if answers.len() != 1 {
-        return failed();
-    }
-    let Some(answer) = answers.get("result") else {
-        return failed();
-    };
-    if answer.get("type").and_then(Value::as_str) != Some("choice") {
-        return failed();
-    }
-    let Some(choice) = answer.get("choice").and_then(Value::as_str) else {
-        return failed();
-    };
-    let class = match choice {
-        "normal" => ThreatClass::Normal,
-        "access_post_suspected" => ThreatClass::AccessPostSuspected,
-        "unknown" => ThreatClass::Unknown,
-        _ => return failed(),
-    };
-    let Some(distribution) = answer.get("probabilities").and_then(Value::as_object) else {
-        return failed();
-    };
-    if distribution.len() != CLASSES.len() || CLASSES.iter().any(|c| !distribution.contains_key(*c))
-    {
-        return failed();
-    }
-    let mut probabilities = BTreeMap::new();
-    for (name, probability) in distribution {
-        let Some(probability) = probability.as_f64() else {
-            return failed();
-        };
-        if !unit(probability) {
-            return failed();
+    if answer.class == ThreatClass::Unknown {
+        ClassificationOutcome::Abstained {
+            reason: AbstentionReason::UnknownChoice,
+            answer: Some(answer),
         }
-        probabilities.insert(name.clone(), probability);
+    } else if answer.confidence < config.min_confidence {
+        ClassificationOutcome::Abstained {
+            reason: AbstentionReason::LowConfidence,
+            answer: Some(answer),
+        }
+    } else {
+        ClassificationOutcome::Classified { answer }
     }
-    let sum: f64 = probabilities.values().sum();
-    if (sum - 1.0).abs() > config.distribution_tolerance {
-        return failed();
-    }
-    let selected_probability = probabilities[choice];
-    if probabilities
-        .values()
-        .any(|p| *p > selected_probability + f64::EPSILON * 8.0)
-    {
-        return failed();
-    }
-    let Some(confidence) = answer.get("confidence").and_then(Value::as_f64) else {
-        return failed();
-    };
-    let expected_confidence = (selected_probability - 1.0 / 3.0) / (1.0 - 1.0 / 3.0);
-    if !unit(confidence) || (expected_confidence - confidence).abs() > config.confidence_tolerance {
-        return failed();
-    }
+}
+
+fn decode_evaluation(
+    value: &Value,
+    projection: &FeatureProjection,
+    config: &ClassifierConfig,
+    elapsed: Duration,
+) -> Result<ClassificationAnswer, ClassificationErrorKind> {
+    let model = response_model(value, config)?;
+    let (choice, class, answer) = response_choice(value)?;
+    let confidence = response_confidence(answer, choice, config)?;
     let Some(input_tokens) = value.pointer("/usage/input_tokens").and_then(Value::as_u64) else {
-        return failed();
+        return Err(ClassificationErrorKind::InvalidResponse);
     };
     let Some(output_tokens) = value
         .pointer("/usage/output_tokens")
         .and_then(Value::as_u64)
     else {
-        return failed();
+        return Err(ClassificationErrorKind::InvalidResponse);
     };
     let Ok(input_digest) = projection.digest() else {
-        return failed();
+        return Err(ClassificationErrorKind::InvalidResponse);
     };
-    let answer = ClassificationAnswer {
+    Ok(ClassificationAnswer {
         class,
-        probabilities,
-        selected_probability,
-        confidence,
+        probabilities: confidence.probabilities,
+        selected_probability: confidence.selected_probability,
+        confidence: confidence.confidence,
         requested_model: config.model.clone(),
         returned_model: model.into(),
         input_digest,
@@ -667,20 +676,98 @@ pub fn validate_evaluation(
         input_tokens,
         output_tokens,
         elapsed_ms: elapsed.as_millis().min(u128::from(u64::MAX)) as u64,
+    })
+}
+
+fn response_model<'a>(
+    value: &'a Value,
+    config: &ClassifierConfig,
+) -> Result<&'a str, ClassificationErrorKind> {
+    let Some(model) = value.get("model").and_then(Value::as_str) else {
+        return Err(ClassificationErrorKind::InvalidResponse);
     };
-    if class == ThreatClass::Unknown {
-        ClassificationOutcome::Abstained {
-            reason: AbstentionReason::UnknownChoice,
-            answer: Some(answer),
-        }
-    } else if confidence < config.min_confidence {
-        ClassificationOutcome::Abstained {
-            reason: AbstentionReason::LowConfidence,
-            answer: Some(answer),
-        }
-    } else {
-        ClassificationOutcome::Classified { answer }
+    if model != config.model {
+        return Err(ClassificationErrorKind::ModelMismatch);
     }
+    Ok(model)
+}
+
+fn response_choice(value: &Value) -> Result<(&str, ThreatClass, &Value), ClassificationErrorKind> {
+    let Some(answers) = value.get("answers").and_then(Value::as_object) else {
+        return Err(ClassificationErrorKind::InvalidResponse);
+    };
+    if answers.len() != 1 {
+        return Err(ClassificationErrorKind::InvalidResponse);
+    }
+    let Some(answer) = answers.get("result") else {
+        return Err(ClassificationErrorKind::InvalidResponse);
+    };
+    if answer.get("type").and_then(Value::as_str) != Some("choice") {
+        return Err(ClassificationErrorKind::InvalidResponse);
+    }
+    let Some(choice) = answer.get("choice").and_then(Value::as_str) else {
+        return Err(ClassificationErrorKind::InvalidResponse);
+    };
+    let class = match choice {
+        "normal" => ThreatClass::Normal,
+        "access_post_suspected" => ThreatClass::AccessPostSuspected,
+        "unknown" => ThreatClass::Unknown,
+        _ => return Err(ClassificationErrorKind::InvalidResponse),
+    };
+    Ok((choice, class, answer))
+}
+
+struct ResponseConfidence {
+    probabilities: BTreeMap<String, f64>,
+    selected_probability: f64,
+    confidence: f64,
+}
+
+fn response_confidence(
+    answer: &Value,
+    choice: &str,
+    config: &ClassifierConfig,
+) -> Result<ResponseConfidence, ClassificationErrorKind> {
+    let Some(distribution) = answer.get("probabilities").and_then(Value::as_object) else {
+        return Err(ClassificationErrorKind::InvalidResponse);
+    };
+    if distribution.len() != CLASSES.len() || CLASSES.iter().any(|c| !distribution.contains_key(*c))
+    {
+        return Err(ClassificationErrorKind::InvalidResponse);
+    }
+    let mut probabilities = BTreeMap::new();
+    for (name, probability) in distribution {
+        let Some(probability) = probability.as_f64() else {
+            return Err(ClassificationErrorKind::InvalidResponse);
+        };
+        if !unit(probability) {
+            return Err(ClassificationErrorKind::InvalidResponse);
+        }
+        probabilities.insert(name.clone(), probability);
+    }
+    let sum: f64 = probabilities.values().sum();
+    if (sum - 1.0).abs() > config.distribution_tolerance {
+        return Err(ClassificationErrorKind::InvalidResponse);
+    }
+    let selected_probability = probabilities[choice];
+    if probabilities
+        .values()
+        .any(|p| *p > selected_probability + f64::EPSILON * 8.0)
+    {
+        return Err(ClassificationErrorKind::InvalidResponse);
+    }
+    let Some(confidence) = answer.get("confidence").and_then(Value::as_f64) else {
+        return Err(ClassificationErrorKind::InvalidResponse);
+    };
+    let expected_confidence = (selected_probability - 1.0 / 3.0) / (1.0 - 1.0 / 3.0);
+    if !unit(confidence) || (expected_confidence - confidence).abs() > config.confidence_tolerance {
+        return Err(ClassificationErrorKind::InvalidResponse);
+    }
+    Ok(ResponseConfidence {
+        probabilities,
+        selected_probability,
+        confidence,
+    })
 }
 
 /// Recorded responses are keyed by a closed projection digest, never a raw log or secret.

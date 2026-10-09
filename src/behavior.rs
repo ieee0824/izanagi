@@ -131,29 +131,10 @@ impl BehaviorRuntime {
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(config.enabled, "behavior analysis is disabled");
         config.validate()?;
-        let session_id: String = (0..16)
-            .map(|_| format!("{:02x}", rand::random::<u8>()))
-            .collect();
+        let session_id = new_session_id();
         let session_dir = audit_root.join(&session_id);
-        let store = AuditStore::new(
-            &session_dir,
-            StoreConfig {
-                max_session_bytes: config.limits.max_store_bytes,
-                max_segment_bytes: (10 * 1024 * 1024).min(config.limits.max_store_bytes),
-                retention_secs: config.limits.retention_days * 86400,
-                ..Default::default()
-            },
-        )?;
-        let store = Arc::new(Mutex::new(store));
-        let counters = Arc::new(Counters {
-            mcp_commit: config.classifier.mcp_commit.clone(),
-            requested_model: if config.classifier.provider == "mock" {
-                "mock-v1".into()
-            } else {
-                config.classifier.model.clone()
-            },
-            ..Default::default()
-        });
+        let store = runtime_store(config, &session_dir)?;
+        let counters = runtime_counters(config);
         let latest = Arc::new(Mutex::new(Latest::default()));
         let (sender, rx) = mpsc::channel(config.limits.telemetry_queue);
         let (queue, windows) = mpsc::channel(config.limits.queue_windows);
@@ -182,12 +163,7 @@ impl BehaviorRuntime {
             config.classifier.provider
         );
         Ok(Self {
-            start: BehaviorStartConfig {
-                session_id,
-                proxy_listen: config.proxy_listen.clone(),
-                allowed_hosts,
-                fixture_endpoint: config.fixture_endpoint.clone(),
-            },
+            start: guest_start_config(config, session_id, allowed_hosts),
             sender,
             stop,
             tasks: vec![ingestion, worker],
@@ -230,6 +206,48 @@ impl Drop for BehaviorRuntime {
         }
     }
 }
+fn runtime_store(
+    config: &BehaviorSection,
+    session_dir: &Path,
+) -> anyhow::Result<Arc<Mutex<AuditStore>>> {
+    let store = AuditStore::new(
+        session_dir,
+        StoreConfig {
+            max_session_bytes: config.limits.max_store_bytes,
+            max_segment_bytes: (10 * 1024 * 1024).min(config.limits.max_store_bytes),
+            retention_secs: config.limits.retention_days * 86400,
+            ..Default::default()
+        },
+    )?;
+    let store = Arc::new(Mutex::new(store));
+    Ok(store)
+}
+
+fn runtime_counters(config: &BehaviorSection) -> Arc<Counters> {
+    Arc::new(Counters {
+        mcp_commit: config.classifier.mcp_commit.clone(),
+        requested_model: if config.classifier.provider == "mock" {
+            "mock-v1".into()
+        } else {
+            config.classifier.model.clone()
+        },
+        ..Default::default()
+    })
+}
+
+fn guest_start_config(
+    config: &BehaviorSection,
+    session_id: String,
+    allowed_hosts: Vec<String>,
+) -> BehaviorStartConfig {
+    BehaviorStartConfig {
+        session_id,
+        proxy_listen: config.proxy_listen.clone(),
+        allowed_hosts,
+        fixture_endpoint: config.fixture_endpoint.clone(),
+    }
+}
+
 fn unix_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -261,55 +279,18 @@ async fn ingest(
     latest: Arc<Mutex<Latest>>,
     counters: Arc<Counters>,
 ) {
-    let mut correlator =
-        Correlator::new(Default::default()).expect("fixed bounded correlation configuration");
-    let baseline: Vec<_> = baseline
-        .into_iter()
-        .map(|s| s.trim_end_matches('.').to_ascii_lowercase())
-        .collect();
-    let mut clocks: HashMap<String, (u64, Instant, u64)> = HashMap::new();
+    let mut state = IngestionState::new(baseline);
     let mut tick = tokio::time::interval(Duration::from_millis(250));
-    let mut pending_gap = false;
     let mut closing = false;
     loop {
         let snapshots = tokio::select! {
             biased;
-            _=stop.changed(), if !closing=> { rx.close(); closing=true; Vec::new() },
-            _=tick.tick(), if !closing=> {
-                let mut snapshots=Vec::new();
-                for (domain,(observed,received,uncertainty)) in &clocks {
-                    // Guest and host monotonic clocks have different epochs. Advance only
-                    // by elapsed host duration since an actual same-domain guest event.
-                    let elapsed=received.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-                    snapshots.extend(correlator.advance_clock_uncertain(domain,observed.saturating_add(elapsed),uncertainty.saturating_add(5_000_000)));
-                }
+            _ = stop.changed(), if !closing => { rx.close(); closing = true; Vec::new() },
+            _ = tick.tick(), if !closing => state.advance_clocks(),
+            event = rx.recv() => {
+                let Some(event) = event else { break; };
+                let Some(snapshots) = state.receive_event(event, &session, &store, &counters) else { continue; };
                 snapshots
-            },
-            event=rx.recv()=> {
-                let Some(mut event)=event else { break; };
-                if event.session_id!=session || event.validate().is_err() {
-                    counters.invalid.fetch_add(1,Ordering::Relaxed); pending_gap=true; continue;
-                }
-                counters.events.fetch_add(1,Ordering::Relaxed);
-                event.host_received_at_unix_ns=Some(SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos().min(u64::MAX as u128) as u64);
-                if let TelemetryPayload::HttpRequest{raw_host,novelty,..}=&mut event.payload {
-                    *novelty=match raw_host { Some(host)=>if baseline.iter().any(|b|b==&host.trim_end_matches('.').to_ascii_lowercase()) {DestinationNovelty::Known} else {DestinationNovelty::Novel}, None=>DestinationNovelty::Unknown };
-                }
-                // An invalid envelope has no trustworthy time/scope. Coverage
-                // remains degraded until a new authenticated behavior session.
-                if pending_gap { event.quality.issues.push(QualityIssue::EventLoss); }
-                if clocks.len()<16 || clocks.contains_key(&event.clock_domain) {
-                    let clock=clocks.entry(event.clock_domain.clone()).or_insert((event.observed_monotonic_ns,Instant::now(),event.clock_uncertainty_ns));
-                    // Delayed source events must not reset the live clock estimate backwards.
-                    let estimate=clock.0.saturating_add(clock.1.elapsed().as_nanos().min(u64::MAX as u128) as u64);
-                    if event.observed_monotonic_ns>=estimate { *clock=(event.observed_monotonic_ns,Instant::now(),event.clock_uncertainty_ns); }
-                    else { clock.2=clock.2.max(event.clock_uncertainty_ns); }
-                } else { event.quality.issues.push(QualityIssue::ClockUnknown); }
-                let result=store.lock().expect("audit lock").append_event(&event,unix_secs());
-                let storage_bad=!result.as_ref().is_ok_and(|r|!r.storage_gap);
-                stored(result,&counters);
-                if storage_bad { event.quality.issues.push(QualityIssue::StorageGap); }
-                match correlator.ingest(event) { Ok(s)=>s,Err(_)=>{ counters.invalid.fetch_add(1,Ordering::Relaxed); pending_gap=true; Vec::new() } }
             },
         };
         for snapshot in snapshots {
@@ -317,7 +298,7 @@ async fn ingest(
         }
     }
     // Final snapshots remain audit records; stopped sessions cannot start new inference.
-    for snapshot in correlator.flush() {
+    for snapshot in state.correlator.flush() {
         stored(
             store
                 .lock()
@@ -335,6 +316,134 @@ async fn ingest(
         );
     }
 }
+
+struct IngestionState {
+    correlator: Correlator,
+    baseline: Vec<String>,
+    clocks: HashMap<String, (u64, Instant, u64)>,
+    pending_gap: bool,
+}
+impl IngestionState {
+    fn new(baseline: Vec<String>) -> Self {
+        Self {
+            correlator: Correlator::new(Default::default())
+                .expect("fixed bounded correlation configuration"),
+            baseline: baseline
+                .into_iter()
+                .map(|s| s.trim_end_matches('.').to_ascii_lowercase())
+                .collect(),
+            clocks: HashMap::new(),
+            pending_gap: false,
+        }
+    }
+
+    fn advance_clocks(&mut self) -> Vec<FeatureSnapshot> {
+        let mut snapshots = Vec::new();
+        for (domain, (observed, received, uncertainty)) in &self.clocks {
+            // Advance only by elapsed host duration since an actual same-domain guest event.
+            let elapsed = received.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+            snapshots.extend(self.correlator.advance_clock_uncertain(
+                domain,
+                observed.saturating_add(elapsed),
+                uncertainty.saturating_add(5_000_000),
+            ));
+        }
+        snapshots
+    }
+
+    fn receive_event(
+        &mut self,
+        mut event: TelemetryEnvelope,
+        session: &str,
+        store: &Arc<Mutex<AuditStore>>,
+        counters: &Counters,
+    ) -> Option<Vec<FeatureSnapshot>> {
+        if event.session_id != session || event.validate().is_err() {
+            counters.invalid.fetch_add(1, Ordering::Relaxed);
+            self.pending_gap = true;
+            return None;
+        }
+        counters.events.fetch_add(1, Ordering::Relaxed);
+        event.host_received_at_unix_ns = Some(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+                .min(u64::MAX as u128) as u64,
+        );
+        self.assign_novelty(&mut event);
+        // Invalid envelopes have no trustworthy scope/time: coverage stays degraded for this session.
+        if self.pending_gap {
+            event.quality.issues.push(QualityIssue::EventLoss);
+        }
+        self.update_clock(&mut event);
+        let result = store
+            .lock()
+            .expect("audit lock")
+            .append_event(&event, unix_secs());
+        let storage_bad = !result.as_ref().is_ok_and(|r| !r.storage_gap);
+        stored(result, counters);
+        if storage_bad {
+            event.quality.issues.push(QualityIssue::StorageGap);
+        }
+        Some(match self.correlator.ingest(event) {
+            Ok(snapshots) => snapshots,
+            Err(_) => {
+                counters.invalid.fetch_add(1, Ordering::Relaxed);
+                self.pending_gap = true;
+                Vec::new()
+            }
+        })
+    }
+
+    fn assign_novelty(&self, event: &mut TelemetryEnvelope) {
+        if let TelemetryPayload::HttpRequest {
+            raw_host, novelty, ..
+        } = &mut event.payload
+        {
+            *novelty = match raw_host {
+                Some(host) => {
+                    if self
+                        .baseline
+                        .iter()
+                        .any(|b| b == &host.trim_end_matches('.').to_ascii_lowercase())
+                    {
+                        DestinationNovelty::Known
+                    } else {
+                        DestinationNovelty::Novel
+                    }
+                }
+                None => DestinationNovelty::Unknown,
+            };
+        }
+    }
+
+    fn update_clock(&mut self, event: &mut TelemetryEnvelope) {
+        if self.clocks.len() < 16 || self.clocks.contains_key(&event.clock_domain) {
+            let clock = self.clocks.entry(event.clock_domain.clone()).or_insert((
+                event.observed_monotonic_ns,
+                Instant::now(),
+                event.clock_uncertainty_ns,
+            ));
+            // Delayed source events must not reset the live estimate backwards.
+            let estimate = clock
+                .0
+                .saturating_add(clock.1.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+            if event.observed_monotonic_ns >= estimate {
+                *clock = (
+                    event.observed_monotonic_ns,
+                    Instant::now(),
+                    event.clock_uncertainty_ns,
+                );
+            } else {
+                clock.2 = clock.2.max(event.clock_uncertainty_ns);
+            }
+        } else {
+            event.quality.issues.push(QualityIssue::ClockUnknown);
+        }
+    }
+}
+
 fn enqueue(
     snapshot: FeatureSnapshot,
     queue: &mpsc::Sender<Pending>,
@@ -375,6 +484,16 @@ fn enqueue(
         );
         return;
     }
+    queue_pending(snapshot, digest, queue, store, counters);
+}
+
+fn queue_pending(
+    snapshot: FeatureSnapshot,
+    digest: String,
+    queue: &mpsc::Sender<Pending>,
+    store: &Arc<Mutex<AuditStore>>,
+    counters: &Counters,
+) {
     let pending = Pending {
         snapshot,
         digest,
@@ -417,20 +536,13 @@ async fn classify(
                 reason: SkipReason::ExportDenied,
             }
         } else {
-            let projection = pending.snapshot.projection(FeatureMode::Correlated);
-            let classifier = classifier.clone();
-            // JoinSet aborts its invocation on timeout, shutdown, or worker drop.
-            // A provider panic becomes an audit failure; ingestion keeps running.
-            let mut invocation = tokio::task::JoinSet::new();
-            invocation.spawn(async move { classifier.classify(&projection).await });
-            tokio::select! { biased;
-                _=stop.changed()=> { record(&pending.snapshot,ClassificationOutcome::Skipped{reason:SkipReason::SessionEnded},&store,&counters); break; },
-                outcome=tokio::time::timeout(Duration::from_secs(config.classifier.deadline_secs),invocation.join_next())=>match outcome {
-                    Ok(Some(Ok(outcome)))=>outcome,
-                    Ok(_)=>ClassificationOutcome::Failed{kind:crate::behavior_classifier::ClassificationErrorKind::Panicked},
-                    Err(_)=>ClassificationOutcome::Failed{kind:crate::behavior_classifier::ClassificationErrorKind::Timeout},
-                },
-            }
+            let Some(outcome) =
+                invoke_classifier(&pending, &classifier, &config, &mut stop, &store, &counters)
+                    .await
+            else {
+                break;
+            };
+            outcome
         };
         let outcome = if pending.created.elapsed()
             > Duration::from_secs(config.limits.max_result_age_secs)
@@ -444,6 +556,14 @@ async fn classify(
         };
         record(&pending.snapshot, outcome, &store, &counters);
     }
+    discard_pending(&mut rx, &store, &counters);
+}
+
+fn discard_pending(
+    rx: &mut mpsc::Receiver<Pending>,
+    store: &Arc<Mutex<AuditStore>>,
+    counters: &Counters,
+) {
     rx.close();
     while let Ok(pending) = rx.try_recv() {
         record(
@@ -451,10 +571,40 @@ async fn classify(
             ClassificationOutcome::Skipped {
                 reason: SkipReason::SessionEnded,
             },
-            &store,
-            &counters,
+            store,
+            counters,
         );
     }
+}
+
+fn new_session_id() -> String {
+    (0..16)
+        .map(|_| format!("{:02x}", rand::random::<u8>()))
+        .collect()
+}
+
+async fn invoke_classifier(
+    pending: &Pending,
+    classifier: &Arc<dyn Classifier>,
+    config: &BehaviorSection,
+    stop: &mut watch::Receiver<bool>,
+    store: &Arc<Mutex<AuditStore>>,
+    counters: &Counters,
+) -> Option<ClassificationOutcome> {
+    let projection = pending.snapshot.projection(FeatureMode::Correlated);
+    let classifier = classifier.clone();
+    // JoinSet aborts its invocation on timeout, shutdown, or worker drop.
+    // A provider panic becomes an audit failure; ingestion keeps running.
+    let mut invocation = tokio::task::JoinSet::new();
+    invocation.spawn(async move { classifier.classify(&projection).await });
+    Some(tokio::select! { biased;
+        _=stop.changed()=> { record(&pending.snapshot,ClassificationOutcome::Skipped{reason:SkipReason::SessionEnded},store,counters); return None; },
+        outcome=tokio::time::timeout(Duration::from_secs(config.classifier.deadline_secs),invocation.join_next())=>match outcome {
+            Ok(Some(Ok(outcome)))=>outcome,
+            Ok(_)=>ClassificationOutcome::Failed{kind:crate::behavior_classifier::ClassificationErrorKind::Panicked},
+            Err(_)=>ClassificationOutcome::Failed{kind:crate::behavior_classifier::ClassificationErrorKind::Timeout},
+        },
+    })
 }
 
 fn record(
@@ -496,8 +646,23 @@ fn persist_classification(
     store: &Arc<Mutex<AuditStore>>,
     counters: &Counters,
 ) {
+    let Some(audit) = classification_audit(snapshot, outcome, counters) else {
+        return;
+    };
+    stored(
+        store
+            .lock()
+            .expect("audit lock")
+            .append_classification(&audit, unix_secs()),
+        counters,
+    );
+}
+
+fn audit_status(
+    outcome: &ClassificationOutcome,
+) -> (ClassificationStatus, Option<ClassificationReason>) {
     use crate::behavior_classifier::ClassificationErrorKind as Error;
-    let (status, reason) = match outcome {
+    match outcome {
         ClassificationOutcome::Classified { .. } => (ClassificationStatus::Classified, None),
         ClassificationOutcome::Abstained { reason, .. } => (
             ClassificationStatus::Abstained,
@@ -534,13 +699,21 @@ fn persist_classification(
                 SkipReason::MissingRecording => ClassificationReason::McpError,
             }),
         ),
-    };
+    }
+}
+
+fn classification_audit(
+    snapshot: &FeatureSnapshot,
+    outcome: &ClassificationOutcome,
+    counters: &Counters,
+) -> Option<ClassificationAudit> {
+    let (status, reason) = audit_status(outcome);
     let Ok(projection_digest) = snapshot.projection(FeatureMode::Correlated).digest() else {
         counters.storage_failed.fetch_add(1, Ordering::Relaxed);
-        return;
+        return None;
     };
     let answer = outcome.answer();
-    let audit = ClassificationAudit {
+    Some(ClassificationAudit {
         session_id: snapshot.session_id.clone(),
         window_id: snapshot.window_id.clone(),
         revision: snapshot.revision,
@@ -573,14 +746,7 @@ fn persist_classification(
         evidence_event_ids: snapshot.evidence_event_ids.clone(),
         queued_ns: None,
         elapsed_ns: answer.map(|a| a.elapsed_ms.saturating_mul(1_000_000)),
-    };
-    stored(
-        store
-            .lock()
-            .expect("audit lock")
-            .append_classification(&audit, unix_secs()),
-        counters,
-    );
+    })
 }
 
 #[cfg(test)]

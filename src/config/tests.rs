@@ -863,3 +863,19 @@ fn current_dir_join_returns_absolute_path() {
         "current_dir().join(\"izanagi.toml\") should be absolute, got: {path:?}"
     );
 }
+
+#[test]
+fn validation_preserves_backend_then_platform_then_share_error_priority() {
+    let mut config = Config::default();
+    config.sandbox.backend = SandboxBackend::Qemu;
+    config.sandbox.tracer = TracerBackend::Ebpf;
+    config.share.paths = vec!["/".into()];
+    let error = config.validate_for_platform(false, true).unwrap_err();
+    assert!(error.to_string().contains("[sandbox.qemu]"));
+    config.sandbox.backend = SandboxBackend::Native;
+    let error = config.validate_for_platform(false, true).unwrap_err();
+    assert!(error.to_string().contains("ebpf"));
+    config.sandbox.tracer = TracerBackend::Auto;
+    let error = config.validate_for_platform(false, true).unwrap_err();
+    assert!(error.to_string().contains("ルートパス"));
+}

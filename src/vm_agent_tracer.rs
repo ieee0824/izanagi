@@ -191,6 +191,55 @@ impl VmAgentTracer {
         Ok(client)
     }
 
+    async fn connect_ready(
+        port: u16,
+        filter: &TraceFilter,
+        secret: Option<Vec<u8>>,
+        token: Option<String>,
+        behavior: Option<crate::protocol::BehaviorStartConfig>,
+    ) -> anyhow::Result<
+        crate::protocol_client::ProtocolClient<
+            tokio::io::ReadHalf<tokio::net::TcpStream>,
+            tokio::io::WriteHalf<tokio::net::TcpStream>,
+        >,
+    > {
+        let stream = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            tokio::net::TcpStream::connect(("127.0.0.1", port)),
+        )
+        .await??;
+        Self::prepare_inner(stream, filter, secret, token, behavior).await
+    }
+
+    fn reserve_start(
+        &self,
+        shutdown_tx: tokio::sync::oneshot::Sender<()>,
+    ) -> anyhow::Result<AgentStartup> {
+        let mut inner = self.inner.lock().expect("VmAgentTracerInner lock poisoned");
+        if inner.shutdown_tx.is_some() || inner.starting {
+            anyhow::bail!("VmAgentTracer is already running");
+        }
+        let port = match inner.port_override {
+            Some(p) => p,
+            None => u16::try_from(self.config.port).map_err(|_| {
+                anyhow::anyhow!(
+                    "invalid VmAgentConfig.port: {} exceeds u16 range",
+                    self.config.port
+                )
+            })?,
+        };
+        inner.shutdown_tx = Some(shutdown_tx);
+        inner.starting = true;
+        inner.failure = None;
+        Ok(AgentStartup {
+            token: inner.token.clone(),
+            port,
+            secret: inner.secret.clone(),
+            behavior: inner.behavior.clone(),
+            telemetry_tx: inner.telemetry_tx.clone(),
+        })
+    }
+
     async fn receive_events<R, W>(
         client: &mut crate::protocol_client::ProtocolClient<R, W>,
         tx: mpsc::Sender<Arc<SyscallEvent>>,
@@ -214,19 +263,8 @@ impl VmAgentTracer {
                                 _ = &mut *shutdown_rx => { break; }
                             }
                         }
-                        Some(Message::Telemetry(mut event)) => {
-                            if let Some(ref sender) = telemetry_tx {
-                                if telemetry_dropped > 0 {
-                                    event.quality.issues.push(izanagi_telemetry::QualityIssue::EventLoss);
-                                }
-                                if sender.try_send(*event).is_err() {
-                                    telemetry_dropped = telemetry_dropped.saturating_add(1);
-                                    if telemetry_dropped == 1 { eprintln!("behavior telemetry queue full or closed; optional analysis is degraded"); }
-                                } else {
-                                    if telemetry_dropped > 0 { eprintln!("behavior telemetry dropped: {telemetry_dropped}"); }
-                                    telemetry_dropped = 0;
-                                }
-                            }
+                        Some(Message::Telemetry(event)) => {
+                            forward_optional_telemetry(*event, &telemetry_tx, &mut telemetry_dropped);
                         }
                         Some(Message::Error(e)) => {
                             anyhow::bail!("agent error: {}", e);
@@ -247,6 +285,54 @@ impl VmAgentTracer {
         }
         Ok(())
     }
+}
+
+fn forward_optional_telemetry(
+    mut event: izanagi_telemetry::TelemetryEnvelope,
+    telemetry_tx: &Option<mpsc::Sender<izanagi_telemetry::TelemetryEnvelope>>,
+    telemetry_dropped: &mut u64,
+) {
+    if let Some(sender) = telemetry_tx {
+        if *telemetry_dropped > 0 {
+            event
+                .quality
+                .issues
+                .push(izanagi_telemetry::QualityIssue::EventLoss);
+        }
+        if sender.try_send(event).is_err() {
+            *telemetry_dropped = telemetry_dropped.saturating_add(1);
+            if *telemetry_dropped == 1 {
+                eprintln!("behavior telemetry queue full or closed; optional analysis is degraded");
+            }
+        } else {
+            if *telemetry_dropped > 0 {
+                eprintln!("behavior telemetry dropped: {telemetry_dropped}");
+            }
+            *telemetry_dropped = 0;
+        }
+    }
+}
+
+fn record_monitoring_failure(
+    result: anyhow::Result<()>,
+    state: &std::sync::Weak<std::sync::Mutex<VmAgentTracerInner>>,
+) {
+    if let Err(error) = result
+        && let Some(state) = state.upgrade()
+    {
+        state
+            .lock()
+            .expect("VmAgentTracerInner lock poisoned")
+            .failure = Some(error.to_string());
+    }
+}
+
+struct AgentStartup {
+    token: Option<String>,
+    port: u16,
+    secret: Option<Vec<u8>>,
+    behavior: Option<crate::protocol::BehaviorStartConfig>,
+    telemetry_tx: Option<mpsc::Sender<izanagi_telemetry::TelemetryEnvelope>>,
 }
 
 struct StartReservation {
@@ -312,37 +398,17 @@ impl Tracer for VmAgentTracer {
         &self,
         filter: &TraceFilter,
     ) -> anyhow::Result<mpsc::Receiver<Arc<SyscallEvent>>> {
-        use tokio::net::TcpStream;
-
         let (tx, rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
 
         // チェックと設定を同一ロック内で原子的に行い TOCTOU を防止
-        let (token, port, secret, behavior, telemetry_tx) = {
-            let mut inner = self.inner.lock().expect("VmAgentTracerInner lock poisoned");
-            if inner.shutdown_tx.is_some() || inner.starting {
-                anyhow::bail!("VmAgentTracer is already running");
-            }
-            let port = match inner.port_override {
-                Some(p) => p,
-                None => u16::try_from(self.config.port).map_err(|_| {
-                    anyhow::anyhow!(
-                        "invalid VmAgentConfig.port: {} exceeds u16 range",
-                        self.config.port
-                    )
-                })?,
-            };
-            inner.shutdown_tx = Some(shutdown_tx);
-            inner.starting = true;
-            inner.failure = None;
-            (
-                inner.token.clone(),
-                port,
-                inner.secret.clone(),
-                inner.behavior.clone(),
-                inner.telemetry_tx.clone(),
-            )
-        };
+        let AgentStartup {
+            token,
+            port,
+            secret,
+            behavior,
+            telemetry_tx,
+        } = self.reserve_start(shutdown_tx)?;
 
         // Roll back the reservation on every failure or cancellation.
         let mut reservation = StartReservation {
@@ -350,14 +416,7 @@ impl Tracer for VmAgentTracer {
             committed: false,
         };
         let mut shutdown_rx = shutdown_rx;
-        let setup = async {
-            let stream = tokio::time::timeout(
-                std::time::Duration::from_secs(10),
-                TcpStream::connect(("127.0.0.1", port)),
-            )
-            .await??;
-            Self::prepare_inner(stream, filter, secret, token, behavior).await
-        };
+        let setup = Self::connect_ready(port, filter, secret, token, behavior);
         let mut client = tokio::select! {
             biased;
             _ = &mut shutdown_rx => anyhow::bail!("tracer startup cancelled"),
@@ -373,14 +432,7 @@ impl Tracer for VmAgentTracer {
             // Retain a sender until the failure reason has been recorded.
             let result =
                 Self::receive_events(&mut client, tx.clone(), &mut shutdown_rx, telemetry_tx).await;
-            if let Err(error) = result
-                && let Some(state) = state.upgrade()
-            {
-                state
-                    .lock()
-                    .expect("VmAgentTracerInner lock poisoned")
-                    .failure = Some(error.to_string());
-            }
+            record_monitoring_failure(result, &state);
         }));
         inner.starting = false;
         reservation.committed = true;
@@ -409,6 +461,31 @@ impl Tracer for VmAgentTracer {
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn optional_telemetry_queue_marks_the_next_delivered_event_after_loss() {
+        let event: izanagi_telemetry::TelemetryEnvelope = serde_json::from_str(
+            include_str!("../tests/fixtures/behavior/normal.jsonl")
+                .lines()
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        let (tx, mut rx) = mpsc::channel(1);
+        let sender = Some(tx);
+        let mut dropped = 0;
+        forward_optional_telemetry(event.clone(), &sender, &mut dropped);
+        forward_optional_telemetry(event.clone(), &sender, &mut dropped);
+        forward_optional_telemetry(event.clone(), &sender, &mut dropped);
+        assert_eq!(dropped, 2);
+        assert!(rx.recv().await.unwrap().quality.issues.is_empty());
+        forward_optional_telemetry(event, &sender, &mut dropped);
+        assert_eq!(dropped, 0);
+        assert_eq!(
+            rx.recv().await.unwrap().quality.issues,
+            vec![izanagi_telemetry::QualityIssue::EventLoss]
+        );
+    }
     use super::*;
     use crate::event::{Syscall, SyscallArg, SyscallResult};
 

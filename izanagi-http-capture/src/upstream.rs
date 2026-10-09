@@ -45,33 +45,7 @@ async fn forward_https_inner(
 ) -> anyhow::Result<Vec<u8>> {
     let addr = format!("{}:{}", host, port);
 
-    // DNS 解決を明示的に行い、プライベート IP を除外してパブリック候補のみに接続する。
-    // split-horizon DNS 等で「パブリック + プライベート」が返るケースでも、
-    // パブリック候補があればそちらへ接続し可用性を維持する。
-    // 全候補がプライベート IP の場合のみ SSRF 防止のためブロックする。
-    let resolved = tokio::net::lookup_host(&addr)
-        .await
-        .with_context(|| format!("上流ホスト名の解決に失敗: {}", addr))?;
-    let resolved: Vec<_> = resolved.collect();
-
-    let public_addrs: Vec<_> = resolved
-        .iter()
-        .filter(|sa| !crate::ip_filter::is_private_ip(sa.ip()))
-        .collect();
-
-    if public_addrs.is_empty() {
-        if resolved.is_empty() {
-            anyhow::bail!("上流ホスト {} の DNS 解決結果が空です", host);
-        }
-        let private_ips: Vec<String> = resolved.iter().map(|sa| sa.ip().to_string()).collect();
-        anyhow::bail!(
-            "上流ホスト {} がプライベート IP ({}) のみに解決されました。SSRF 防止のため接続をブロックします。",
-            host,
-            private_ips.join(", ")
-        );
-    }
-
-    let target_addr = public_addrs[0];
+    let target_addr = resolve_public_upstream(host, &addr).await?;
 
     let connector = cached_tls_connector();
     let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
@@ -92,6 +66,49 @@ async fn forward_https_inner(
         .await
         .context("上流へのリクエスト送信に失敗")?;
 
+    read_upstream_response(&mut tls_stream).await
+}
+
+async fn resolve_public_upstream(host: &str, addr: &str) -> anyhow::Result<std::net::SocketAddr> {
+    // DNS 解決を明示的に行い、プライベート IP を除外してパブリック候補のみに接続する。
+    // split-horizon DNS 等で「パブリック + プライベート」が返るケースでも、
+    // パブリック候補があればそちらへ接続し可用性を維持する。
+    // 全候補がプライベート IP の場合のみ SSRF 防止のためブロックする。
+    let resolved = tokio::net::lookup_host(addr)
+        .await
+        .with_context(|| format!("上流ホスト名の解決に失敗: {}", addr))?;
+    let resolved: Vec<_> = resolved.collect();
+
+    select_public_upstream(host, &resolved)
+}
+
+fn select_public_upstream(
+    host: &str,
+    resolved: &[std::net::SocketAddr],
+) -> anyhow::Result<std::net::SocketAddr> {
+    let public_addrs: Vec<_> = resolved
+        .iter()
+        .filter(|sa| !crate::ip_filter::is_private_ip(sa.ip()))
+        .collect();
+
+    if public_addrs.is_empty() {
+        if resolved.is_empty() {
+            anyhow::bail!("上流ホスト {} の DNS 解決結果が空です", host);
+        }
+        let private_ips: Vec<String> = resolved.iter().map(|sa| sa.ip().to_string()).collect();
+        anyhow::bail!(
+            "上流ホスト {} がプライベート IP ({}) のみに解決されました。SSRF 防止のため接続をブロックします。",
+            host,
+            private_ips.join(", ")
+        );
+    }
+
+    Ok(*public_addrs[0])
+}
+
+async fn read_upstream_response<S: tokio::io::AsyncRead + Unpin>(
+    tls_stream: &mut S,
+) -> anyhow::Result<Vec<u8>> {
     // レスポンスを受信（最大 1MB）
     let mut response = Vec::new();
     let max_response = 1024 * 1024;
@@ -114,12 +131,8 @@ async fn forward_https_inner(
     Ok(response)
 }
 
-// NOTE: forward_https / forward_https_inner の統合テスト (SSRF 防止・タイムアウト) は
-// tokio::net::lookup_host + TcpStream::connect が実ネットワーク接続を必要とするため
-// 現時点では追加していない。プライベート IP 検証ロジックは ip_filter モジュールの
-// 単体テストでカバーしている。リファクタリング Phase で DNS 解決・TCP 接続を
-// trait 化しモック可能にした後、forward_https の統合テストを追加すること。
-// (tasks.db Phase 8 / task 320)
+// Public-address selection and bounded response reading are tested without external
+// network access. DNS/TCP/TLS remain inside the single forward_https timeout.
 
 /// HTTP/1.1 リクエストバイト列を構築する。
 pub fn build_http_request(
@@ -136,6 +149,20 @@ pub fn build_http_request(
         sanitize_header_value(host),
     );
 
+    append_extra_headers(&mut request, headers_extra);
+
+    if !body.is_empty() {
+        request.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    }
+
+    request.push_str("Connection: close\r\n\r\n");
+
+    let mut bytes = request.into_bytes();
+    bytes.extend_from_slice(body);
+    bytes
+}
+
+fn append_extra_headers(request: &mut String, headers_extra: &[(String, String)]) {
     // hop-by-hop ヘッダーと重複管理ヘッダーを除外
     const SKIP_HEADERS: &[&str] = &[
         "host",
@@ -161,16 +188,6 @@ pub fn build_http_request(
             sanitize_header_value(value),
         ));
     }
-
-    if !body.is_empty() {
-        request.push_str(&format!("Content-Length: {}\r\n", body.len()));
-    }
-
-    request.push_str("Connection: close\r\n\r\n");
-
-    let mut bytes = request.into_bytes();
-    bytes.extend_from_slice(body);
-    bytes
 }
 
 /// HTTP ヘッダーの key/value から CR/LF を除去してヘッダーインジェクションを防止する。
@@ -181,6 +198,39 @@ fn sanitize_header_value(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upstream_selection_rejects_empty_and_private_only_answers() {
+        assert!(
+            select_public_upstream("example.test", &[])
+                .unwrap_err()
+                .to_string()
+                .contains("空です")
+        );
+        let private = "127.0.0.1:443".parse().unwrap();
+        let first = "8.8.8.8:443".parse().unwrap();
+        let second = "1.1.1.1:443".parse().unwrap();
+        assert!(select_public_upstream("example.test", &[private]).is_err());
+        assert_eq!(
+            select_public_upstream("example.test", &[private, first, second]).unwrap(),
+            first
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_response_accepts_exact_limit_and_rejects_one_extra_byte() {
+        let bytes = vec![b'x'; 1024 * 1024];
+        let mut reader = std::io::Cursor::new(bytes.clone());
+        assert_eq!(read_upstream_response(&mut reader).await.unwrap(), bytes);
+        let mut reader = std::io::Cursor::new(vec![b'x'; 1024 * 1024 + 1]);
+        assert!(
+            read_upstream_response(&mut reader)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("最大サイズ")
+        );
+    }
 
     #[test]
     fn build_request_get() {

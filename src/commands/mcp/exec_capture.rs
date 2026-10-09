@@ -35,86 +35,74 @@ pub(super) async fn exec_on_session_capture(
             container_name,
             mount_point,
             ..
-        } => {
-            let args = izanagi::apple_container_sandbox::build_exec_args(
-                container_name,
-                cmd,
-                &env,
-                mount_point,
-            );
-
-            let mut child = tokio::process::Command::new("container")
-                .args(&args)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .kill_on_drop(true)
-                .spawn()
-                .context("container exec の実行に失敗")?;
-
-            let read_limit = (MAX_OUTPUT_SIZE + 1) as u64;
-
-            let mut child_stdout = child.stdout.take().expect("stdout must be piped");
-            let mut child_stderr = child.stderr.take().expect("stderr must be piped");
-
-            let exec_fut = async {
-                tokio::try_join!(
-                    async {
-                        let mut buf = Vec::with_capacity(64 * 1024);
-                        let mut limited = (&mut child_stdout).take(read_limit);
-                        AsyncReadExt::read_to_end(&mut limited, &mut buf).await?;
-                        // drain して子プロセスのパイプ詰まりを防止 (上限付き)。
-                        // 上限超過時はパイプを閉じて子プロセスを SIGPIPE で終了させる。
-                        let drained = tokio::io::copy(
-                            &mut (&mut child_stdout).take(MAX_DRAIN_SIZE),
-                            &mut tokio::io::sink(),
-                        )
-                        .await?;
-                        if drained >= MAX_DRAIN_SIZE {
-                            // stdout を drop してパイプを閉じる
-                            drop(child_stdout);
-                        }
-                        Ok::<_, std::io::Error>(buf)
-                    },
-                    async {
-                        let mut buf = Vec::with_capacity(64 * 1024);
-                        let mut limited = (&mut child_stderr).take(read_limit);
-                        AsyncReadExt::read_to_end(&mut limited, &mut buf).await?;
-                        let drained = tokio::io::copy(
-                            &mut (&mut child_stderr).take(MAX_DRAIN_SIZE),
-                            &mut tokio::io::sink(),
-                        )
-                        .await?;
-                        if drained >= MAX_DRAIN_SIZE {
-                            drop(child_stderr);
-                        }
-                        Ok::<_, std::io::Error>(buf)
-                    },
-                    async { child.wait().await },
-                )
-            };
-
-            match tokio::time::timeout(EXEC_TIMEOUT, exec_fut).await {
-                Ok(Ok((stdout_raw, stderr_raw, status))) => Ok(ExecOutput {
-                    exit_code: status.code().unwrap_or(1),
-                    stdout: String::from_utf8_lossy(&truncate_output(stdout_raw)).into_owned(),
-                    stderr: String::from_utf8_lossy(&truncate_output(stderr_raw)).into_owned(),
-                }),
-                Ok(Err(e)) => Err(e.into()),
-                Err(_) => {
-                    let _ = child.kill().await;
-                    let _ = child.wait().await;
-                    anyhow::bail!(
-                        "container exec がタイムアウトしました ({}秒)",
-                        EXEC_TIMEOUT.as_secs()
-                    );
-                }
-            }
-        }
+        } => exec_on_container_session_capture(container_name, mount_point, cmd, &env).await,
         session::SessionBackend::Qemu {
             host_port,
             token_hash,
         } => exec_on_qemu_session_capture(*host_port, token_hash.clone(), cmd, &env).await,
     }
+}
+
+async fn exec_on_container_session_capture(
+    container_name: &str,
+    mount_point: &str,
+    cmd: &[String],
+    env: &HashMap<String, String>,
+) -> anyhow::Result<ExecOutput> {
+    let args =
+        izanagi::apple_container_sandbox::build_exec_args(container_name, cmd, env, mount_point);
+
+    let mut child = tokio::process::Command::new("container")
+        .args(&args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .context("container exec の実行に失敗")?;
+
+    let child_stdout = child.stdout.take().expect("stdout must be piped");
+    let child_stderr = child.stderr.take().expect("stderr must be piped");
+    let exec_fut = async {
+        tokio::try_join!(
+            capture_pipe(child_stdout),
+            capture_pipe(child_stderr),
+            child.wait()
+        )
+    };
+
+    match tokio::time::timeout(EXEC_TIMEOUT, exec_fut).await {
+        Ok(Ok((stdout_raw, stderr_raw, status))) => Ok(ExecOutput {
+            exit_code: status.code().unwrap_or(1),
+            stdout: String::from_utf8_lossy(&truncate_output(stdout_raw)).into_owned(),
+            stderr: String::from_utf8_lossy(&truncate_output(stderr_raw)).into_owned(),
+        }),
+        Ok(Err(e)) => Err(e.into()),
+        Err(_) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            anyhow::bail!(
+                "container exec がタイムアウトしました ({}秒)",
+                EXEC_TIMEOUT.as_secs()
+            );
+        }
+    }
+}
+
+async fn capture_pipe(mut pipe: impl tokio::io::AsyncRead + Unpin) -> std::io::Result<Vec<u8>> {
+    let mut buf = Vec::with_capacity(64 * 1024);
+    let read_limit = (MAX_OUTPUT_SIZE + 1) as u64;
+    let mut limited = (&mut pipe).take(read_limit);
+    limited.read_to_end(&mut buf).await?;
+    // Drain with the same cap; dropping the pipe closes it if the cap is reached.
+    let drained = tokio::io::copy(
+        &mut (&mut pipe).take(MAX_DRAIN_SIZE),
+        &mut tokio::io::sink(),
+    )
+    .await?;
+    if drained >= MAX_DRAIN_SIZE {
+        drop(pipe);
+    }
+    Ok(buf)
 }
 
 /// QEMU バックエンド向けキャプチャ版 exec。共通ヘルパーを利用。タイムアウト付き。
@@ -144,6 +132,32 @@ async fn exec_on_qemu_session_capture(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn capture_retains_only_output_prefix_and_drains_both_pipes() {
+        let (mut stdout_writer, stdout) = tokio::io::duplex(128);
+        let (mut stderr_writer, stderr) = tokio::io::duplex(128);
+        let size = (MAX_OUTPUT_SIZE + 4096) as u64;
+        let writers = async {
+            let mut stdout_bytes = tokio::io::repeat(b'o').take(size);
+            let mut stderr_bytes = tokio::io::repeat(b'e').take(size);
+            tokio::try_join!(
+                tokio::io::copy(&mut stdout_bytes, &mut stdout_writer),
+                tokio::io::copy(&mut stderr_bytes, &mut stderr_writer),
+            )
+            .unwrap();
+            drop((stdout_writer, stderr_writer));
+        };
+        let capture = async { tokio::try_join!(capture_pipe(stdout), capture_pipe(stderr)) };
+        let (_, result) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::join!(writers, capture)
+        })
+        .await
+        .unwrap();
+        let (stdout, stderr) = result.unwrap();
+        assert_eq!(stdout, vec![b'o'; MAX_OUTPUT_SIZE + 1]);
+        assert_eq!(stderr, vec![b'e'; MAX_OUTPUT_SIZE + 1]);
+    }
 
     #[test]
     fn truncate_output_under_limit() {

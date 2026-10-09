@@ -142,27 +142,7 @@ fn emit_event(
             16,
         );
 
-        // Read only arguments whose syscall ABI defines a userspace pathname.
-        // Never dereference the pointer directly: the helper bounds the copy,
-        // omits the trailing NUL, and reports inaccessible memory as an error.
-        let path_ptr = match syscall_id {
-            SyscallId::OpenAt => Some((*event).arg1),
-            SyscallId::Stat | SyscallId::Access | SyscallId::Execve => Some((*event).arg0),
-            _ => None,
-        };
-        if let Some(path_ptr) = path_ptr {
-            if let Ok(path) = aya_ebpf::helpers::bpf_probe_read_user_str_bytes(
-                path_ptr as *const u8,
-                &mut (*event).path_buf,
-            ) {
-                (*event).path_len = path.len() as u32;
-                if path.len() >= PATH_BUF_SIZE - 1 {
-                    (*event).flags |= FLAG_PATH_TRUNCATED;
-                }
-            } else {
-                (*event).flags |= FLAG_PATH_FAILED;
-            }
-        }
+        capture_user_path(event, syscall_id);
     }
 
     if syscall_id == SyscallId::OpenAt {
@@ -423,25 +403,7 @@ pub fn inet_sock_set_state(ctx: TracePointContext) -> u32 {
     }
     let now = unsafe { aya_ebpf::helpers::bpf_ktime_get_ns() };
     if state == 2 {
-        let id = aya_ebpf::helpers::bpf_get_current_pid_tgid();
-        let tgid = (id >> 32) as u32;
-        let process = unsafe { PROCESS_GENERATIONS.get(&tgid).copied() }.unwrap_or(Generation {
-            start: 0,
-            exec: 0,
-            parent_start: 0,
-            parent: 0,
-            _pad: 0,
-        });
-        // Opaque correlation ID, generated without exposing the kernel address.
-        let generation = SocketGeneration {
-            started: now,
-            opaque: address,
-            process,
-            tgid,
-            tid: id as u32,
-        };
-        if SOCKET_GENERATIONS.insert(&address, &generation, 0).is_err() {
-            lost();
+        if record_connector(address, now).is_err() {
             return 1;
         }
     }
@@ -455,6 +417,86 @@ pub fn inet_sock_set_state(ctx: TracePointContext) -> u32 {
     };
     unsafe {
         let event = entry.as_mut_ptr();
+        populate_socket_identity(&ctx, event, &generation, state, now);
+        if !read_socket_addresses(&ctx, event) {
+            entry.discard(0);
+            return 0;
+        }
+    }
+    entry.submit(0);
+    if state == 7 {
+        let _ = SOCKET_GENERATIONS.remove(&address);
+    }
+    0
+}
+
+// All helpers inline into their tracepoint to retain the verifier's bounded layout.
+/// # Safety
+/// `event` must point to an initialized, live ring-buffer reservation.
+#[inline(always)]
+unsafe fn capture_user_path(event: *mut RawSyscallEvent, syscall_id: SyscallId) {
+    unsafe {
+        // Read only arguments whose syscall ABI defines a userspace pathname.
+        // Never dereference the pointer directly: the helper bounds the copy,
+        // omits the trailing NUL, and reports inaccessible memory as an error.
+        let path_ptr = match syscall_id {
+            SyscallId::OpenAt => Some((*event).arg1),
+            SyscallId::Stat | SyscallId::Access | SyscallId::Execve => Some((*event).arg0),
+            _ => None,
+        };
+        if let Some(path_ptr) = path_ptr {
+            if let Ok(path) = aya_ebpf::helpers::bpf_probe_read_user_str_bytes(
+                path_ptr as *const u8,
+                &mut (*event).path_buf,
+            ) {
+                (*event).path_len = path.len() as u32;
+                if path.len() >= PATH_BUF_SIZE - 1 {
+                    (*event).flags |= FLAG_PATH_TRUNCATED;
+                }
+            } else {
+                (*event).flags |= FLAG_PATH_FAILED;
+            }
+        }
+    }
+}
+
+#[inline(always)]
+fn record_connector(address: u64, now: u64) -> Result<(), ()> {
+    let id = aya_ebpf::helpers::bpf_get_current_pid_tgid();
+    let tgid = (id >> 32) as u32;
+    let process = unsafe { PROCESS_GENERATIONS.get(&tgid).copied() }.unwrap_or(Generation {
+        start: 0,
+        exec: 0,
+        parent_start: 0,
+        parent: 0,
+        _pad: 0,
+    });
+    // Opaque correlation ID, generated without exposing the kernel address.
+    let generation = SocketGeneration {
+        started: now,
+        opaque: address,
+        process,
+        tgid,
+        tid: id as u32,
+    };
+    if SOCKET_GENERATIONS.insert(&address, &generation, 0).is_err() {
+        lost();
+        return Err(());
+    }
+    Ok(())
+}
+
+/// # Safety
+/// `event` must be a live reservation and `ctx` must use inet_sock_set_state layout.
+#[inline(always)]
+unsafe fn populate_socket_identity(
+    ctx: &TracePointContext,
+    event: *mut RawSyscallEvent,
+    generation: &SocketGeneration,
+    state: u32,
+    now: u64,
+) {
+    unsafe {
         initialize(event, KIND_SOCKET);
         (*event).timestamp_ns = now;
         (*event).socket_address = generation.opaque;
@@ -469,6 +511,14 @@ pub fn inet_sock_set_state(ctx: TracePointContext) -> u32 {
         (*event).family = ctx.read_at::<u16>(28).unwrap_or(0);
         (*event).source_port = ctx.read_at::<u16>(24).unwrap_or(0);
         (*event).destination_port = ctx.read_at::<u16>(26).unwrap_or(0);
+    }
+}
+
+/// # Safety
+/// `event` must be a live reservation and `ctx` must use inet_sock_set_state layout.
+#[inline(always)]
+unsafe fn read_socket_addresses(ctx: &TracePointContext, event: *mut RawSyscallEvent) -> bool {
+    unsafe {
         if (*event).family == 2 {
             (&mut (*event).source_address)[..4]
                 .copy_from_slice(&ctx.read_at::<[u8; 4]>(32).unwrap_or([0; 4]));
@@ -486,15 +536,10 @@ pub fn inet_sock_set_state(ctx: TracePointContext) -> u32 {
             (&mut (*event).destination_address)[..8].copy_from_slice(&destination0);
             (&mut (*event).destination_address)[8..].copy_from_slice(&destination1);
         } else {
-            entry.discard(0);
-            return 0;
+            return false;
         }
     }
-    entry.submit(0);
-    if state == 7 {
-        let _ = SOCKET_GENERATIONS.remove(&address);
-    }
-    0
+    true
 }
 
 // ---------------------------------------------------------------------------

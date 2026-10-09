@@ -101,6 +101,36 @@ async fn handle_connection(
 /// RFC 5246 Section 7.4.1.2 (ClientHello)
 /// RFC 6066 Section 3 (Server Name Indication)
 pub fn extract_sni(record: &[u8]) -> Option<String> {
+    let mut pos = client_hello_fields_start(record)?;
+
+    // session_id: length (1 byte) + data
+    let session_id_len = *record.get(pos)? as usize;
+    pos += 1 + session_id_len;
+    if pos > record.len() {
+        return None;
+    }
+
+    // cipher_suites: length (2 bytes) + data
+    if pos + 2 > record.len() {
+        return None;
+    }
+    let cipher_len = u16::from_be_bytes([record[pos], record[pos + 1]]) as usize;
+    pos += 2 + cipher_len;
+    if pos > record.len() {
+        return None;
+    }
+
+    // compression_methods: length (1 byte) + data
+    let comp_len = *record.get(pos)? as usize;
+    pos += 1 + comp_len;
+    if pos > record.len() {
+        return None;
+    }
+
+    find_server_name_extension(record, pos)
+}
+
+fn client_hello_fields_start(record: &[u8]) -> Option<usize> {
     let mut pos = 0;
 
     // Handshake type (1 byte): 0x01 = ClientHello
@@ -127,30 +157,10 @@ pub fn extract_sni(record: &[u8]) -> Option<String> {
         return None;
     }
 
-    // session_id: length (1 byte) + data
-    let session_id_len = *record.get(pos)? as usize;
-    pos += 1 + session_id_len;
-    if pos > record.len() {
-        return None;
-    }
+    Some(pos)
+}
 
-    // cipher_suites: length (2 bytes) + data
-    if pos + 2 > record.len() {
-        return None;
-    }
-    let cipher_len = u16::from_be_bytes([record[pos], record[pos + 1]]) as usize;
-    pos += 2 + cipher_len;
-    if pos > record.len() {
-        return None;
-    }
-
-    // compression_methods: length (1 byte) + data
-    let comp_len = *record.get(pos)? as usize;
-    pos += 1 + comp_len;
-    if pos > record.len() {
-        return None;
-    }
-
+fn find_server_name_extension(record: &[u8], mut pos: usize) -> Option<String> {
     // extensions: total length (2 bytes)
     if pos + 2 > record.len() {
         return None;
@@ -270,6 +280,19 @@ mod tests {
         record.extend_from_slice(&hello);
 
         record
+    }
+
+    #[test]
+    fn extract_sni_rejects_every_truncated_client_hello() {
+        let record = build_client_hello("example.test");
+        for length in 0..record.len() {
+            assert_eq!(extract_sni(&record[..length]), None, "prefix {length}");
+        }
+        assert_eq!(extract_sni(&record), Some("example.test".into()));
+        let mut oversized = record.clone();
+        // Fixed ClientHello fields occupy 45 bytes including the handshake header.
+        oversized[45..47].copy_from_slice(&u16::MAX.to_be_bytes());
+        assert_eq!(extract_sni(&oversized), None);
     }
 
     #[test]

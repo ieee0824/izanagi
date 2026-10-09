@@ -369,7 +369,27 @@ fn parse_dtrace_line(line: &str) -> Option<SyscallEvent> {
     // 残りの引数部分 (存在しない場合もある)
     let args_remainder = header_iter.next();
 
-    let syscall = match syscall_str {
+    let syscall = dtrace_syscall(syscall_str)?;
+
+    let args = parse_dtrace_args(syscall_str, args_remainder);
+
+    // walltimestamp はナノ秒単位の UNIX epoch
+    let timestamp = std::time::UNIX_EPOCH + std::time::Duration::from_nanos(timestamp_ns);
+
+    Some(SyscallEvent {
+        timestamp,
+        pid,
+        tgid: 0, // DTrace は tgid を提供しない
+        process_name,
+        syscall,
+        args,
+        result: crate::event::SyscallResult::Unknown,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn dtrace_syscall(name: &str) -> Option<Syscall> {
+    Some(match name {
         "open" => Syscall::Open,
         "openat" => Syscall::OpenAt,
         "read" => Syscall::Read,
@@ -386,14 +406,14 @@ fn parse_dtrace_line(line: &str) -> Option<SyscallEvent> {
         "fork" => Syscall::Fork,
         "readlink" => Syscall::ReadLink,
         _ => return None,
-    };
+    })
+}
 
-    // 追加引数をパース (スキーマ駆動)
-    //
-    // PROBE_TABLE の arg_kinds を参照し、各引数の型に応じてパースする。
-    // ArgKind::Path の引数は copyinstr() 由来の文字列で、パス内に `|` を含む場合
-    // フィールドが分割される。スキーマの先頭 Int を消費し、Path 部分は末尾の
-    // trailing Int を差し引いた中間フィールドを結合して復元する。
+#[cfg(target_os = "macos")]
+type DTraceArgs = smallvec::SmallVec<[crate::event::SyscallArg; 4]>;
+
+#[cfg(target_os = "macos")]
+fn parse_dtrace_args(syscall_str: &str, args_remainder: Option<&str>) -> DTraceArgs {
     let arg_kinds = arg_kinds_for_syscall(syscall_str);
     let mut args = smallvec::smallvec![];
     let has_path_arg = arg_kinds.contains(&ArgKind::Path);
@@ -403,64 +423,9 @@ fn parse_dtrace_line(line: &str) -> Option<SyscallEvent> {
             // Path 引数がある場合: | で split して collect が必要（パス内 | の復元）
             let extra: Vec<&str> = remainder.split('|').collect();
             if extra.len() >= 2 {
-                let leading_int_count =
-                    arg_kinds.iter().take_while(|k| **k == ArgKind::Int).count();
-                let trailing_int_count = arg_kinds
-                    .iter()
-                    .rev()
-                    .take_while(|k| **k == ArgKind::Int)
-                    .count();
-
-                // 先頭の Int 引数を消費
-                for part in &extra[..leading_int_count.min(extra.len())] {
-                    let trimmed = part.trim();
-                    if let Ok(val) = trimmed.parse::<i64>() {
-                        args.push(crate::event::SyscallArg::Int(val));
-                    }
-                }
-
-                // 中間フィールドを Path として結合
-                let path_start = leading_int_count.min(extra.len());
-                let path_end = extra.len().saturating_sub(trailing_int_count);
-                if path_start < path_end {
-                    let path_str = extra[path_start..path_end]
-                        .iter()
-                        .map(|s| s.trim())
-                        .collect::<Vec<_>>()
-                        .join("|");
-                    if !path_str.is_empty() && path_str != "<null>" {
-                        args.push(crate::event::SyscallArg::Path(std::path::PathBuf::from(
-                            &path_str,
-                        )));
-                    }
-                }
-
-                // 末尾の Int 引数を消費
-                for part in &extra[path_end..] {
-                    let trimmed = part.trim();
-                    if let Ok(val) = trimmed.parse::<i64>() {
-                        args.push(crate::event::SyscallArg::Int(val));
-                    }
-                }
+                parse_path_fields(&extra, arg_kinds, &mut args);
             } else {
-                // フィールド 1 個のみ — スキーマの先頭 ArgKind で型を決定
-                let trimmed = remainder.trim();
-                if !trimmed.is_empty() && trimmed != "<null>" {
-                    match arg_kinds.first() {
-                        Some(ArgKind::Path) => {
-                            args.push(crate::event::SyscallArg::Path(std::path::PathBuf::from(
-                                trimmed,
-                            )));
-                        }
-                        _ => {
-                            if let Ok(val) = trimmed.parse::<i64>() {
-                                args.push(crate::event::SyscallArg::Int(val));
-                            } else {
-                                args.push(crate::event::SyscallArg::Str(trimmed.to_string()));
-                            }
-                        }
-                    }
-                }
+                parse_single_path_field(remainder, arg_kinds, &mut args);
             }
         } else {
             // Path 引数なし: | で split するだけで Vec 不要（イテレータで処理）
@@ -475,18 +440,73 @@ fn parse_dtrace_line(line: &str) -> Option<SyscallEvent> {
         }
     }
 
-    // walltimestamp はナノ秒単位の UNIX epoch
-    let timestamp = std::time::UNIX_EPOCH + std::time::Duration::from_nanos(timestamp_ns);
+    args
+}
 
-    Some(SyscallEvent {
-        timestamp,
-        pid,
-        tgid: 0, // DTrace は tgid を提供しない
-        process_name,
-        syscall,
-        args,
-        result: crate::event::SyscallResult::Unknown,
-    })
+// Consume schema-defined edge integers and rejoin the middle path fields,
+// preserving literal pipe characters emitted by copyinstr().
+#[cfg(target_os = "macos")]
+fn parse_path_fields(extra: &[&str], arg_kinds: &[ArgKind], args: &mut DTraceArgs) {
+    let leading_int_count = arg_kinds.iter().take_while(|k| **k == ArgKind::Int).count();
+    let trailing_int_count = arg_kinds
+        .iter()
+        .rev()
+        .take_while(|k| **k == ArgKind::Int)
+        .count();
+
+    // 先頭の Int 引数を消費
+    for part in &extra[..leading_int_count.min(extra.len())] {
+        let trimmed = part.trim();
+        if let Ok(val) = trimmed.parse::<i64>() {
+            args.push(crate::event::SyscallArg::Int(val));
+        }
+    }
+
+    // 中間フィールドを Path として結合
+    let path_start = leading_int_count.min(extra.len());
+    let path_end = extra.len().saturating_sub(trailing_int_count);
+    if path_start < path_end {
+        let path_str = extra[path_start..path_end]
+            .iter()
+            .map(|s| s.trim())
+            .collect::<Vec<_>>()
+            .join("|");
+        if !path_str.is_empty() && path_str != "<null>" {
+            args.push(crate::event::SyscallArg::Path(std::path::PathBuf::from(
+                &path_str,
+            )));
+        }
+    }
+
+    // 末尾の Int 引数を消費
+    for part in &extra[path_end..] {
+        let trimmed = part.trim();
+        if let Ok(val) = trimmed.parse::<i64>() {
+            args.push(crate::event::SyscallArg::Int(val));
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn parse_single_path_field(remainder: &str, arg_kinds: &[ArgKind], args: &mut DTraceArgs) {
+    // フィールド 1 個のみ — スキーマの先頭 ArgKind で型を決定
+    let trimmed = remainder.trim();
+    if !trimmed.is_empty() && trimmed != "<null>" {
+        match arg_kinds.first() {
+            Some(ArgKind::Path) => {
+                args.push(crate::event::SyscallArg::Path(std::path::PathBuf::from(
+                    trimmed,
+                )));
+            }
+            _ => {
+                if let Ok(val) = trimmed.parse::<i64>() {
+                    args.push(crate::event::SyscallArg::Int(val));
+                } else {
+                    args.push(crate::event::SyscallArg::Str(trimmed.to_string()));
+                }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -494,40 +514,36 @@ fn parse_dtrace_line(line: &str) -> Option<SyscallEvent> {
 // ---------------------------------------------------------------------------
 
 #[cfg(target_os = "macos")]
-#[async_trait::async_trait]
-impl Tracer for DTraceTracer {
-    async fn start(
-        &self,
-        filter: &TraceFilter,
-    ) -> anyhow::Result<mpsc::Receiver<Arc<SyscallEvent>>> {
-        use tokio::io::{AsyncBufReadExt, BufReader};
-        use tokio::process::Command;
+fn dtrace_command(dtrace_path: &str) -> tokio::process::Command {
+    use tokio::process::Command;
+    let is_root = unsafe { libc::geteuid() } == 0;
+    if is_root {
+        Command::new(dtrace_path)
+    } else {
+        let mut c = Command::new("sudo");
+        c.arg("-n");
+        c.arg(dtrace_path);
+        c
+    }
+}
 
-        let script = generate_dscript(filter);
+#[cfg(target_os = "macos")]
+fn spawn_dtrace(script: &str) -> anyhow::Result<tokio::process::Child> {
+    // dtrace コマンドの存在確認
+    let dtrace_path = "/usr/sbin/dtrace";
+    if !std::path::Path::new(dtrace_path).exists() {
+        anyhow::bail!(
+            "dtrace command not found at {}. DTrace is only available on macOS.",
+            dtrace_path
+        );
+    }
 
-        // dtrace コマンドの存在確認
-        let dtrace_path = "/usr/sbin/dtrace";
-        if !std::path::Path::new(dtrace_path).exists() {
-            anyhow::bail!(
-                "dtrace command not found at {}. DTrace is only available on macOS.",
-                dtrace_path
-            );
-        }
-
-        // dtrace サブプロセスを起動
-        // euid == 0 (root) なら sudo 不要。それ以外は sudo -n (非対話モード) を使用。
-        let is_root = unsafe { libc::geteuid() } == 0;
-        let mut cmd = if is_root {
-            Command::new(dtrace_path)
-        } else {
-            let mut c = Command::new("sudo");
-            c.arg("-n");
-            c.arg(dtrace_path);
-            c
-        };
-        let mut child = cmd
+    // dtrace サブプロセスを起動
+    // euid == 0 (root) なら sudo 不要。それ以外は sudo -n (非対話モード) を使用。
+    let mut cmd = dtrace_command(dtrace_path);
+    let child = cmd
             .arg("-qn")
-            .arg(&script)
+            .arg(script)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
@@ -543,6 +559,82 @@ impl Tracer for DTraceTracer {
                 }
             })?;
 
+    Ok(child)
+}
+
+#[cfg(target_os = "macos")]
+async fn drain_dtrace_stderr(stderr: tokio::process::ChildStderr) {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    let reader = BufReader::new(stderr);
+    let mut lines = reader.lines();
+    let mut count: usize = 0;
+    let mut suppressed: usize = 0;
+    while let Ok(Some(line)) = lines.next_line().await {
+        count += 1;
+        if count <= STDERR_LOG_LIMIT {
+            eprintln!("[dtrace stderr] {}", line);
+        } else {
+            suppressed += 1;
+        }
+    }
+    if suppressed > 0 {
+        eprintln!(
+            "[dtrace stderr] ... {} additional lines suppressed (total: {})",
+            suppressed, count
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+async fn forward_dtrace_stdout(
+    stdout: impl tokio::io::AsyncRead + Unpin,
+    tx: mpsc::Sender<Arc<SyscallEvent>>,
+) {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    let reader = BufReader::new(stdout);
+    let mut lines = reader.lines();
+
+    while let Ok(Some(line)) = lines.next_line().await {
+        if let Some(event) = parse_dtrace_line(&line) {
+            match tx.try_send(Arc::new(event)) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Closed(_)) => break,
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    // チャネル満杯 → イベントを drop して読み取りを継続
+                }
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+async fn cleanup_failed_dtrace(
+    stdout_handle: Option<tokio::task::JoinHandle<()>>,
+    stderr_handle: Option<tokio::task::JoinHandle<()>>,
+    child: Option<tokio::process::Child>,
+) {
+    if let Some(h) = stdout_handle {
+        h.abort();
+    }
+    if let Some(h) = stderr_handle {
+        h.abort();
+    }
+    if let Some(mut c) = child {
+        let _ = c.kill().await;
+        let _ = c.wait().await;
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[async_trait::async_trait]
+impl Tracer for DTraceTracer {
+    async fn start(
+        &self,
+        filter: &TraceFilter,
+    ) -> anyhow::Result<mpsc::Receiver<Arc<SyscallEvent>>> {
+        let script = generate_dscript(filter);
+        let mut child = spawn_dtrace(&script)?;
+
         let stdout = child
             .stdout
             .take()
@@ -550,50 +642,17 @@ impl Tracer for DTraceTracer {
 
         // stderr を非同期で読み取り、バッファ詰まりによるハングを防止する (#102)
         // レートリミット: STDERR_LOG_LIMIT 行を超えたら抑制し、終了時にサマリを出力
-        let mut stderr_handle = child.stderr.take().map(|stderr| {
-            tokio::spawn(async move {
-                let reader = BufReader::new(stderr);
-                let mut lines = reader.lines();
-                let mut count: usize = 0;
-                let mut suppressed: usize = 0;
-                while let Ok(Some(line)) = lines.next_line().await {
-                    count += 1;
-                    if count <= STDERR_LOG_LIMIT {
-                        eprintln!("[dtrace stderr] {}", line);
-                    } else {
-                        suppressed += 1;
-                    }
-                }
-                if suppressed > 0 {
-                    eprintln!(
-                        "[dtrace stderr] ... {} additional lines suppressed (total: {})",
-                        suppressed, count
-                    );
-                }
-            })
-        });
+        let mut stderr_handle = child
+            .stderr
+            .take()
+            .map(|stderr| tokio::spawn(drain_dtrace_stderr(stderr)));
 
         let (tx, rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
 
         // stdout を非同期に読み取り、パースしてチャネルに送信
         // try_send でバックプレッシャー時にイベントを drop し、stdout 読み取りが
         // 詰まって dtrace プロセスがハングするのを防止する
-        let stdout_handle = tokio::spawn(async move {
-            let reader = BufReader::new(stdout);
-            let mut lines = reader.lines();
-
-            while let Ok(Some(line)) = lines.next_line().await {
-                if let Some(event) = parse_dtrace_line(&line) {
-                    match tx.try_send(Arc::new(event)) {
-                        Ok(()) => {}
-                        Err(mpsc::error::TrySendError::Closed(_)) => break,
-                        Err(mpsc::error::TrySendError::Full(_)) => {
-                            // チャネル満杯 → イベントを drop して読み取りを継続
-                        }
-                    }
-                }
-            }
-        });
+        let stdout_handle = tokio::spawn(forward_dtrace_stdout(stdout, tx));
 
         // チェックと設定を同一ロック内で行い TOCTOU を防止。
         // 二重起動時は新しく生成したリソースをクリーンアップしてからエラーを返す。
@@ -611,16 +670,7 @@ impl Tracer for DTraceTracer {
             }
         };
         if already_running {
-            if let Some(h) = stdout_handle {
-                h.abort();
-            }
-            if let Some(h) = stderr_handle {
-                h.abort();
-            }
-            if let Some(mut c) = child {
-                let _ = c.kill().await;
-                let _ = c.wait().await;
-            }
+            cleanup_failed_dtrace(stdout_handle, stderr_handle, child).await;
             anyhow::bail!("DTraceTracer is already running");
         }
         Ok(rx)
@@ -679,6 +729,24 @@ mod tests {
     use crate::event::SyscallCategory;
 
     // -- DTrace スクリプト生成テスト (#27) --
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn full_event_channel_drops_output_without_stalling_the_reader() {
+        let line = "IZANAGI|1000|42|test|open|/tmp/test|0\n";
+        let (tx, mut rx) = mpsc::channel(1);
+        let initial = Arc::new(parse_dtrace_line(line).unwrap());
+        tx.send(initial.clone()).await.unwrap();
+        let input = std::io::Cursor::new(line.repeat(3).into_bytes());
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            forward_dtrace_stdout(input, tx),
+        )
+        .await
+        .unwrap();
+        assert!(Arc::ptr_eq(&rx.recv().await.unwrap(), &initial));
+        assert!(rx.recv().await.is_none());
+    }
 
     #[cfg(target_os = "macos")]
     #[test]

@@ -234,12 +234,6 @@ impl TelemetryEnvelope {
     }
     pub fn validate(&self) -> Result<(), crate::TelemetryError> {
         use crate::{SCHEMA_VERSION, TelemetryError};
-        let valid_id = |s: &str| {
-            !s.is_empty()
-                && s.len() <= 160
-                && s.bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b':' | b'.'))
-        };
         if self.schema_version != SCHEMA_VERSION
             || !valid_id(&self.session_id)
             || !valid_id(&self.guest_boot_id)
@@ -250,19 +244,29 @@ impl TelemetryEnvelope {
         {
             return Err(TelemetryError::InvalidEvent);
         }
-        let valid_process = |p: &ProcessKey| {
-            p.session_id == self.session_id
-                && p.guest_boot_id == self.guest_boot_id
-                && p.tgid > 0
-                && p.started_monotonic_ns <= self.observed_monotonic_ns
-        };
-        if self.process.as_ref().is_some_and(|p| !valid_process(p)) {
+        if self
+            .process
+            .as_ref()
+            .is_some_and(|p| !self.valid_process(p))
+        {
             return Err(TelemetryError::InvalidEvent);
         }
+        self.validate_payload()
+    }
+
+    fn valid_process(&self, p: &ProcessKey) -> bool {
+        p.session_id == self.session_id
+            && p.guest_boot_id == self.guest_boot_id
+            && p.tgid > 0
+            && p.started_monotonic_ns <= self.observed_monotonic_ns
+    }
+
+    fn validate_payload(&self) -> Result<(), crate::TelemetryError> {
+        use crate::TelemetryError;
         match &self.payload {
             TelemetryPayload::ProcessFork { parent, child }
-                if !valid_process(parent)
-                    || !valid_process(child)
+                if !self.valid_process(parent)
+                    || !self.valid_process(child)
                     || parent.pid_namespace != child.pid_namespace
                     || parent == child =>
             {
@@ -299,4 +303,9 @@ impl TelemetryEnvelope {
         }
         Ok(())
     }
+}
+
+// Envelope IDs have a stricter size cap than persisted local audit IDs.
+fn valid_id(s: &str) -> bool {
+    s.len() <= 160 && crate::privacy::valid_local_id(s)
 }

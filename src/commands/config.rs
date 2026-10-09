@@ -36,6 +36,20 @@ pub fn cmd_config(action: ConfigAction, config: &Config, config_path: &Path) -> 
 fn cmd_config_mitm(config: &Config, config_path: &Path) -> anyhow::Result<u8> {
     let mut config = config.clone();
 
+    config.dns_proxy = Some(prompt_dns_proxy(&config)?);
+
+    config.http_capture = Some(prompt_http_capture(&config)?);
+
+    config.detect.allowed_hosts = prompt_allowed_hosts(&config)?;
+
+    // 設定ファイルに書き戻し
+    write_config(config_path, &config)?;
+
+    println!("設定を保存しました: {}", config_path.display());
+    Ok(0)
+}
+
+fn prompt_dns_proxy(config: &Config) -> anyhow::Result<DnsProxySection> {
     // DNS プロキシ設定
     let dns_enabled = Confirm::new()
         .with_prompt("DNS プロキシを有効にしますか？")
@@ -62,11 +76,13 @@ fn cmd_config_mitm(config: &Config, config_path: &Path) -> anyhow::Result<u8> {
         "127.0.0.1:15353".to_string()
     };
 
-    config.dns_proxy = Some(DnsProxySection {
+    Ok(DnsProxySection {
         enabled: dns_enabled,
         listen: dns_listen,
-    });
+    })
+}
 
+fn prompt_http_capture(config: &Config) -> anyhow::Result<HttpCaptureSection> {
     // HTTP キャプチャ設定
     let http_enabled = Confirm::new()
         .with_prompt("HTTP キャプチャ (TLS MITM) を有効にしますか？")
@@ -74,29 +90,7 @@ fn cmd_config_mitm(config: &Config, config_path: &Path) -> anyhow::Result<u8> {
         .interact()?;
 
     if http_enabled {
-        let current_http = config
-            .http_capture
-            .as_ref()
-            .map(|h| h.listen_http.to_string())
-            .unwrap_or_else(|| "127.0.0.1:18080".to_string());
-        let listen_http_str: String = Input::new()
-            .with_prompt("HTTP リッスンアドレス")
-            .default(current_http)
-            .interact_text()?;
-        let listen_http: std::net::SocketAddr =
-            listen_http_str.parse().context("無効なアドレスです")?;
-
-        let current_https = config
-            .http_capture
-            .as_ref()
-            .map(|h| h.listen_https.to_string())
-            .unwrap_or_else(|| "127.0.0.1:18443".to_string());
-        let listen_https_str: String = Input::new()
-            .with_prompt("HTTPS (TLS MITM) リッスンアドレス")
-            .default(current_https)
-            .interact_text()?;
-        let listen_https: std::net::SocketAddr =
-            listen_https_str.parse().context("無効なアドレスです")?;
+        let (listen_http, listen_https) = prompt_http_addresses(config)?;
 
         let current_ca = config
             .http_capture
@@ -109,50 +103,88 @@ fn cmd_config_mitm(config: &Config, config_path: &Path) -> anyhow::Result<u8> {
             .default(current_ca)
             .interact_text()?;
 
-        // シークレットマッピング
-        let mut secret_maps: Vec<String> = config
-            .http_capture
-            .as_ref()
-            .map(|h| h.secret_maps.clone())
-            .unwrap_or_default();
+        let secret_maps = prompt_secret_maps(config)?;
 
-        if !secret_maps.is_empty() {
-            println!("シークレットマッピングは登録済みです (内容は非表示)");
-        }
-
-        println!("シークレットマッピングを追加 (DUMMY=REAL 形式、空行で終了):");
-        loop {
-            let input: String = Password::new()
-                .with_prompt("追加するマッピング")
-                .allow_empty_password(true)
-                .interact()?;
-            if input.is_empty() {
-                break;
-            }
-            if !input.contains('=') {
-                eprintln!("形式が正しくありません。DUMMY=REAL の形式で入力してください。");
-                continue;
-            }
-            secret_maps.push(input);
-        }
-
-        config.http_capture = Some(HttpCaptureSection {
+        Ok(HttpCaptureSection {
             enabled: true,
             listen_http,
             listen_https,
             ca_cert_out: Some(ca_cert_out.into()),
             secret_maps,
-        });
+        })
     } else {
-        config.http_capture = Some(HttpCaptureSection {
+        Ok(HttpCaptureSection {
             enabled: false,
             listen_http: "127.0.0.1:18080".parse().unwrap(),
             listen_https: "127.0.0.1:18443".parse().unwrap(),
             ca_cert_out: None,
             secret_maps: vec![],
-        });
+        })
+    }
+}
+
+fn prompt_http_addresses(
+    config: &Config,
+) -> anyhow::Result<(std::net::SocketAddr, std::net::SocketAddr)> {
+    let current_http = config
+        .http_capture
+        .as_ref()
+        .map(|h| h.listen_http.to_string())
+        .unwrap_or_else(|| "127.0.0.1:18080".to_string());
+    let listen_http_str: String = Input::new()
+        .with_prompt("HTTP リッスンアドレス")
+        .default(current_http)
+        .interact_text()?;
+    let listen_http: std::net::SocketAddr =
+        listen_http_str.parse().context("無効なアドレスです")?;
+
+    let current_https = config
+        .http_capture
+        .as_ref()
+        .map(|h| h.listen_https.to_string())
+        .unwrap_or_else(|| "127.0.0.1:18443".to_string());
+    let listen_https_str: String = Input::new()
+        .with_prompt("HTTPS (TLS MITM) リッスンアドレス")
+        .default(current_https)
+        .interact_text()?;
+    let listen_https: std::net::SocketAddr =
+        listen_https_str.parse().context("無効なアドレスです")?;
+
+    Ok((listen_http, listen_https))
+}
+
+fn prompt_secret_maps(config: &Config) -> anyhow::Result<Vec<String>> {
+    // シークレットマッピング
+    let mut secret_maps: Vec<String> = config
+        .http_capture
+        .as_ref()
+        .map(|h| h.secret_maps.clone())
+        .unwrap_or_default();
+
+    if !secret_maps.is_empty() {
+        println!("シークレットマッピングは登録済みです (内容は非表示)");
     }
 
+    println!("シークレットマッピングを追加 (DUMMY=REAL 形式、空行で終了):");
+    loop {
+        let input: String = Password::new()
+            .with_prompt("追加するマッピング")
+            .allow_empty_password(true)
+            .interact()?;
+        if input.is_empty() {
+            break;
+        }
+        if !input.contains('=') {
+            eprintln!("形式が正しくありません。DUMMY=REAL の形式で入力してください。");
+            continue;
+        }
+        secret_maps.push(input);
+    }
+
+    Ok(secret_maps)
+}
+
+fn prompt_allowed_hosts(config: &Config) -> anyhow::Result<Vec<String>> {
     // 許可するホスト
     let current_hosts = config.detect.allowed_hosts.join(", ");
     let hosts_input: String = Input::new()
@@ -160,17 +192,11 @@ fn cmd_config_mitm(config: &Config, config_path: &Path) -> anyhow::Result<u8> {
         .default(current_hosts)
         .allow_empty(true)
         .interact_text()?;
-    config.detect.allowed_hosts = hosts_input
+    Ok(hosts_input
         .split(',')
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-        .collect();
-
-    // 設定ファイルに書き戻し
-    write_config(config_path, &config)?;
-
-    println!("設定を保存しました: {}", config_path.display());
-    Ok(0)
+        .collect())
 }
 
 /// Config を TOML として設定ファイルに書き出す。
@@ -217,6 +243,37 @@ fn write_config(path: &Path, config: &Config) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn configuration_save_is_private_and_overwrite_truncates_old_content() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("izanagi-mitm-save-{}", rand::random::<u64>()));
+        let path = dir.join("config.toml");
+        let mut config = Config::default();
+        config.detect.allowed_hosts = vec!["x".repeat(1024)];
+        write_config(&path, &config).unwrap();
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        config.detect.allowed_hosts.clear();
+        write_config(&path, &config).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            toml::to_string_pretty(&config).unwrap()
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn config_display_hides_all_mapping_content_without_mutating_config() {
