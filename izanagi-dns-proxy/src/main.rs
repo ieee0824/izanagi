@@ -41,22 +41,7 @@ struct Cli {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    // 設定ファイルの存在チェック（Config::load は NotFound 時にデフォルトを返すため）
-    if !cli.config.exists() {
-        bail!("設定ファイルが見つかりません: {}", cli.config.display());
-    }
-
-    // 設定ファイル読み込み
-    let config = Config::load(&cli.config)?;
-    let allowlist = DomainAllowlist::new(&config.detect.allowed_hosts);
-
-    eprintln!(
-        "allowed_hosts: {} エントリ (完全一致 + ワイルドカード)",
-        config.detect.allowed_hosts.len()
-    );
-    for host in &config.detect.allowed_hosts {
-        eprintln!("  - {}", host);
-    }
+    let allowlist = load_allowlist(&cli.config)?;
 
     // 上流 DNS リゾルバ
     let upstream = match cli.upstream {
@@ -87,4 +72,25 @@ async fn main() -> anyhow::Result<()> {
     signal_handle.abort();
 
     Ok(())
+}
+
+fn load_allowlist(path: &std::path::Path) -> anyhow::Result<DomainAllowlist> {
+    // 設定ファイルの存在チェック（Config::load は NotFound 時にデフォルトを返すため）
+    if !path.exists() {
+        bail!("設定ファイルが見つかりません: {}", path.display());
+    }
+
+    // 設定ファイル読み込み
+    let config = Config::load(path)?;
+    let allowlist = DomainAllowlist::new(&config.detect.allowed_hosts);
+
+    eprintln!(
+        "allowed_hosts: {} エントリ (完全一致 + ワイルドカード)",
+        config.detect.allowed_hosts.len()
+    );
+    for host in &config.detect.allowed_hosts {
+        eprintln!("  - {}", host);
+    }
+
+    Ok(allowlist)
 }

@@ -1,6 +1,3 @@
-izanagi-dns-proxy/src/main.rs	main	41	50
-izanagi-dns-proxy/src/proxy.rs	run	30	52
-izanagi-dns-proxy/src/proxy.rs	handle_query	197	102
 izanagi-ebpf/src/main.rs	emit_event	113	65
 izanagi-ebpf/src/main.rs	inet_sock_set_state	405	94
 izanagi-http-capture/src/behavior_forward.rs	parse_header	70	98

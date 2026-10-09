@@ -259,6 +259,24 @@ are unchanged. The three config-command tests pass; an added regression verifies
 new-directory/file permissions and private overwrite without trailing content.
 Linux cross-target all-target/all-feature Clippy passes.
 
+### DNS proxy
+
+All three original DNS proxy candidates and new production helpers are below
+50 lines. Configuration/allowlist loading, UDP task setup, malformed-query
+handling and upstream-response validation are separate responsibilities.
+Question normalization, FORMERR/SERVFAIL identity, allowlist forwarding, blocked
+responses and all-section rebinding checks retain their behavior and ordering.
+Existing listener/task/shutdown behavior is preserved.
+
+All 20 component tests and all-target Clippy pass on macOS. Three new regressions
+use a local UDP upstream to verify private IPv4/IPv6 rejection in answers,
+additionals and authorities; exact public-response forwarding and malformed
+upstream rejection; and FORMERR/questionless handling without upstream traffic.
+Two pre-existing response-module Clippy warnings were fixed by scoping a test
+import and collapsing an equivalent condition. Linux CI at `492dfd9` passes
+root Linux/macOS tests, including the new Landlock enforcement regression, all
+component tests, eBPF checks/build, all-feature Clippy and secret scan.
+
 ## Outstanding work
 
 The remaining inventory is work to complete, except explicitly documented
