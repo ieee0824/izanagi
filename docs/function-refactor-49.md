@@ -277,6 +277,23 @@ import and collapsing an equivalent condition. Linux CI at `492dfd9` passes
 root Linux/macOS tests, including the new Landlock enforcement regression, all
 component tests, eBPF checks/build, all-feature Clippy and secret scan.
 
+### Kernel eBPF tracepoints
+
+Both original kernel eBPF candidates and all new helpers are below 50 lines.
+User-path capture, connector generation, socket identity and socket-address
+reads are separate inline(always) responsibilities. Ring reservation loss,
+userspace probe-read bounds, submission/discard order, connector ownership,
+IPv4/IPv6 scalar reads and socket-state cleanup are preserved.
+
+The no_std release build passes locally with nightly-2026-02-12,
+bpfel-unknown-none and build-std=core. The pre-refactor source at `bec9e9e` was
+built with the same toolchain. ELF function inspection finds the same 23 function
+symbols: 18 have identical executable bytes; the five affected tracepoints
+(openat/stat/access/execve/inet_sock_set_state) are each 16 bytes shorter after
+optimization. No extracted helper remains as an independent function. This
+confirms inlining/code-generation scope, not a live kernel-verifier/load test.
+Linux CI no_std build remains required at the final head.
+
 ## Outstanding work
 
 The remaining inventory is work to complete, except explicitly documented
