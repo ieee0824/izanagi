@@ -3,6 +3,87 @@ use izanagi_telemetry::*;
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 
+mod support;
+
+#[test]
+fn jev_rejects_path_lookup_and_relative_executables() {
+    for command in ["jev-mcp", "./jev-mcp", "tools/jev-mcp"] {
+        assert!(
+            JevMcpClassifier::new(ClassifierConfig {
+                command: command.into(),
+                ..Default::default()
+            })
+            .is_err(),
+            "untrusted executable lookup accepted: {command}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn mcp_descendants_stop_on_success_failure_timeout_and_cancellation() {
+    for mode in ["success", "invalid", "timeout", "cancel"] {
+        let dir = std::env::temp_dir().join(format!("izanagi-mcp-child-{}", rand::random::<u64>()));
+        std::fs::create_dir(&dir).unwrap();
+        let cfg = descendant_config(mode, &dir);
+        let task = tokio::spawn(async move {
+            JevMcpClassifier::new(cfg)
+                .unwrap()
+                .classify(&projection())
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !dir.join("ready").exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        if mode == "cancel" {
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+        } else {
+            let result = task.await.unwrap();
+            match mode {
+                "success" => assert_eq!(result.class(), Some(ThreatClass::Normal)),
+                "invalid" => assert_eq!(
+                    result,
+                    ClassificationOutcome::failed(ClassificationErrorKind::InvalidResponse)
+                ),
+                _ => assert_eq!(
+                    result,
+                    ClassificationOutcome::failed(ClassificationErrorKind::Timeout)
+                ),
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        let survived = dir.join("survived").exists();
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(!survived, "MCP descendant survived {mode}");
+    }
+}
+
+#[cfg(unix)]
+fn descendant_config(mode: &str, dir: &std::path::Path) -> ClassifierConfig {
+    ClassifierConfig {
+        command: support::python(),
+        args: vec![
+            format!(
+                "{}/tests/fixtures/behavior/descendant_mcp.py",
+                env!("CARGO_MANIFEST_DIR")
+            ),
+            mode.into(),
+            dir.to_str().unwrap().into(),
+        ],
+        deadline: if mode == "timeout" {
+            Duration::from_millis(500)
+        } else {
+            Duration::from_secs(5)
+        },
+        ..Default::default()
+    }
+}
+
 fn projection() -> FeatureProjection {
     FeatureProjection {
         feature_version: FEATURE_VERSION,
@@ -26,7 +107,7 @@ fn projection() -> FeatureProjection {
 
 fn config(mode: &str) -> ClassifierConfig {
     ClassifierConfig {
-        command: PathBuf::from("python3"),
+        command: support::python(),
         args: vec![
             format!(
                 "{}/tests/fixtures/behavior/mock_mcp.py",

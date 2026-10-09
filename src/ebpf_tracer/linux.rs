@@ -3,8 +3,8 @@ use super::{boot_time_offset, convert_raw_event, monotonic_ns, observation, read
 use crate::event::SyscallEvent;
 use aya::{
     Ebpf,
-    maps::{MapData, PerCpuArray, RingBuf},
-    programs::TracePoint,
+    maps::{Array, MapData, PerCpuArray, RingBuf},
+    programs::{KProbe, TracePoint},
 };
 use izanagi_telemetry::schema::{QualityIssue, TelemetryEnvelope, TelemetryPayload};
 use std::{sync::Arc, time::Duration};
@@ -93,6 +93,7 @@ pub(super) fn attach_required(bpf: &mut Ebpf, behavior: bool) -> anyhow::Result<
             program.load()?;
             program.attach(category, name)?;
         }
+        attach_writers(bpf)?;
     } else {
         // Outcomes are also useful in the legacy stream.
         let program: &mut TracePoint = bpf
@@ -103,6 +104,31 @@ pub(super) fn attach_required(bpf: &mut Ebpf, behavior: bool) -> anyhow::Result<
         program.attach("syscalls", "sys_exit_openat")?;
     }
 
+    Ok(())
+}
+
+fn attach_writers(bpf: &mut Ebpf) -> anyhow::Result<()> {
+    let offsets = super::kernel_layout::load()?;
+    let mut layout: Array<_, [u32; 4]> = Array::try_from(
+        bpf.map_mut("SOCKET_LAYOUT")
+            .ok_or_else(|| anyhow::anyhow!("required socket layout map missing"))?,
+    )?;
+    layout.set(0, offsets, 0)?;
+    for name in ["SOCKET_STREAMS", "SEND_ATTEMPTS", "UNPROVEN_STREAMS"] {
+        anyhow::ensure!(
+            bpf.map(name).is_some(),
+            "required writer map missing: {name}"
+        );
+    }
+    // Return probe attaches first; a tracked entry can never lack its outcome.
+    for name in ["tcp_sendmsg_exit", "tcp_sendmsg_enter"] {
+        let program: &mut KProbe = bpf
+            .program_mut(name)
+            .ok_or_else(|| anyhow::anyhow!("required writer probe missing: {name}"))?
+            .try_into()?;
+        program.load()?;
+        program.attach("tcp_sendmsg_locked", 0)?;
+    }
     Ok(())
 }
 

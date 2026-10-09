@@ -25,7 +25,7 @@ assert not configuration["behavior"]["classifier"].get("allow_export", False)
 assert "IZANAGI_SECRET_FILE" in os.environ
 assert W.is_dir(), "Prepare a dedicated guest-writable fixture directory"
 assert not (D / "up-second.log").exists(), "Use a fresh artifact directory for each test"
-for name in ["vm-client.py", "vm-receiver.py"]:
+for name in ["vm-client.py", "vm-receiver.py", "vm-mixed-writer.py"]:
     shutil.copy2(Path(__file__).resolve().parent / name, W / name.removeprefix("vm-"))
 E = os.environ.copy()
 E["TERM"] = "xterm-256color"
@@ -120,12 +120,28 @@ try:
  assert len(routine_windows)==2 and len(access_windows)==2,assessments
  assert all(a['snapshot']['credential_open_succeeded']==1 and a['snapshot']['credential_open_failed']==1 for a in access_windows),assessments
  assert all(a['snapshot']['credential_open_succeeded']==0 and a['snapshot']['credential_open_failed']==0 for a in routine_windows),assessments
- assert all(a['status']=='abstained' for a in classifications),classifications
+ assert all(a['snapshot']['binding']=='confirmed_writer' and not a['snapshot']['quality']['issues'] for a in assessments),assessments
+ assert all(a['status']=='classified' for a in classifications),classifications
  events=[r['payload']['Event'] for r in records if 'Event' in r['payload']]
  (D/'observed-events-second.jsonl').write_text(''.join(json.dumps(e)+'\n' for e in events))
  (D/'resources.json').write_text(json.dumps(dict(host_samples=samples,guest_before=guest_before,guest_after=guest_after,drops=[e['payload']['ObservationGap'] for e in events if isinstance(e['payload'],dict) and 'ObservationGap' in e['payload']]),indent=2))
  result={'session':latest.name,'canary_absent':True,'assessments':assessments,'classifications':classifications,'http_round_trip_ns':{mode:json.loads((W/('latency-'+mode+'.json')).read_text()) for mode in ['routine','access']}}
  (D/'results-second.json').write_text(json.dumps(result,indent=2));print('VM_TELEMETRY_CORRELATION_AND_PRIVACY_OK',flush=True)
+ out=run(['python3','/workspace/mixed-writer.py']);assert out.count(b'VM_MIXED_WRITER_TRANSFER_OK')==2;print(out.decode(),flush=True)
+ time.sleep(3)
+ raw=''.join(f.read_text() for f in sorted(latest.glob('*.jsonl')));assert 'DO_NOT_LOG' not in raw
+ records=[json.loads(l) for l in raw.splitlines()]
+ positive_ids={a['snapshot']['window_id'] for a in assessments}
+ negative=[r['payload']['Assessment'] for r in records if 'Assessment' in r['payload'] and r['payload']['Assessment']['snapshot']['window_id'] not in positive_ids]
+ assert len(negative)==2,negative
+ assert all(a['snapshot']['binding']=='unknown' and 'socket_shared' in a['snapshot']['quality']['issues'] for a in negative),negative
+ negative_ids={a['snapshot']['window_id'] for a in negative}
+ negative_classes=[r['payload']['Classification'] for r in records if 'Classification' in r['payload'] and r['payload']['Classification']['window_id'] in negative_ids]
+ assert len(negative_classes)==2 and all(c['status']=='abstained' for c in negative_classes),negative_classes
+ (D/'writer-negative-results.json').write_text(json.dumps(dict(assessments=negative,classifications=negative_classes),indent=2))
+ events=[r['payload']['Event'] for r in records if 'Event' in r['payload']]
+ (D/'observed-events-second.jsonl').write_text(''.join(json.dumps(e)+'\n' for e in events))
+ print('VM_MIXED_WRITER_ABSTENTION_OK',flush=True)
  shell=Shell('behavior-existing-shell');shell.raw();shell.send("echo PROXY:$http_proxy; id -u\n");shell.expect('PROXY:http://127.0.0.1:18080');shell.resize(47,121);shell.send('stty size\n');shell.expect('47 121');shell.send('exit 7\n');shell.finish(7)
  print('VM_BEHAVIOR_SHELL_LIFECYCLE_OK',flush=True)
  stopped=subprocess.run(C+['down'],cwd=W,env=E,capture_output=True,timeout=30)

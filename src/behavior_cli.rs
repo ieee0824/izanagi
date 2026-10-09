@@ -47,6 +47,7 @@ pub struct ProviderOptions {
     /// digest → 検証対象 API 応答の JSON object
     #[arg(long)]
     pub recorded_responses: Option<PathBuf>,
+    /// Trusted absolute executable path, required when classifier is jev-mcp.
     #[arg(long, default_value = "jev-mcp")]
     pub mcp_command: PathBuf,
     /// MCP 子プロセスの固定引数。shell 展開はしません。
@@ -319,6 +320,9 @@ fn build_classifier(
         }
         Provider::JevMcp => {
             reject_recorded_responses(options)?;
+            config.validate_mcp_command().map_err(|_| {
+                anyhow::anyhow!("jev-mcp requires --mcp-command with a trusted absolute path")
+            })?;
             Ok(Box::new(JevMcpClassifier::new(config)?))
         }
     }

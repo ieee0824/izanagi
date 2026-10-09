@@ -96,13 +96,7 @@ impl BehaviorClassifierSection {
 }
 impl BehaviorSection {
     pub fn validate(&self) -> anyhow::Result<()> {
-        if !matches!(self.classifier.provider.as_str(), "mock" | "jev-mcp") {
-            anyhow::bail!("behavior.classifier.provider must be mock or jev-mcp");
-        }
-        self.classifier
-            .runtime()
-            .validate()
-            .map_err(|_| anyhow::anyhow!("invalid behavior classifier configuration"))?;
+        self.validate_classifier()?;
         let listen: std::net::SocketAddr = self
             .proxy_listen
             .parse()
@@ -135,6 +129,24 @@ impl BehaviorSection {
             || l.retention_days > 7
         {
             anyhow::bail!("behavior limits are outside bounded PoC ranges");
+        }
+        Ok(())
+    }
+
+    fn validate_classifier(&self) -> anyhow::Result<()> {
+        if !matches!(self.classifier.provider.as_str(), "mock" | "jev-mcp") {
+            anyhow::bail!("behavior.classifier.provider must be mock or jev-mcp");
+        }
+        let runtime = self.classifier.runtime();
+        runtime
+            .validate()
+            .map_err(|_| anyhow::anyhow!("invalid behavior classifier configuration"))?;
+        if self.classifier.provider == "jev-mcp" {
+            runtime.validate_mcp_command().map_err(|_| {
+                anyhow::anyhow!(
+                    "behavior.classifier.command must be a trusted absolute path for jev-mcp"
+                )
+            })?;
         }
         Ok(())
     }
