@@ -103,6 +103,16 @@ impl BehaviorSection {
             .runtime()
             .validate()
             .map_err(|_| anyhow::anyhow!("invalid behavior classifier configuration"))?;
+        if self.classifier.provider == "jev-mcp" {
+            self.classifier
+                .runtime()
+                .validate_mcp_command()
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "behavior.classifier.command must be a trusted absolute path for jev-mcp"
+                    )
+                })?;
+        }
         let listen: std::net::SocketAddr = self
             .proxy_listen
             .parse()

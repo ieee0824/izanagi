@@ -162,6 +162,8 @@ API の shape は [API reference](https://docs.typesafe.ai/api) に従う。MCP 
 
 設定例は [configs/default.toml](../configs/default.toml)。機能と外部送信は既定で無効。
 
+Jev MCP の command は operator が信頼する絶対パスを必須とし、PATH/cwd による暗黙解決を拒否する。mock/recorded は外部実行しないためこの制約の対象外。Unix では MCP を専用 process group で起動し、成功・失敗・timeout・cancel 時に group を停止して直接の子を回収する。これは通常の子孫の lifecycle 管理であり、悪意ある provider の setsid 等による離脱を防ぐ OS 隔離ではない。
+
 - [behavior]: enabled=false、audit only、backend capability と各上限。
 - [behavior.classifier]: provider=mock/jev-mcp、model、profile、command/args、API credential の env 名。秘密値を TOML に書かない。MCP commit は operator が別途確認して指定する。未確認の commit は null と保存し、参考実装の commit を実行版と偽らない。質問 digest と feature/question/host policy 版、usage も監査に保存する。
 - [behavior.classifier].allow_export: 外部 TypeSafe API への送信を明示許可。許可する特徴フィールドは型の固定 projection で制限する。

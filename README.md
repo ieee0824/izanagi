@@ -194,6 +194,8 @@ izanagi behavior clear --session SESSION_ID --directory /path/to/session-audit
 
 Jev を使う場合は host に [jev-mcp](https://github.com/ieee0824/jev-mcp) を用意し、TypeSafe の認証情報を host の `TYPESAFE_API_KEY` 環境変数で管理します。次の操作は許可された構造化特徴量を TypeSafe API へ送信します。
 
+Jev MCP の実行ファイルには、信頼する絶対パスを指定してください。`jev-mcp` のような PATH 検索や相対パスは拒否します。ライブ設定でも `behavior.classifier.command` を絶対パスに変更する必要があります。実行ファイルと引数で読み込むコードを、guest や信頼しないプロジェクトから書き換えられる場所に置かないでください。
+
 ```bash
 izanagi behavior evaluate --manifest tests/fixtures/behavior/manifest.json \
   --classifier jev-mcp --mcp-command /path/to/jev-mcp --allow-export \

@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
-    process::{ChildStdin, Command},
+    process::{Child, ChildStdin, Command},
 };
 
 pub const PINNED_MODEL: &str = "jev-1.13.0";
@@ -186,6 +186,14 @@ impl Default for ClassifierConfig {
 }
 
 impl ClassifierConfig {
+    /// The operator must select a trusted executable, without PATH or cwd lookup.
+    pub fn validate_mcp_command(&self) -> Result<(), ClassificationErrorKind> {
+        if !self.command.is_absolute() {
+            return Err(ClassificationErrorKind::Configuration);
+        }
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<(), ClassificationErrorKind> {
         let variable_ok = self.credential_env.starts_with("TYPESAFE_")
             && self
@@ -224,6 +232,7 @@ pub struct JevMcpClassifier {
 impl JevMcpClassifier {
     pub fn new(config: ClassifierConfig) -> Result<Self, ClassificationErrorKind> {
         config.validate()?;
+        config.validate_mcp_command()?;
         Ok(Self { config })
     }
     pub fn config(&self) -> &ClassifierConfig {
@@ -235,7 +244,7 @@ impl JevMcpClassifier {
         projection: &FeatureProjection,
     ) -> Result<Value, ClassificationErrorKind> {
         let mut child = self.spawn_process()?;
-        let (mut transport, stderr) = McpExchange::take(&mut child, &self.config)?;
+        let (mut transport, stderr) = McpExchange::take(&mut child.child, &self.config)?;
         let stderr_drain = drain_stderr(stderr, self.config.max_stderr_bytes);
         let exchange = transport.exchange(projection, &self.config);
         tokio::pin!(exchange, stderr_drain);
@@ -244,8 +253,8 @@ impl JevMcpClassifier {
             result = &mut stderr_drain => (match result { Ok(()) => exchange.await, Err(error) => Err(error) }, true),
         };
         // A provider has no authority to outlive the request or the sandbox session.
-        let _ = child.start_kill();
-        let _ = child.wait().await;
+        child.stop();
+        let _ = child.child.wait().await;
         if !stderr_finished {
             // Account for buffered stderr even if a successful stdout response won the select.
             // A descendant holding the pipe open cannot extend the request indefinitely.
@@ -258,7 +267,7 @@ impl JevMcpClassifier {
         result
     }
 
-    fn spawn_process(&self) -> Result<tokio::process::Child, ClassificationErrorKind> {
+    fn spawn_process(&self) -> Result<McpProcess, ClassificationErrorKind> {
         let mut command = Command::new(&self.config.command);
         command
             .args(&self.config.args)
@@ -267,6 +276,11 @@ impl JevMcpClassifier {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.as_std_mut().process_group(0);
+        }
         // No generic inheritance: sandbox secrets and unrelated provider credentials never reach MCP.
         for name in [
             "PATH",
@@ -279,7 +293,39 @@ impl JevMcpClassifier {
                 command.env(name, value);
             }
         }
-        command.spawn().map_err(|_| ClassificationErrorKind::Spawn)
+        let child = command
+            .spawn()
+            .map_err(|_| ClassificationErrorKind::Spawn)?;
+        Ok(McpProcess {
+            #[cfg(unix)]
+            group: child.id(),
+            child,
+        })
+    }
+}
+
+/// Cancellation drops this guard as well as the transport futures. On Unix the
+/// group includes ordinary descendants, even when they close inherited stdio.
+/// This is lifecycle cleanup, not isolation from a provider that calls setsid.
+struct McpProcess {
+    child: Child,
+    #[cfg(unix)]
+    group: Option<u32>,
+}
+impl McpProcess {
+    fn stop(&mut self) {
+        #[cfg(unix)]
+        if let Some(group) = self.group.take() {
+            // The group was created with pgid=child PID before exec. Consume the
+            // ID once so Drop cannot signal a recycled group after wait/reap.
+            unsafe { libc::kill(-(group as libc::pid_t), libc::SIGKILL) };
+        }
+        let _ = self.child.start_kill();
+    }
+}
+impl Drop for McpProcess {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 
