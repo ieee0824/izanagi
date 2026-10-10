@@ -1,10 +1,26 @@
 //! Validate the few kernel field offsets used by writer probes from running BTF.
 //! No guessed kernel layout. Encoding: https://docs.kernel.org/bpf/btf.html
 use anyhow::{Result, bail, ensure};
+#[cfg(any(target_os = "linux", test))]
+use std::io::Read;
+
+const MAX_BTF_BYTES: usize = 32 * 1024 * 1024;
+
+#[cfg(any(target_os = "linux", test))]
+fn read_bounded(reader: impl Read, limit: usize) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    let read_limit = u64::try_from(limit)?
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("BTF read limit overflow"))?;
+    reader.take(read_limit).read_to_end(&mut bytes)?;
+    ensure!(bytes.len() <= limit, "kernel BTF exceeds size limit");
+    Ok(bytes)
+}
 
 #[cfg(target_os = "linux")]
 pub(super) fn load() -> Result<[u32; 4]> {
-    let bytes = std::fs::read("/sys/kernel/btf/vmlinux")?;
+    let file = std::fs::File::open("/sys/kernel/btf/vmlinux")?;
+    let bytes = read_bounded(file, MAX_BTF_BYTES)?;
     offsets(&bytes)
 }
 
@@ -35,7 +51,7 @@ struct Btf<'a> {
 impl<'a> Btf<'a> {
     fn parse(bytes: &'a [u8]) -> Result<Self> {
         ensure!(
-            bytes.len() <= 32 * 1024 * 1024 && bytes.get(..4) == Some(&[0x9f, 0xeb, 1, 0]),
+            bytes.len() <= MAX_BTF_BYTES && bytes.get(..4) == Some(&[0x9f, 0xeb, 1, 0]),
             "unsupported kernel BTF"
         );
         let header = word(bytes, 4)? as usize;
@@ -232,6 +248,25 @@ fn word(bytes: &[u8], offset: usize) -> Result<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oversized_btf_stops_reading_after_one_byte_past_limit() {
+        let mut source = std::io::Cursor::new(vec![0u8; 1024]);
+        assert!(read_bounded(&mut source, 16).is_err());
+        assert_eq!(source.position(), 17);
+    }
+
+    #[test]
+    fn bounded_btf_accepts_exact_limit_and_propagates_read_errors() {
+        assert_eq!(read_bounded(&b"abcd"[..], 4).unwrap(), b"abcd");
+        struct Broken;
+        impl Read for Broken {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("fixture read failed"))
+            }
+        }
+        assert!(read_bounded(Broken, 4).is_err());
+    }
 
     #[test]
     fn missing_truncated_or_incompatible_kernel_btf_never_guesses_offsets() {
