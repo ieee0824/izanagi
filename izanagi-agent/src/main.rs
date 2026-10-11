@@ -21,6 +21,7 @@
 //!
 //! このバイナリはスケルトン実装であり、実際の動作は Linux + QEMU 環境で確認する。
 
+mod admission;
 mod config;
 mod connection;
 mod crypto;
@@ -55,19 +56,12 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(format!("{}:{}", bind_addr, DEFAULT_PORT)).await?;
     eprintln!("izanagi-agent listening on {}:{}", bind_addr, DEFAULT_PORT);
 
+    let slots = Arc::new(tokio::sync::Semaphore::new(admission::MAX_CONNECTIONS));
     loop {
         let (stream, addr) = listener.accept().await?;
         eprintln!("accepted connection from {:?}", addr);
 
-        let secret = secret.clone();
-        let expected_token = Arc::clone(&expected_token);
-        tokio::spawn(async move {
-            if let Err(e) =
-                connection::handle_connection(stream, secret.as_deref(), &expected_token).await
-            {
-                eprintln!("connection error: {}", e);
-            }
-        });
+        admission::spawn_connection(stream, secret.clone(), Arc::clone(&expected_token), &slots);
     }
 }
 
