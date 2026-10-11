@@ -578,8 +578,10 @@ impl Config {
             bail!("dns_proxy.listen must be a concrete unicast address with a nonzero port");
         }
         match self.sandbox.backend {
-            SandboxBackend::Qemu if addr.ip().is_loopback() && !addr.ip().is_ipv4() => {
-                bail!("QEMU DNS relay requires IPv4 host loopback (127.0.0.1)");
+            SandboxBackend::Qemu
+                if addr.ip().is_loopback() && addr.ip() != std::net::Ipv4Addr::LOCALHOST =>
+            {
+                bail!("QEMU DNS relay supports only 127.0.0.1 as host loopback");
             }
             SandboxBackend::Qemu => {}
             SandboxBackend::AppleContainer | SandboxBackend::Native if is_macos => {

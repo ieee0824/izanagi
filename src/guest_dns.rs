@@ -12,7 +12,7 @@ const MAX_QUERIES: usize = 256;
 
 /// Slirp exposes the host's IPv4 loopback at 10.0.2.2.
 pub fn qemu_endpoint(mut host: SocketAddr) -> SocketAddr {
-    if host.ip().is_loopback() {
+    if host.ip() == std::net::Ipv4Addr::LOCALHOST {
         host.set_ip(std::net::Ipv4Addr::new(10, 0, 2, 2).into());
     }
     host

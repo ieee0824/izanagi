@@ -992,6 +992,7 @@ fn dns_proxy_rejects_unreachable_or_ambiguous_endpoints() {
         "127.0.0.1:0",
         "127.0.0.1",
         "[::1]:15353",
+        "127.0.0.2:15353",
         "224.0.0.1:53",
     ] {
         config.dns_proxy = Some(DnsProxySection {
