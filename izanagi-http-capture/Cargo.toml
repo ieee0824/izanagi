@@ -27,6 +27,9 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-uti
 tokio-rustls = "0.26"
 webpki-roots = "1"
 
+[dev-dependencies]
+tokio = { version = "1", features = ["process"] }
+
 [[bin]]
 name = "izanagi-http-capture"
 path = "src/main.rs"

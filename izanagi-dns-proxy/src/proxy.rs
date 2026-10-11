@@ -27,13 +27,23 @@ pub struct DnsProxy {
 
 impl DnsProxy {
     /// UDP と TCP のリスナーを起動し、シャットダウンシグナルまで待機する。
-    pub async fn run(&self, shutdown: tokio::sync::watch::Receiver<()>) -> anyhow::Result<()> {
+    pub async fn run_ready(
+        &self,
+        shutdown: tokio::sync::watch::Receiver<()>,
+        ready_stdout: bool,
+    ) -> anyhow::Result<()> {
         let udp_socket = UdpSocket::bind(self.listen_addr)
             .await
             .with_context(|| format!("{} への UDP バインドに失敗", self.listen_addr))?;
         let tcp_listener = TcpListener::bind(self.listen_addr)
             .await
             .with_context(|| format!("{} への TCP バインドに失敗", self.listen_addr))?;
+
+        if ready_stdout {
+            use std::io::Write;
+            println!("IZANAGI_PROXY_READY");
+            std::io::stdout().flush()?;
+        }
 
         eprintln!("DNS プロキシを起動しました: {} (UDP+TCP)", self.listen_addr);
         if self.allowlist.is_empty() {

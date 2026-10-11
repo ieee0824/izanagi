@@ -165,7 +165,7 @@ fn prompt_secret_maps(config: &Config) -> anyhow::Result<Vec<String>> {
         println!("シークレットマッピングは登録済みです (内容は非表示)");
     }
 
-    println!("シークレットマッピングを追加 (DUMMY=REAL 形式、空行で終了):");
+    println!("シークレットマッピングを追加 (HOST:Authorization:DUMMY=REAL 形式、空行で終了):");
     loop {
         let input: String = Password::new()
             .with_prompt("追加するマッピング")
@@ -174,8 +174,8 @@ fn prompt_secret_maps(config: &Config) -> anyhow::Result<Vec<String>> {
         if input.is_empty() {
             break;
         }
-        if !input.contains('=') {
-            eprintln!("形式が正しくありません。DUMMY=REAL の形式で入力してください。");
+        if !input.contains(":Authorization:") || !input.contains('=') {
+            eprintln!("HOST:Authorization:DUMMY=REAL の形式で入力してください。");
             continue;
         }
         secret_maps.push(input);

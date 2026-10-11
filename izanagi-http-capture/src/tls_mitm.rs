@@ -37,6 +37,7 @@ impl rustls::server::ResolvesServerCert for MitmCertResolver {
 }
 
 /// TLS MITM プロキシリスナーを起動する。
+#[cfg(test)]
 pub async fn run(
     listen_addr: SocketAddr,
     max_body_bytes: usize,
@@ -48,13 +49,35 @@ pub async fn run(
     allowed_hosts: Arc<HashSet<String>>,
     shutdown: &mut tokio::sync::watch::Receiver<()>,
 ) -> anyhow::Result<()> {
+    let listener = TcpListener::bind(listen_addr).await?;
+    run_bound(
+        listener,
+        max_body_bytes,
+        timeout,
+        logger,
+        semaphore,
+        cert_cache,
+        secret_map,
+        allowed_hosts,
+        shutdown,
+    )
+    .await
+}
+
+pub async fn run_bound(
+    listener: TcpListener,
+    max_body_bytes: usize,
+    timeout: Duration,
+    logger: Arc<CaptureLogger>,
+    semaphore: Arc<Semaphore>,
+    cert_cache: Arc<CertCache>,
+    secret_map: Arc<SecretMap>,
+    allowed_hosts: Arc<HashSet<String>>,
+    shutdown: &mut tokio::sync::watch::Receiver<()>,
+) -> anyhow::Result<()> {
     let acceptor = create_acceptor(cert_cache);
 
-    let listener = TcpListener::bind(listen_addr)
-        .await
-        .with_context(|| format!("{} への HTTPS (MITM) バインドに失敗", listen_addr))?;
-
-    report_startup(listen_addr, &allowed_hosts);
+    report_startup(listener.local_addr()?, &allowed_hosts);
     let settings = ConnectionSettings {
         max_body_bytes,
         timeout,
@@ -293,25 +316,8 @@ async fn forward_captured_request(
     target: ForwardTarget<'_>,
     settings: &ConnectionSettings,
 ) {
-    // シークレット置換（body + ヘッダー値）
-    let substituted_body = settings.secret_map.substitute(&req.body);
-    let substituted_path = settings.secret_map.substitute_str(&req.path);
-    let substituted_headers: Vec<(String, String)> = req
-        .headers
-        .iter()
-        .map(|(k, v)| (k.clone(), settings.secret_map.substitute_str(v)))
-        .collect();
-
     log_captured_request(&settings.logger, req, src, target.host, sni);
-
-    // 上流に転送（ヘッダー含む、Host はポート付きの元の値を保持）
-    let request_bytes = upstream::build_http_request(
-        &req.method,
-        &substituted_path,
-        target.host,
-        &substituted_headers,
-        &substituted_body,
-    );
+    let request_bytes = scoped_upstream_request(req, &target, &settings.secret_map);
 
     match upstream::forward_https(
         target.hostname,
@@ -322,7 +328,9 @@ async fn forward_captured_request(
     .await
     {
         Ok(response) => {
-            let _ = tls_stream.write_all(&response).await;
+            let _ = tls_stream
+                .write_all(settings.secret_map.safe_response(&response))
+                .await;
         }
         Err(e) => {
             eprintln!("上流転送失敗 ({} → {}): {}", src, target.host, e);
@@ -333,6 +341,33 @@ async fn forward_captured_request(
                 .await;
         }
     }
+}
+
+fn scoped_upstream_request(
+    req: &http_capture::ParsedRequest,
+    target: &ForwardTarget<'_>,
+    secret_map: &SecretMap,
+) -> Vec<u8> {
+    // Body and path/query always remain unchanged; only scoped Authorization is rewritten.
+    let substituted_headers: Vec<(String, String)> = req
+        .headers
+        .iter()
+        .map(|(k, v)| {
+            (
+                k.clone(),
+                secret_map.substitute_header(target.hostname, target.port, k, v),
+            )
+        })
+        .collect();
+
+    // 上流に転送（ヘッダー含む、Host はポート付きの元の値を保持）
+    upstream::build_http_request(
+        &req.method,
+        &req.path,
+        target.host,
+        &substituted_headers,
+        &req.body,
+    )
 }
 
 fn log_captured_request(
@@ -360,6 +395,36 @@ mod tests {
     use crate::ca::CaAuthority;
     use crate::cert_cache::CertCache;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn secret_mapping_does_not_replace_request_body_query_or_other_headers() {
+        let mut map = SecretMap::new();
+        map.add_from_str("api.example.com:Authorization:DUMMY=REAL_CANARY")
+            .unwrap();
+        let request = http_capture::ParsedRequest {
+            method: "POST".into(),
+            path: "/echo?marker=DUMMY".into(),
+            host: Some("api.example.com".into()),
+            headers: vec![
+                ("Authorization".into(), "Bearer DUMMY".into()),
+                ("X-Fixture".into(), "DUMMY".into()),
+            ],
+            content_length: Some(5),
+            body: b"DUMMY".to_vec(),
+        };
+        let sent = String::from_utf8(scoped_upstream_request(
+            &request,
+            &forward_target("api.example.com"),
+            &map,
+        ))
+        .unwrap();
+        assert!(sent.starts_with("POST /echo?marker=DUMMY HTTP/1.1"));
+        assert!(sent.contains("Authorization: Bearer REAL_CANARY"));
+        assert!(sent.contains("X-Fixture: DUMMY"));
+        assert!(sent.ends_with("\r\n\r\nDUMMY"));
+        let other = scoped_upstream_request(&request, &forward_target("other.example.com"), &map);
+        assert!(!String::from_utf8(other).unwrap().contains("REAL_CANARY"));
+    }
 
     #[test]
     fn target_port_parsing_preserves_original_host_and_invalid_port_fallback() {

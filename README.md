@@ -342,14 +342,16 @@ cargo run -- --listen 127.0.0.1:15353 --config ../izanagi.toml
 cd izanagi-http-capture
 cargo run -- --listen-http 127.0.0.1:18080 --listen-https 127.0.0.1:18443 \
   --ca-cert-out /tmp/izanagi-ca.pem \
-  --secret-map "DUMMY_TOKEN=real-api-key" \
+  --secret-map-file /path/to/private-secret-maps.txt \
   --allowed-host "registry.npmjs.org"
 ```
 
 - **HTTP**: リクエストの Host, Method, Path, Body をログに記録し 403 を返す
 - **HTTPS**: 起動時に自己署名 CA を生成、SNI に応じてサーバー証明書をオンデマンド発行
 - **上流転送**: `--allowed-host` で許可されたホストにはシークレット置換後に転送
-- **シークレット置換**: `--secret-map DUMMY=REAL` でサンドボックス内のダミー値を本物に書き換え
+- **シークレット置換**: `HOST:Authorization:DUMMY=REAL` を1行ずつ記載した非公開ファイルを `--secret-map-file` で指定する。ファイルは共有領域外に置き、権限を0600にする。指定ホストの443番宛ての `Authorization` ヘッダーだけを置換し、body・パス・クエリ・他のヘッダーは置換しない。範囲未指定の `DUMMY=REAL` は拒否する。
+- 応答に本物の値がそのまま含まれる場合は502を返す。この検査はエンコード・変換された値を検出しないため、マッピング先は認証情報の送付を信頼できる API に限定する。
+- `izanagi up` はプロキシのリスナー起動確認が失敗すると終了する。プロキシは本体と同じディレクトリからのみ起動するため、更新時は `make install` で本体・両プロキシを同時に配置する。
 
 ### サンドボックス DNS 統合
 
