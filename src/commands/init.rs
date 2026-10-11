@@ -371,7 +371,7 @@ fn append_sandbox(
 
 fn append_share(out: &mut String, share_paths: &str, mount_point: &str) {
     // [share]
-    out.push_str("\n[share]\n");
+    out.push_str("\n[share]\nread_only = true\n");
     let paths: Vec<String> = share_paths
         .split(',')
         .map(|s| escape_toml_string(s.trim()))

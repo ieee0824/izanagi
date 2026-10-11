@@ -49,6 +49,8 @@ pub struct ShareConfig {
     pub host_paths: Vec<PathBuf>,
     /// ゲスト側のマウントポイント。
     pub mount_point: PathBuf,
+    /// Deny writes through the workspace share.
+    pub read_only: bool,
 }
 
 /// コマンド実行の結果。

@@ -589,6 +589,7 @@ mod tests {
             share: crate::sandbox::ShareConfig {
                 host_paths: vec![],
                 mount_point: std::path::PathBuf::from("/workspace"),
+                read_only: false,
             },
         }
     }

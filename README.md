@@ -71,6 +71,12 @@ Izanagi は隔離環境によりホストを保護しつつ、syscall トレー�
 | 軽量・Linux | Landlock | eBPF |
 | 監視のみ（隔離なし） | なし | eBPF / DTrace |
 
+共有ワークスペースはホストへの経路です。`[share] read_only = true` を既定とし、`.git/`（設定・フックを含む）、IDE 設定、ビルドスクリプトを含めて共有全体への内容の書き込みを防ぎます。QEMU はホストの 9p export に `readonly=on` を設定し、Apple Container は volume を `:ro` にします。Linux Native は Landlock で書き込み・切り詰め・作成・削除を拒否します。Native の読み取り専用モードは ABI v3 以降が必要です。`/tmp` と共有範囲が重なる場合、`/tmp` の書き込み許可も外します。Landlock は `chmod` など一部のメタデータ操作を制限しないため、Native は VM の読み取り専用マウントと同等の保護ではありません。
+
+インストール・ビルドなど共有先への書き込みが必要な場合は、`read_only = false` を明示してください。その変更はホストに直接反映され、QEMU のディスク snapshot でも取り消せません。信頼しないコードを動かす場合は使い捨てのプロジェクトコピーを共有し、成果物と差分を確認してから取り込んでください。元のプロジェクトを共有した場合は、ホストで Git・IDE・ビルドツールを使う前に設定・フック・スクリプトを含む変更を確認してください。
+
+`workspace-write` ルールは共有内の Git・IDE・ビルド関連パスへの書き込みまたは書き込み可能な open を警告します。読み取り専用モードで拒否された試行も結果を添えて記録します。open の flags が不明なら「書き込み意図不明」として警告します。検知は観測できたパスと syscall に限られ、symlink の参照先や fd だけの write、未収集の rename/unlink などを完全には検知しません。警告は防止機構の代わりにはなりません。
+
 ## クイックスタート
 
 ### 1. ビルド
@@ -265,6 +271,7 @@ image = "default"
 [share]
 paths = ["."]
 mount_point = "/workspace"
+read_only = true                 # 既定: .git を含む共有全体への書き込みを防ぐ
 
 [monitor]
 syscalls = ["file", "network", "process", "env"]

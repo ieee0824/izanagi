@@ -207,8 +207,9 @@ fn push_qemu_share(args: &mut Vec<String>, share: &ShareConfig) {
         args.extend_from_slice(&[
             "-fsdev".to_string(),
             format!(
-                "local,id=fs0,path={},security_model=mapped-xattr",
-                host_path.display()
+                "local,id=fs0,path={},security_model=mapped-xattr,readonly={}",
+                host_path.display(),
+                if share.read_only { "on" } else { "off" }
             ),
         ]);
         args.extend_from_slice(&[
@@ -1142,6 +1143,7 @@ mod tests {
         let share = ShareConfig {
             host_paths: vec![PathBuf::from("/home/user/project")],
             mount_point: PathBuf::from("/workspace"),
+            read_only: false,
         };
         let args = build_args(&image, 2, 4096, &share, 9001, None, None, None);
 
@@ -1174,6 +1176,7 @@ mod tests {
         let share = ShareConfig {
             host_paths: vec![],
             mount_point: PathBuf::from("/workspace"),
+            read_only: false,
         };
         let args = build_args(&image, 1, 512, &share, 9001, None, None, None);
 
@@ -1193,6 +1196,7 @@ mod tests {
         let share = ShareConfig {
             host_paths: vec![PathBuf::from("/home/user/project")],
             mount_point: PathBuf::from("/workspace"),
+            read_only: false,
         };
         let args = build_args(&image, 2, 4096, &share, 9001, None, None, None);
 
@@ -1214,6 +1218,7 @@ mod tests {
         let share = ShareConfig {
             host_paths: vec![],
             mount_point: PathBuf::from("/workspace"),
+            read_only: false,
         };
         let args = build_args(&image, 1, 512, &share, 9001, None, None, None);
 
@@ -1230,6 +1235,7 @@ mod tests {
         let share = ShareConfig {
             host_paths: vec![],
             mount_point: PathBuf::from("/workspace"),
+            read_only: false,
         };
         let args = build_args(&image, 1, 512, &share, 12345, None, None, None);
 
@@ -1249,6 +1255,7 @@ mod tests {
         let share = ShareConfig {
             host_paths: vec![],
             mount_point: PathBuf::from("/workspace"),
+            read_only: false,
         };
         let args = build_args(&image, 1, 512, &share, 9001, None, None, Some("10.0.2.2"));
 
@@ -1266,6 +1273,7 @@ mod tests {
         let share = ShareConfig {
             host_paths: vec![],
             mount_point: PathBuf::from("/workspace"),
+            read_only: false,
         };
         let args = build_args(&image, 1, 512, &share, 9001, None, None, None);
 
@@ -1296,6 +1304,7 @@ mod tests {
             share: ShareConfig {
                 host_paths: vec![],
                 mount_point: PathBuf::from("/workspace"),
+                read_only: false,
             },
         };
 
@@ -1333,6 +1342,7 @@ mod tests {
         let share = ShareConfig {
             host_paths: vec![PathBuf::from("/tmp")],
             mount_point: PathBuf::from("/workspace"),
+            read_only: false,
         };
         let config = SandboxConfig::Qemu {
             cpus: 2,
@@ -1357,6 +1367,7 @@ mod tests {
         let share = ShareConfig {
             host_paths: vec![PathBuf::from("/home/user/project")],
             mount_point: PathBuf::from("/workspace"),
+            read_only: false,
         };
         let args = build_args(&image, 4, 8192, &share, 9999, None, None, None);
 
@@ -1402,6 +1413,7 @@ mod tests {
         let share = ShareConfig {
             host_paths: vec![],
             mount_point: PathBuf::from("/workspace"),
+            read_only: false,
         };
         let args = build_args(
             &image,
@@ -1430,6 +1442,7 @@ mod tests {
         let share = ShareConfig {
             host_paths: vec![],
             mount_point: PathBuf::from("/workspace"),
+            read_only: false,
         };
         let args = build_args(&image, 1, 512, &share, 9001, None, None, None);
 
@@ -1443,6 +1456,7 @@ mod tests {
         let share = ShareConfig {
             host_paths: vec![],
             mount_point: PathBuf::from("/workspace"),
+            read_only: false,
         };
         let args = build_args(
             &image,
@@ -1470,6 +1484,7 @@ mod tests {
         let share = ShareConfig {
             host_paths: vec![],
             mount_point: PathBuf::from("/workspace"),
+            read_only: false,
         };
         let args = build_args(&image, 1, 512, &share, 9001, None, None, None);
 
@@ -1594,5 +1609,22 @@ mod tests {
                 .is_none()
         );
         agent.await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod share_security_tests {
+    #[test]
+    fn host_export_enforces_both_share_modes() {
+        for (read_only, option) in [(true, "on"), (false, "off")] {
+            let share = crate::sandbox::ShareConfig {
+                host_paths: vec!["/project".into()],
+                mount_point: "/workspace".into(),
+                read_only,
+            };
+            let mut args = Vec::new();
+            super::push_qemu_share(&mut args, &share);
+            assert!(args[1].ends_with(&format!(",readonly={option}")));
+        }
     }
 }

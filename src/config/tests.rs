@@ -864,3 +864,64 @@ fn validation_preserves_backend_then_platform_then_share_error_priority() {
     let error = config.validate_for_platform(false, true).unwrap_err();
     assert!(error.to_string().contains("ルートパス"));
 }
+
+#[test]
+fn old_configs_default_to_read_only_and_mode_reaches_each_backend() {
+    let mut value: toml::Value =
+        toml::from_str(&toml::to_string(&Config::default()).unwrap()).unwrap();
+    value["share"].as_table_mut().unwrap().remove("read_only");
+    assert!(
+        Config::from_toml(&toml::to_string(&value).unwrap())
+            .unwrap()
+            .share
+            .read_only
+    );
+    for backend in [
+        SandboxBackend::Native,
+        SandboxBackend::Qemu,
+        SandboxBackend::AppleContainer,
+    ] {
+        for read_only in [true, false] {
+            let mut config = Config::default();
+            config.sandbox.backend = backend;
+            config.sandbox.qemu = Some(QemuSection::default());
+            config.share.read_only = read_only;
+            for linux in [true, false] {
+                let share = match config.to_sandbox_config_for_platform(linux).unwrap() {
+                    crate::sandbox::SandboxConfig::Landlock { share }
+                    | crate::sandbox::SandboxConfig::Qemu { share, .. }
+                    | crate::sandbox::SandboxConfig::AppleContainer { share, .. } => share,
+                };
+                assert_eq!(share.read_only, read_only);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn workspace_write_rule_is_enabled_in_sync_and_async_configuration() {
+    let config = Config::default();
+    assert!(
+        config
+            .to_rules()
+            .iter()
+            .any(|r| r.name() == "workspace-write")
+    );
+    let (rules, _) = config
+        .to_rules_with_warnings_async(std::time::Duration::from_secs(1))
+        .await;
+    assert!(rules.iter().any(|r| r.name() == "workspace-write"));
+}
+
+#[test]
+fn writable_share_emits_host_execution_warning() {
+    let mut config = Config::default();
+    config.share.read_only = false;
+    assert!(
+        config
+            .validate()
+            .unwrap()
+            .iter()
+            .any(|w| w.contains("Writable shares"))
+    );
+}
