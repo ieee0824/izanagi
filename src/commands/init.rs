@@ -334,6 +334,9 @@ fn generate_toml(
 ) -> String {
     let mut out = String::new();
     append_sandbox(&mut out, backend, qemu, tracer, require_auth);
+    if qemu.is_some() {
+        out.push_str(&format!("restrict_network = {}\n", mitm.is_none()));
+    }
     append_share(&mut out, share_paths, mount_point);
     append_monitor(&mut out, syscalls);
     out.push_str("\n[detect]\n");
