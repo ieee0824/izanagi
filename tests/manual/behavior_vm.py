@@ -13,9 +13,11 @@ W = D / "workspace"
 B = str(args.binary.resolve())
 configuration = tomllib.loads(args.config.read_text())
 assert configuration["sandbox"]["backend"] == "qemu"
+assert configuration["sandbox"]["qemu"].get("restrict_network", True) is False, "Fixture proxy needs explicit network opt-out"
 assert configuration["sandbox"]["tracer"] == "vm-agent"
 assert configuration["sandbox"]["require_auth"] is True
 assert configuration["share"]["paths"] == [str(W)]
+assert configuration["share"].get("read_only", True) is False, "Dedicated fixture output needs an explicit writable share"
 assert configuration["share"]["mount_point"] == "/workspace"
 assert configuration["behavior"]["enabled"] is True
 assert configuration["behavior"]["proxy_listen"] == "127.0.0.1:18080"

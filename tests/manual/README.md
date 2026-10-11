@@ -18,9 +18,11 @@ require_auth = true
 cpus = 2
 memory = "2G"
 image = "/absolute/path/to/test-overlay.qcow2"
+restrict_network = false # 専用 fixture のホスト HTTP プロキシに接続する
 [share]
 paths = ["/absolute/path/to/artifacts/workspace"]
 mount_point = "/workspace"
+read_only = false # 専用 fixture 内の receiver log と計測結果を書き込む
 [monitor]
 syscalls = ["file", "network", "process"]
 [detect]
