@@ -34,7 +34,7 @@ echo "=== QEMU VM を起動 ==="
 qemu-system-aarch64 -accel hvf -cpu host -m 2G -smp 2 \
   -M virt -bios /opt/homebrew/share/qemu/edk2-aarch64-code.fd \
   -drive "file=$IMAGE,format=qcow2,if=virtio" \
-  -netdev "user,id=net0,hostfwd=tcp::${SSH_PORT}-:22,hostfwd=tcp::${AGENT_PORT}-:${AGENT_PORT}" \
+  -netdev "user,id=net0,hostfwd=tcp:127.0.0.1:${SSH_PORT}-:22,hostfwd=tcp:127.0.0.1:${AGENT_PORT}-:${AGENT_PORT}" \
   -device virtio-net-pci,netdev=net0 \
   -nographic &
 QEMU_PID=$!
@@ -63,7 +63,12 @@ echo "=== agent を転送 ==="
 sshpass -p izanagi scp -P $SSH_PORT $SSH_OPTS "$AGENT_BINARY" root@localhost:/usr/local/bin/izanagi-agent
 
 echo "=== agent をセットアップ ==="
+sshpass -p izanagi scp -P $SSH_PORT $SSH_OPTS "$(dirname "$0")/lock-down.sh" root@localhost:/tmp/izanagi-lock-down.sh
+
+sshpass -p izanagi scp -P $SSH_PORT $SSH_OPTS "$(dirname "$0")/verify-image.sh" root@localhost:/tmp/verify-image.sh
+
 sshpass -p izanagi ssh -p $SSH_PORT $SSH_OPTS root@localhost << 'SETUP'
+set -eu
 chmod +x /usr/local/bin/izanagi-agent
 
 # OpenRC init スクリプト
@@ -84,11 +89,13 @@ echo "9p" >> /etc/modules
 echo "9pnet" >> /etc/modules
 echo "9pnet_virtio" >> /etc/modules
 
+sh /tmp/izanagi-lock-down.sh
 echo "=== セットアップ完了 ==="
+nohup sh -c 'sleep 2; poweroff' >/dev/null 2>&1 &
 SETUP
 
 echo "=== VM をシャットダウン ==="
-sshpass -p izanagi ssh -p $SSH_PORT $SSH_OPTS root@localhost poweroff || true
+# root パスワードはロック済み。既存 SSH 接続内で終了する。
 
 # QEMU の終了を待つ
 wait $QEMU_PID 2>/dev/null || true

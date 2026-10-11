@@ -551,6 +551,10 @@ cargo build --release --features landlock,ebpf
 
 ### QEMU VM イメージの作成
 
+旧イメージには公開ビルド用の root パスワードが残るため、VM を停止してイメージを退避し、
+以下の手順で再作成する。新しいイメージは最終化時に root パスワードをロックし、SSH を無効化する。
+検証手順は [Packer README](packer/README.md#イメージの検証) を参照する。
+
 agent・eBPF object・HTTP sidecar を Packer で qcow2 イメージに配置する。
 
 ```bash

@@ -90,7 +90,7 @@ source "qemu" "debian" {
   disk_interface    = "virtio"
   boot_wait         = "60s"
   boot_key_interval = "100ms"
-  shutdown_command  = "shutdown -h now"
+  shutdown_command  = "sh /tmp/izanagi-lock-down.sh && shutdown -h now"
 
   # aarch64 では -boot once=d が使えないため無効化
   cd_files     = []
@@ -119,6 +119,17 @@ build {
   provisioner "file" {
     source      = var.agent_binary
     destination = "/usr/local/bin/izanagi-agent"
+  }
+
+  # 最終イメージからビルド用 root 認証と SSH 起動を除去する。
+  provisioner "file" {
+    source      = "${path.root}/lock-down.sh"
+    destination = "/tmp/izanagi-lock-down.sh"
+  }
+
+  provisioner "file" {
+    source      = "${path.root}/verify-image.sh"
+    destination = "/tmp/verify-image.sh"
   }
 
   # eBPF オブジェクトをコピー (ビルド済みの場合)
