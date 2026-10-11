@@ -54,11 +54,19 @@ build-all: build build-agent build-ebpf build-http-gnu ## ホスト + agent + eB
 # --- インストール ---
 
 .PHONY: install
-install: build ## ホスト側バイナリを ~/.izanagi/bin にインストール
+install: build ## ホスト側バイナリとプロキシを ~/.izanagi/bin にインストール
+	cargo build --release --locked --manifest-path izanagi-dns-proxy/Cargo.toml
+	cargo build --release --locked --manifest-path izanagi-http-capture/Cargo.toml
 	mkdir -p $(INSTALL_DIR)
 	cp target/release/izanagi $(INSTALL_DIR)/izanagi
+	cp izanagi-dns-proxy/target/release/izanagi-dns-proxy $(INSTALL_DIR)/izanagi-dns-proxy
+	cp izanagi-http-capture/target/release/izanagi-http-capture $(INSTALL_DIR)/izanagi-http-capture
 	chmod +x $(INSTALL_DIR)/izanagi
+ifeq ($(shell uname -s),Darwin)
 	codesign --sign - --force $(INSTALL_DIR)/izanagi
+	codesign --sign - --force $(INSTALL_DIR)/izanagi-dns-proxy
+	codesign --sign - --force $(INSTALL_DIR)/izanagi-http-capture
+endif
 	@echo "Installed: $(INSTALL_DIR)/izanagi"
 	@echo "PATH に $(INSTALL_DIR) を追加してください:"
 	@echo '  export PATH="$$HOME/.izanagi/bin:$$PATH"'

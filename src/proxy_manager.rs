@@ -30,18 +30,27 @@ impl ProxyManager {
     /// - `dns_proxy.enabled = true` なら DNS プロキシを起動
     /// - `http_capture.enabled = true` なら HTTP キャプチャプロキシを起動
     pub async fn start(config: &Config, config_path: &Path) -> anyhow::Result<Self> {
-        let dns_proxy = Self::start_dns_proxy(config, config_path)?;
-        let (http_capture, secret_guard) = Self::start_http_capture(config)?;
-
-        Ok(Self {
-            dns_proxy,
-            http_capture,
-            _secret_map_guard: secret_guard,
-        })
+        let mut manager = Self {
+            dns_proxy: None,
+            http_capture: None,
+            _secret_map_guard: None,
+        };
+        manager.dns_proxy = Self::start_dns_proxy(config, config_path).await?;
+        match Self::start_http_capture(config).await {
+            Ok((child, guard)) => {
+                manager.http_capture = child;
+                manager._secret_map_guard = guard;
+                Ok(manager)
+            }
+            Err(error) => {
+                manager.stop().await;
+                Err(error)
+            }
+        }
     }
 
     /// DNS プロキシをサブプロセスとして起動する。
-    fn start_dns_proxy(config: &Config, config_path: &Path) -> anyhow::Result<Option<Child>> {
+    async fn start_dns_proxy(config: &Config, config_path: &Path) -> anyhow::Result<Option<Child>> {
         let section = match &config.dns_proxy {
             Some(s) if s.enabled => s,
             _ => return Ok(None),
@@ -49,18 +58,20 @@ impl ProxyManager {
 
         let binary = find_binary("izanagi-dns-proxy")?;
 
-        let child = Command::new(&binary)
+        let mut child = Command::new(&binary)
+            .arg("--ready-stdout")
             .arg("--config")
             .arg(config_path)
             .arg("--listen")
             .arg(&section.listen)
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .kill_on_drop(true)
             .spawn()
             .map_err(|e| {
                 anyhow::anyhow!("DNS プロキシの起動に失敗 ({}): {}", binary.display(), e)
             })?;
+        wait_proxy_ready(&mut child).await?;
 
         eprintln!(
             "[proxy] DNS プロキシを起動しました (PID: {}, listen: {})",
@@ -72,7 +83,7 @@ impl ProxyManager {
     }
 
     /// HTTP キャプチャプロキシをサブプロセスとして起動する。
-    fn start_http_capture(
+    async fn start_http_capture(
         config: &Config,
     ) -> anyhow::Result<(Option<Child>, Option<TempFileGuard>)> {
         let section = match &config.http_capture {
@@ -89,13 +100,14 @@ impl ProxyManager {
 
         let (mut cmd, secret_guard) = http_capture_command(&binary, section, config)?;
 
-        let child = cmd.spawn().map_err(|e| {
+        let mut child = cmd.spawn().map_err(|e| {
             anyhow::anyhow!(
                 "HTTP キャプチャプロキシの起動に失敗 ({}): {}",
                 binary.display(),
                 e
             )
         })?;
+        wait_proxy_ready(&mut child).await?;
 
         eprintln!(
             "[proxy] HTTP キャプチャプロキシを起動しました (PID: {}, http: {}, https: {})",
@@ -136,11 +148,12 @@ fn http_capture_command(
     config: &Config,
 ) -> anyhow::Result<(Command, Option<TempFileGuard>)> {
     let mut cmd = Command::new(binary);
-    cmd.arg("--listen-http")
+    cmd.arg("--ready-stdout")
+        .arg("--listen-http")
         .arg(section.listen_http.to_string())
         .arg("--listen-https")
         .arg(section.listen_https.to_string())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .kill_on_drop(true);
 
@@ -166,6 +179,41 @@ fn http_capture_command(
     };
 
     Ok((cmd, secret_guard))
+}
+
+async fn wait_proxy_ready(child: &mut Child) -> anyhow::Result<()> {
+    use tokio::io::AsyncReadExt;
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let stdout = child
+            .stdout
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("proxy stdout unavailable"))?;
+        let mut ready = [0u8; b"IZANAGI_PROXY_READY\n".len()];
+        stdout.read_exact(&mut ready).await?;
+        anyhow::ensure!(
+            &ready == b"IZANAGI_PROXY_READY\n",
+            "invalid proxy startup response"
+        );
+        anyhow::ensure!(child.try_wait()?.is_none(), "proxy exited during startup");
+        Ok::<_, anyhow::Error>(())
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => Ok(()),
+        failure => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            // Never echo child output: it might contain credentials.
+            anyhow::bail!(
+                "プロキシの起動確認に失敗しました ({})",
+                if failure.is_err() {
+                    "timeout"
+                } else {
+                    "startup error"
+                }
+            );
+        }
+    }
 }
 
 /// 一時ファイルの RAII ガード。Drop 時にファイルを削除する。
@@ -195,6 +243,11 @@ impl Drop for TempFileGuard {
 fn write_secret_map_file(maps: &[String]) -> anyhow::Result<(PathBuf, TempFileGuard)> {
     use std::os::unix::fs::OpenOptionsExt;
 
+    anyhow::ensure!(
+        maps.iter().all(|line| !line.chars().any(char::is_control)),
+        "secret mappings must contain one mapping per line"
+    );
+
     let random_suffix: String = (0..8)
         .map(|_| format!("{:02x}", rand::random::<u8>()))
         .collect();
@@ -205,40 +258,29 @@ fn write_secret_map_file(maps: &[String]) -> anyhow::Result<(PathBuf, TempFileGu
         .mode(0o600)
         .open(&path)
         .map_err(|e| anyhow::anyhow!("シークレットマップファイルの作成に失敗: {e}"))?;
+    let guard = TempFileGuard { path: path.clone() };
     for line in maps {
         writeln!(f, "{line}")?;
     }
-    let guard = TempFileGuard { path: path.clone() };
     Ok((path, guard))
 }
 
 /// プロキシバイナリのパスを検索する。
 ///
-/// 1. `current_exe()` と同じディレクトリ (cargo target / インストール先)
-/// 2. `PATH` 環境変数から検索 (シェル非経由、自前パース)
+/// `current_exe()` と同じディレクトリからのみ解決する。
 fn find_binary(name: &str) -> anyhow::Result<PathBuf> {
-    // 同一ディレクトリ (開発時: cargo target、リリース時: インストール先)
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(dir) = exe.parent()
-    {
+    sibling_binary(&std::env::current_exe()?, name)
+}
+
+fn sibling_binary(executable: &Path, name: &str) -> anyhow::Result<PathBuf> {
+    if let Some(dir) = executable.parent() {
         let candidate = dir.join(name);
         if candidate.is_file() {
             return Ok(candidate);
         }
     }
-
-    // PATH から自前で検索 (which コマンドに依存しない)
-    if let Some(paths) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&paths) {
-            let candidate = dir.join(name);
-            if candidate.is_file() {
-                return Ok(candidate);
-            }
-        }
-    }
-
     anyhow::bail!(
-        "プロキシバイナリ '{name}' が見つかりません。cargo build で事前にビルドしてください。"
+        "プロキシバイナリ '{name}' が本体と同じディレクトリにありません。make install でインストールしてください。PATH は検索しません。"
     )
 }
 
@@ -311,6 +353,57 @@ fn pid_display(pid: Option<u32>) -> String {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[tokio::test]
+    async fn failed_proxy_startup_is_reaped_without_echoing_output() {
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "printf 'SECRET_CANARY'; exit 2"])
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let error = wait_proxy_ready(&mut child).await.unwrap_err().to_string();
+        assert!(!error.contains("SECRET_CANARY"));
+        assert!(child.try_wait().unwrap().is_some());
+    }
+
+    #[test]
+    #[serial_test::serial(env)]
+    fn proxy_does_not_search_path_even_when_it_contains_an_executable() {
+        let dir =
+            std::env::temp_dir().join(format!("izanagi-proxy-path-{}", rand::random::<u64>()));
+        std::fs::create_dir(&dir).unwrap();
+        let name = format!("izanagi-fixture-proxy-{}", rand::random::<u64>());
+        std::fs::write(dir.join(&name), "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(dir.join(&name), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let old_path = std::env::var_os("PATH");
+        unsafe {
+            std::env::set_var("PATH", &dir);
+        }
+        let result = find_binary(&name);
+        unsafe {
+            match old_path {
+                Some(value) => std::env::set_var("PATH", value),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+        assert!(result.is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn proxy_resolution_requires_sibling_binary() {
+        let dir =
+            std::env::temp_dir().join(format!("izanagi-proxy-resolve-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(dir.join("trusted")).unwrap();
+        let exe = dir.join("trusted/izanagi");
+        std::fs::write(dir.join("izanagi-dns-proxy"), "untrusted").unwrap();
+        assert!(sibling_binary(&exe, "izanagi-dns-proxy").is_err());
+        let sibling = dir.join("trusted/izanagi-dns-proxy");
+        std::fs::write(&sibling, "trusted").unwrap();
+        assert_eq!(sibling_binary(&exe, "izanagi-dns-proxy").unwrap(), sibling);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn temp_file_guard_deletes_on_drop() {

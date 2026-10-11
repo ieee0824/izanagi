@@ -20,6 +20,8 @@ use crate::upstream::UpstreamResolver;
 #[derive(Parser)]
 #[command(name = "izanagi-dns-proxy", version, about)]
 struct Cli {
+    #[arg(long, hide = true)]
+    ready_stdout: bool,
     /// 設定ファイルパス
     #[arg(short, long, default_value = "./izanagi.toml")]
     config: PathBuf,
@@ -68,7 +70,7 @@ async fn main() -> anyhow::Result<()> {
         let _ = shutdown_tx.send(());
     });
 
-    proxy.run(shutdown_rx).await?;
+    proxy.run_ready(shutdown_rx, cli.ready_stdout).await?;
     signal_handle.abort();
 
     Ok(())
