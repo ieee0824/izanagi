@@ -139,7 +139,7 @@ pub struct HttpCaptureSection {
     pub listen_https: std::net::SocketAddr,
     /// 生成した CA 証明書の出力先パス。
     pub ca_cert_out: Option<std::path::PathBuf>,
-    /// シークレット置換マッピング (`DUMMY=REAL` 形式)。
+    /// シークレット置換マッピング (`HOST:Authorization:DUMMY=REAL` 形式)。
     /// サンドボックス内ではダミー値を使い、プロキシが上流転送時に本物に置換する。
     /// セキュリティ上、設定ファイルに実際のトークンを直書きせず、
     /// 環境変数やファイルから読み込む運用を推奨する。

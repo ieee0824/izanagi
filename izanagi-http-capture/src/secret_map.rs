@@ -1,16 +1,20 @@
-/// ダミー値 → 本物のシークレットのマッピング。
-/// リクエスト body やヘッダー内のダミー値を本物に置換する。
+//! Secrets may be substituted only in Authorization for one exact HTTPS host.
 #[derive(Clone)]
-pub struct SecretMap {
-    /// ダミー値の長い順にソート済み（部分文字列の誤置換を防ぐ）。
-    sorted_mappings: Vec<(String, String)>,
+struct Mapping {
+    host: String,
+    dummy: String,
+    real: String,
 }
 
-// Debug 実装: シークレットの中身をマスクする
+#[derive(Clone)]
+pub struct SecretMap {
+    mappings: Vec<Mapping>,
+}
+
 impl std::fmt::Debug for SecretMap {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SecretMap")
-            .field("entries", &self.sorted_mappings.len())
+            .field("entries", &self.mappings.len())
             .finish()
     }
 }
@@ -18,70 +22,90 @@ impl std::fmt::Debug for SecretMap {
 impl SecretMap {
     pub fn new() -> Self {
         Self {
-            sorted_mappings: Vec::new(),
+            mappings: Vec::new(),
         }
     }
 
-    /// "DUMMY=REAL" 形式の文字列からマッピングを追加する。
-    pub fn add_from_str(&mut self, s: &str) -> anyhow::Result<()> {
-        let (dummy, real) = s.split_once('=').ok_or_else(|| {
-            anyhow::anyhow!("無効な secret-map 形式: '{}' (DUMMY=REAL が必要)", s)
-        })?;
-        if dummy.is_empty() {
-            anyhow::bail!("ダミー値が空です: '{}'", s);
+    /// Parse HOST:Authorization:DUMMY=REAL. Never include mapping content in errors.
+    pub fn add_from_str(&mut self, value: &str) -> anyhow::Result<()> {
+        let invalid = || anyhow::anyhow!("secret-map requires HOST:Authorization:DUMMY=REAL");
+        let mut parts = value.splitn(3, ':');
+        let host = parts.next().ok_or_else(invalid)?;
+        let header = parts.next().ok_or_else(invalid)?;
+        let (dummy, real) = parts
+            .next()
+            .and_then(|part| part.split_once('='))
+            .ok_or_else(invalid)?;
+        if host.is_empty()
+            || !host
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+            || !header.eq_ignore_ascii_case("Authorization")
+            || dummy.is_empty()
+            || real.is_empty()
+            || dummy.chars().any(char::is_control)
+            || real.chars().any(char::is_control)
+        {
+            return Err(invalid());
         }
-        if real.is_empty() {
-            anyhow::bail!("本物のシークレットが空です: '{}'", s);
+        let host = host.to_ascii_lowercase();
+        if self
+            .mappings
+            .iter()
+            .any(|entry| entry.host == host && entry.dummy == dummy)
+        {
+            anyhow::bail!("duplicate secret-map scope and dummy value");
         }
-        self.sorted_mappings
-            .push((dummy.to_string(), real.to_string()));
-        // 長い順にソート（部分文字列の誤置換を防ぐ: "KEY_LONG" を "KEY" より先に置換）
-        // 同じ長さの場合は辞書順で決定的に並べる
-        self.sorted_mappings
-            .sort_by(|a, b| match b.0.len().cmp(&a.0.len()) {
-                std::cmp::Ordering::Equal => a.0.cmp(&b.0),
-                other => other,
-            });
+        self.mappings.push(Mapping {
+            host,
+            dummy: dummy.to_owned(),
+            real: real.to_owned(),
+        });
+        self.mappings.sort_by(|a, b| {
+            b.dummy
+                .len()
+                .cmp(&a.dummy.len())
+                .then_with(|| a.dummy.cmp(&b.dummy))
+        });
         Ok(())
     }
 
-    /// body 内の全ダミー値を本物に置換して返す。
-    /// 非 UTF-8 の body はそのまま返す（バイナリ body の破壊を防ぐ）。
-    pub fn substitute(&self, body: &[u8]) -> Vec<u8> {
-        if self.sorted_mappings.is_empty() {
-            return body.to_vec();
+    pub fn substitute_header(&self, host: &str, port: u16, header: &str, value: &str) -> String {
+        if port != 443 || !header.eq_ignore_ascii_case("Authorization") {
+            return value.to_owned();
         }
-        let Ok(mut s) = String::from_utf8(body.to_vec()) else {
-            return body.to_vec();
-        };
-        for (dummy, real) in &self.sorted_mappings {
-            s = s.replace(dummy.as_str(), real.as_str());
-        }
-        s.into_bytes()
-    }
-
-    /// 文字列内の全ダミー値を本物に置換して返す。
-    pub fn substitute_str(&self, s: &str) -> String {
-        if self.sorted_mappings.is_empty() {
-            return s.to_string();
-        }
-        let mut result = s.to_string();
-        for (dummy, real) in &self.sorted_mappings {
-            result = result.replace(dummy.as_str(), real.as_str());
+        // Scan the original once; inserted real values are never interpreted as dummy values.
+        let mut remaining = value;
+        let mut result = String::new();
+        while !remaining.is_empty() {
+            if let Some(entry) = self.mappings.iter().find(|entry| {
+                entry.host.eq_ignore_ascii_case(host) && remaining.starts_with(&entry.dummy)
+            }) {
+                result.push_str(&entry.real);
+                remaining = &remaining[entry.dummy.len()..];
+            } else {
+                let ch = remaining.chars().next().expect("nonempty");
+                result.push(ch);
+                remaining = &remaining[ch.len_utf8()..];
+            }
         }
         result
     }
 
-    /// マッピングが空かどうか。
-    pub fn is_empty(&self) -> bool {
-        self.sorted_mappings.is_empty()
+    pub fn safe_response<'a>(&self, response: &'a [u8]) -> &'a [u8] {
+        if self.mappings.iter().any(|entry| {
+            response
+                .windows(entry.real.len())
+                .any(|window| window == entry.real.as_bytes())
+        }) {
+            b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        } else {
+            response
+        }
     }
 
-    /// 登録されているダミー値のいずれかが含まれているかチェックする。
-    pub fn contains_dummy(&self, s: &str) -> bool {
-        self.sorted_mappings
-            .iter()
-            .any(|(dummy, _)| s.contains(dummy.as_str()))
+    pub fn is_empty(&self) -> bool {
+        self.mappings.is_empty()
     }
 }
 
@@ -89,70 +113,81 @@ impl SecretMap {
 mod tests {
     use super::*;
 
-    #[test]
-    fn add_and_substitute_body() {
+    fn mapping() -> SecretMap {
         let mut map = SecretMap::new();
-        map.add_from_str("DUMMY_TOKEN=real-api-key-abc123").unwrap();
+        map.add_from_str("api.example.com:Authorization:DUMMY=CANARY_REAL")
+            .unwrap();
+        map
+    }
 
-        let body = b"{\"token\":\"DUMMY_TOKEN\"}";
-        let result = map.substitute(body);
+    #[test]
+    fn mapping_is_limited_to_exact_host_authorization_and_default_tls_port() {
+        let map = mapping();
         assert_eq!(
-            String::from_utf8(result).unwrap(),
-            "{\"token\":\"real-api-key-abc123\"}"
+            map.substitute_header("API.EXAMPLE.COM", 443, "authorization", "Bearer DUMMY"),
+            "Bearer CANARY_REAL"
         );
+        for (host, port, header) in [
+            ("other.example.com", 443, "Authorization"),
+            ("api.example.com.attacker.test", 443, "Authorization"),
+            ("api.example.com", 8443, "Authorization"),
+            ("api.example.com", 443, "X-Fixture"),
+            ("api.example.com", 443, "Host"),
+        ] {
+            assert_eq!(
+                map.substitute_header(host, port, header, "Bearer DUMMY"),
+                "Bearer DUMMY"
+            );
+        }
     }
 
     #[test]
-    fn substitute_multiple() {
-        let mut map = SecretMap::new();
-        map.add_from_str("KEY1=secret1").unwrap();
-        map.add_from_str("KEY2=secret2").unwrap();
-
-        let body = b"a=KEY1&b=KEY2";
-        let result = map.substitute(body);
-        assert_eq!(String::from_utf8(result).unwrap(), "a=secret1&b=secret2");
+    fn reflected_secret_in_body_or_headers_is_not_returned() {
+        let map = mapping();
+        for response in [
+            b"HTTP/1.1 200 OK\r\n\r\nCANARY_REAL".as_slice(),
+            b"HTTP/1.1 200 OK\r\nX-Fixture: CANARY_REAL\r\n\r\n",
+        ] {
+            assert!(map.safe_response(response).starts_with(b"HTTP/1.1 502"));
+            assert!(
+                !map.safe_response(response)
+                    .windows(11)
+                    .any(|w| w == b"CANARY_REAL")
+            );
+        }
+        let harmless = b"HTTP/1.1 200 OK\r\n\r\nDUMMY";
+        assert_eq!(map.safe_response(harmless), harmless);
     }
 
     #[test]
-    fn substitute_str_works() {
-        let mut map = SecretMap::new();
-        map.add_from_str("DUMMY=real").unwrap();
-
-        assert_eq!(map.substitute_str("Bearer DUMMY"), "Bearer real");
+    fn invalid_and_unscoped_mappings_fail_without_echoing_values() {
+        for value in [
+            "DUMMY=SECRET_CANARY",
+            "api.example.com:Host:DUMMY=SECRET_CANARY",
+            "*.example.com:Authorization:DUMMY=SECRET_CANARY",
+            "api.example.com:Authorization:DUMMY=SECRET_CANARY\r\nInjected: value",
+            "api.example.com:Authorization:DUMMY=",
+        ] {
+            let error = SecretMap::new()
+                .add_from_str(value)
+                .unwrap_err()
+                .to_string();
+            assert!(!error.contains("SECRET_CANARY"));
+        }
     }
 
     #[test]
-    fn empty_map_passthrough() {
-        let map = SecretMap::new();
-        assert!(map.is_empty());
-
-        let body = b"no changes";
-        assert_eq!(map.substitute(body), b"no changes");
-    }
-
-    #[test]
-    fn no_match_passthrough() {
-        let mut map = SecretMap::new();
-        map.add_from_str("DUMMY=real").unwrap();
-
-        let body = b"no dummy here";
-        assert_eq!(map.substitute(body), b"no dummy here");
-    }
-
-    #[test]
-    fn add_from_str_invalid() {
-        let mut map = SecretMap::new();
-        assert!(map.add_from_str("no-equals").is_err());
-        assert!(map.add_from_str("=real").is_err());
-        assert!(map.add_from_str("dummy=").is_err());
-    }
-
-    #[test]
-    fn contains_dummy_check() {
-        let mut map = SecretMap::new();
-        map.add_from_str("TOKEN=real-value-xyz").unwrap();
-
-        assert!(map.contains_dummy("Authorization: Bearer TOKEN"));
-        assert!(!map.contains_dummy("no match here"));
+    fn replacement_does_not_cascade_between_mappings() {
+        let mut map = mapping();
+        map.add_from_str("api.example.com:Authorization:CANARY_REAL=SECOND_SECRET")
+            .unwrap();
+        assert_eq!(
+            map.substitute_header("api.example.com", 443, "Authorization", "DUMMY"),
+            "CANARY_REAL"
+        );
+        assert!(
+            map.add_from_str("api.example.com:Authorization:DUMMY=another")
+                .is_err()
+        );
     }
 }

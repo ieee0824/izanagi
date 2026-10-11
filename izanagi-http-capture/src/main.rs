@@ -25,11 +25,14 @@ use crate::secret_map::SecretMap;
 ///
 /// HTTPS 通信は TLS MITM で復号し、リクエスト内容をログに記録する。
 /// --secret-map でダミー値→本物のシークレットマッピングを指定すると、
-/// リクエスト body 内のダミー値を本物に置換して上流に転送する。
+/// 指定ホストの Authorization ヘッダーだけを置換して上流に転送する。
 /// --allowed-host で上流転送を許可するホストを指定する（未指定時は全て 403）。
 #[derive(Parser)]
 #[command(name = "izanagi-http-capture", version, about)]
 struct Cli {
+    /// Report successful binding to the parent process.
+    #[arg(long, hide = true)]
+    ready_stdout: bool,
     /// Metadata-only HTTP/1.1 forward mode for the opt-in guest behavior collector.
     #[arg(long, requires = "telemetry_socket")]
     behavior_forward: bool,
@@ -74,10 +77,14 @@ struct Cli {
     #[arg(long)]
     ca_cert_out: Option<PathBuf>,
 
-    /// シークレットマッピング（DUMMY=REAL 形式、複数指定可）。
-    /// リクエスト body 内のダミー値を本物に置換して上流に転送する。
-    #[arg(long = "secret-map", value_name = "DUMMY=REAL")]
+    /// シークレットマッピング（HOST:Authorization:DUMMY=REAL 形式、複数指定可）。
+    /// 指定ホストの Authorization ヘッダーだけを置換して上流に転送する。
+    #[arg(long = "secret-map", value_name = "HOST:Authorization:DUMMY=REAL")]
     secret_maps: Vec<String>,
+
+    /// One scoped mapping per line. Recommended instead of exposing secrets in process arguments.
+    #[arg(long)]
+    secret_map_file: Option<PathBuf>,
 
     /// 上流転送を許可するホスト（複数指定可）。未指定時は全て 403。
     #[arg(long = "allowed-host")]
@@ -147,6 +154,13 @@ fn load_secret_map(cli: &Cli) -> anyhow::Result<SecretMap> {
     for s in &cli.secret_maps {
         secret_map.add_from_str(s)?;
     }
+    if let Some(path) = &cli.secret_map_file {
+        let content = std::fs::read_to_string(path)
+            .map_err(|_| anyhow::anyhow!("failed to read secret-map file"))?;
+        for line in content.lines().filter(|line| !line.trim().is_empty()) {
+            secret_map.add_from_str(line)?;
+        }
+    }
     if !secret_map.is_empty() {
         eprintln!("シークレットマッピングを有効にしました");
     }
@@ -199,11 +213,18 @@ fn prepare_capture(cli: &Cli) -> anyhow::Result<CaptureRuntime> {
 
 async fn run_capture(cli: Cli) -> anyhow::Result<()> {
     let runtime = prepare_capture(&cli)?;
+    let http_listener = tokio::net::TcpListener::bind(cli.listen_http).await?;
+    let https_listener = tokio::net::TcpListener::bind(cli.listen_https).await?;
+    if cli.ready_stdout {
+        use std::io::Write;
+        println!("IZANAGI_PROXY_READY");
+        std::io::stdout().flush()?;
+    }
     // シャットダウンチャネル
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
 
-    let http_handle = spawn_http_listener(&cli, &runtime, shutdown_rx.clone());
-    let https_handle = spawn_https_listener(&cli, &runtime, shutdown_rx);
+    let http_handle = spawn_http_listener(&cli, &runtime, http_listener, shutdown_rx.clone());
+    let https_handle = spawn_https_listener(&cli, &runtime, https_listener, shutdown_rx);
 
     // Ctrl+C / SIGTERM でシャットダウン
     let signal_handle = spawn_shutdown_signal(shutdown_tx);
@@ -222,16 +243,16 @@ type ListenerHandle = tokio::task::JoinHandle<anyhow::Result<()>>;
 fn spawn_http_listener(
     cli: &Cli,
     runtime: &CaptureRuntime,
+    listener: tokio::net::TcpListener,
     mut shutdown_http: tokio::sync::watch::Receiver<()>,
 ) -> ListenerHandle {
     let logger = runtime.logger.clone();
     let semaphore = runtime.semaphore.clone();
-    let listen = cli.listen_http;
     let max_body = cli.max_body_bytes;
     let timeout = runtime.timeout;
     tokio::spawn(async move {
         http_capture::run(
-            listen,
+            listener,
             max_body,
             timeout,
             logger,
@@ -245,6 +266,7 @@ fn spawn_http_listener(
 fn spawn_https_listener(
     cli: &Cli,
     runtime: &CaptureRuntime,
+    listener: tokio::net::TcpListener,
     mut shutdown_https: tokio::sync::watch::Receiver<()>,
 ) -> ListenerHandle {
     let logger = runtime.logger.clone();
@@ -252,12 +274,11 @@ fn spawn_https_listener(
     let cert_cache = runtime.cert_cache.clone();
     let secret_map = runtime.secret_map.clone();
     let allowed_hosts = runtime.allowed_hosts.clone();
-    let listen = cli.listen_https;
     let max_body = cli.max_body_bytes;
     let timeout = runtime.timeout;
     tokio::spawn(async move {
-        tls_mitm::run(
-            listen,
+        tls_mitm::run_bound(
+            listener,
             max_body,
             timeout,
             logger,

@@ -11,18 +11,14 @@ use crate::logger::{CaptureLogger, HttpCapture};
 
 /// HTTP キャプチャリスナーを起動する。
 pub async fn run(
-    listen_addr: SocketAddr,
+    listener: TcpListener,
     max_body_bytes: usize,
     timeout: Duration,
     logger: Arc<CaptureLogger>,
     semaphore: Arc<Semaphore>,
     shutdown: &mut tokio::sync::watch::Receiver<()>,
 ) -> anyhow::Result<()> {
-    let listener = TcpListener::bind(listen_addr)
-        .await
-        .with_context(|| format!("{} への HTTP バインドに失敗", listen_addr))?;
-
-    eprintln!("HTTP キャプチャを起動しました: {}", listen_addr);
+    eprintln!("HTTP キャプチャを起動しました: {}", listener.local_addr()?);
 
     loop {
         tokio::select! {
