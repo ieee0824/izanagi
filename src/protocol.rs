@@ -40,6 +40,7 @@ pub enum MessageType {
     TraceStarted = 12,
     Telemetry = 13,
     StartBehavior = 14,
+    DnsStatus = 15,
 }
 
 impl TryFrom<u8> for MessageType {
@@ -62,6 +63,7 @@ impl TryFrom<u8> for MessageType {
             12 => Ok(Self::TraceStarted),
             13 => Ok(Self::Telemetry),
             14 => Ok(Self::StartBehavior),
+            15 => Ok(Self::DnsStatus),
             _ => anyhow::bail!("unknown message type: {}", value),
         }
     }
@@ -133,6 +135,11 @@ pub enum Message {
         filter: crate::tracer::TraceFilter,
         config: BehaviorStartConfig,
     },
+    /// Read-only request (None) / guest DNS relay status (configured endpoint).
+    /// Appended to preserve existing v3 postcard discriminants.
+    DnsStatus {
+        endpoint: Option<String>,
+    },
 }
 
 impl Message {
@@ -154,6 +161,7 @@ impl Message {
             Self::TraceStarted => MessageType::TraceStarted,
             Self::Telemetry(_) => MessageType::Telemetry,
             Self::StartBehavior { .. } => MessageType::StartBehavior,
+            Self::DnsStatus { .. } => MessageType::DnsStatus,
         }
     }
 }

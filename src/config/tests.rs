@@ -574,45 +574,48 @@ listen = "127.0.0.1:15353"
 }
 
 #[test]
-fn dns_proxy_ip_extraction() {
+fn dns_proxy_endpoint_extraction() {
     let mut config = Config::default();
     // dns_proxy が None → None
-    assert_eq!(config.dns_proxy_ip(), None);
+    assert_eq!(config.dns_proxy_endpoint(), None);
 
     // enabled = false → None
     config.dns_proxy = Some(DnsProxySection {
         enabled: false,
         listen: "127.0.0.1:53".to_string(),
     });
-    assert_eq!(config.dns_proxy_ip(), None);
+    assert_eq!(config.dns_proxy_endpoint(), None);
 
-    // enabled = true, IPv4:port → IP 部分を抽出
+    // enabled = true, IPv4:port → ポートを保持
     config.dns_proxy = Some(DnsProxySection {
         enabled: true,
         listen: "127.0.0.1:15353".to_string(),
     });
-    assert_eq!(config.dns_proxy_ip(), Some("127.0.0.1".to_string()));
+    assert_eq!(
+        config.dns_proxy_endpoint(),
+        Some("127.0.0.1:15353".to_string())
+    );
 
-    // IPv6:port → ブラケットなしの IP を抽出
+    // IPv6:port → エンドポイントを保持
     config.dns_proxy = Some(DnsProxySection {
         enabled: true,
         listen: "[::1]:53".to_string(),
     });
-    assert_eq!(config.dns_proxy_ip(), Some("::1".to_string()));
+    assert_eq!(config.dns_proxy_endpoint(), Some("[::1]:53".to_string()));
 
-    // IP アドレス単体（ポートなし）→ そのまま返す
+    // IP アドレス単体（ポートなし）→ 拒否
     config.dns_proxy = Some(DnsProxySection {
         enabled: true,
         listen: "10.0.2.2".to_string(),
     });
-    assert_eq!(config.dns_proxy_ip(), Some("10.0.2.2".to_string()));
+    assert_eq!(config.dns_proxy_endpoint(), None);
 
     // 不正な値 → None
     config.dns_proxy = Some(DnsProxySection {
         enabled: true,
         listen: "not-an-address".to_string(),
     });
-    assert_eq!(config.dns_proxy_ip(), None);
+    assert_eq!(config.dns_proxy_endpoint(), None);
 }
 
 #[test]
@@ -632,7 +635,7 @@ allowed_hosts = []
 "#;
     let config = Config::from_toml(toml).unwrap();
     assert!(config.dns_proxy.is_none());
-    assert_eq!(config.dns_proxy_ip(), None);
+    assert_eq!(config.dns_proxy_endpoint(), None);
 }
 
 // --- #206: Apple Container ネットワーク制限テスト ---
@@ -815,12 +818,12 @@ fn to_sandbox_config_apple_container_network_none_rejects() {
 #[test]
 fn to_sandbox_config_apple_container_with_dns_proxy() {
     let toml = apple_container_toml(
-        "[sandbox.apple_container]\nimage = \"izanagi-vm\"\n[dns_proxy]\nenabled = true\nlisten = \"127.0.0.1:15353\"",
+        "[sandbox.apple_container]\nimage = \"izanagi-vm\"\n[dns_proxy]\nenabled = true\nlisten = \"192.168.1.2:15353\"",
     );
     let config = Config::from_toml(&toml).unwrap();
     let (_, _, dns_proxy, _) =
         unwrap_apple_container(config.to_sandbox_config_for_platform(false).unwrap());
-    assert_eq!(dns_proxy, Some("127.0.0.1".to_string()));
+    assert_eq!(dns_proxy, Some("192.168.1.2:15353".to_string()));
 }
 
 #[test]
@@ -973,4 +976,42 @@ fn restricted_qemu_rejects_network_proxies_until_explicit_opt_out() {
             .iter()
             .any(|w| w.contains("loopback"))
     );
+}
+
+#[test]
+fn dns_proxy_rejects_unreachable_or_ambiguous_endpoints() {
+    let mut config = Config::default();
+    config.sandbox.backend = SandboxBackend::Qemu;
+    config.sandbox.qemu = Some(QemuSection {
+        restrict_network: false,
+        ..Default::default()
+    });
+    for listen in [
+        "0.0.0.0:15353",
+        "[::]:53",
+        "127.0.0.1:0",
+        "127.0.0.1",
+        "[::1]:15353",
+        "224.0.0.1:53",
+    ] {
+        config.dns_proxy = Some(DnsProxySection {
+            enabled: true,
+            listen: listen.into(),
+        });
+        assert!(
+            config.validate_for_platform(false, true).is_err(),
+            "{listen}"
+        );
+    }
+    config.dns_proxy = Some(DnsProxySection {
+        enabled: true,
+        listen: "127.0.0.1:15353".into(),
+    });
+    assert!(config.validate_for_platform(false, true).is_ok());
+    config.sandbox.backend = SandboxBackend::AppleContainer;
+    assert!(config.validate_for_platform(false, true).is_err());
+    config.dns_proxy.as_mut().unwrap().listen = "192.168.1.2:15353".into();
+    assert!(config.validate_for_platform(false, true).is_ok());
+    config.sandbox.backend = SandboxBackend::Native;
+    assert!(config.validate_for_platform(true, false).is_err());
 }

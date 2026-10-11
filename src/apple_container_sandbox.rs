@@ -163,7 +163,12 @@ pub fn build_run_args(
 
     // DNS プロキシ
     if let Some(dns_ip) = dns_proxy {
-        args.extend_from_slice(&["--dns".to_string(), dns_ip.to_string()]);
+        args.extend([
+            "--dns".into(),
+            "127.0.0.1".into(),
+            "-e".into(),
+            format!("IZANAGI_DNS_PROXY={dns_ip}"),
+        ]);
     }
 
     // ネットワークモード
@@ -436,6 +441,21 @@ impl AppleContainerSandbox {
         })
     }
 
+    async fn verify_dns_relay(&self, endpoint: &str) -> anyhow::Result<()> {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let stream = tokio::net::TcpStream::connect(("127.0.0.1", self.host_port)).await?;
+            let (reader, writer) = stream.into_split();
+            let mut client = crate::protocol_client::ProtocolClient::new(
+                reader,
+                writer,
+                crate::protocol::load_shared_secret_from_env()?,
+            );
+            client.handshake_and_wait_ready(None).await?;
+            crate::guest_dns::verify_client(&mut client, endpoint.parse()?).await
+        })
+        .await?
+    }
+
     /// Agent の Ready を待つ。TCP 接続でヘルスチェックを行う。
     async fn wait_for_ready(&self) -> anyhow::Result<()> {
         let timeout = tokio::time::Duration::from_secs(START_TIMEOUT_SECS);
@@ -502,6 +522,13 @@ impl Sandbox for AppleContainerSandbox {
         // Agent の Ready を待つ
         match self.wait_for_ready().await {
             Ok(()) => {
+                if let Some(endpoint) = &boot.dns_proxy
+                    && let Err(error) = self.verify_dns_relay(endpoint).await
+                {
+                    let _ = self.stop_container().await;
+                    self.status = SandboxStatus::Stopped;
+                    return Err(error);
+                }
                 // フォールバック防御: ALLOW_NO_TOKEN で起動しているため、
                 // build_run_args() で 127.0.0.1 バインドが設定されていることが前提。
                 // Config::validate() と build_run_args() の二重チェックにより、
@@ -888,7 +915,7 @@ mod tests {
             9001,
             &share,
             None,
-            Some("127.0.0.1"),
+            Some("192.168.1.2:15353"),
             None,
         );
 

@@ -198,11 +198,19 @@ fn push_qemu_network(
 ) {
     // ネットワーク (TCP ポートフォワーディング + DNS プロキシ)
     let restriction = if restrict_network { "on" } else { "off" };
-    let mut netdev = format!(
+    let netdev = format!(
         "user,id=net0,restrict={restriction},hostfwd=tcp:127.0.0.1:{host_port}-:{AGENT_PORT}"
     );
     if let Some(dns_ip) = dns_proxy {
-        netdev.push_str(&format!(",dns={}", dns_ip));
+        let endpoint = dns_ip
+            .parse()
+            .map(crate::guest_dns::qemu_endpoint)
+            .map(|addr| addr.to_string())
+            .unwrap_or_else(|_| dns_ip.to_string());
+        args.extend([
+            "-fw_cfg".into(),
+            format!("name=opt/izanagi.dns,string={endpoint}"),
+        ]);
     }
     args.extend_from_slice(&["-netdev".to_string(), netdev]);
     args.extend_from_slice(&[
@@ -400,6 +408,13 @@ impl QemuSandbox {
             }
         };
 
+        if let Some(endpoint) = &dns_proxy
+            && let Err(error) = endpoint.parse::<std::net::SocketAddr>()
+        {
+            self.status = SandboxStatus::Stopped;
+            return Err(error.into());
+        }
+
         // #35: イメージの存在確認
         let image_path = match check_image_exists(&image) {
             Ok(p) => p,
@@ -539,7 +554,18 @@ impl QemuSandbox {
 
             // Agent からの Ready 通知を待ち、接続を保持する
             match self.wait_for_agent_ready().await {
-                Ok(conn) => {
+                Ok(mut conn) => {
+                    if let Some(endpoint) = &boot.dns_proxy
+                        && let Err(error) = crate::guest_dns::verify_client(
+                            &mut conn.client,
+                            crate::guest_dns::qemu_endpoint(endpoint.parse()?),
+                        )
+                        .await
+                    {
+                        self.rollback_attempt(&error, PORT_RETRY_MAX).await;
+                        last_error = Some(error);
+                        break;
+                    }
                     self.commit_ready_connection(conn, &secret_file_path);
                     return Ok(());
                 }
@@ -1273,13 +1299,23 @@ mod tests {
             mount_point: PathBuf::from("/workspace"),
             read_only: false,
         };
-        let args = build_args(&image, 1, 512, &share, 9001, None, None, Some("10.0.2.2"));
+        let args = build_args(
+            &image,
+            1,
+            512,
+            &share,
+            9001,
+            None,
+            None,
+            Some("127.0.0.1:15353"),
+        );
 
         let netdev_arg = args
             .iter()
             .find(|a| a.starts_with("user,id=net0"))
             .expect("netdev arg should exist");
-        assert!(netdev_arg.contains("dns=10.0.2.2"));
+        assert!(!netdev_arg.contains("dns="));
+        assert!(args.contains(&"name=opt/izanagi.dns,string=10.0.2.2:15353".into()));
         assert!(netdev_arg.contains("hostfwd=tcp:127.0.0.1:9001-:9001"));
     }
 

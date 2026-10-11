@@ -25,6 +25,7 @@ mod admission;
 mod config;
 mod connection;
 mod crypto;
+mod dns;
 mod exec;
 mod security;
 mod shell;
@@ -53,12 +54,18 @@ async fn main() -> anyhow::Result<()> {
     // QEMU 環境では 0.0.0.0 バインドが必要。
     // IZANAGI_BIND_ADDR で上書き可能。デフォルトは 0.0.0.0（VM/コンテナ内なので安全）。
     let bind_addr = std::env::var("IZANAGI_BIND_ADDR").unwrap_or_else(|_| "0.0.0.0".to_string());
+    let mut dns = dns::start().await?;
     let listener = tokio::net::TcpListener::bind(format!("{}:{}", bind_addr, DEFAULT_PORT)).await?;
     eprintln!("izanagi-agent listening on {}:{}", bind_addr, DEFAULT_PORT);
 
     let slots = Arc::new(tokio::sync::Semaphore::new(admission::MAX_CONNECTIONS));
     loop {
-        let (stream, addr) = listener.accept().await?;
+        let (stream, addr) = tokio::select! {
+            result = listener.accept() => result?,
+            result = async { dns.as_mut().unwrap().await }, if dns.is_some() => {
+                anyhow::bail!("guest DNS relay stopped: {result:?}");
+            }
+        };
         eprintln!("accepted connection from {:?}", addr);
 
         admission::spawn_connection(stream, secret.clone(), Arc::clone(&expected_token), &slots);
