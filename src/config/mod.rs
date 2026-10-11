@@ -260,7 +260,11 @@ impl Config {
     /// 設定ファイルを読み込む。ファイルが存在しない場合はデフォルト値を返す。
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         match std::fs::read_to_string(path) {
-            Ok(content) => Self::from_toml(&content),
+            Ok(content) => {
+                let config = Self::from_toml(&content)?;
+                config.validate_config_location(path)?;
+                Ok(config)
+            }
             Err(e) if e.kind() == ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(anyhow::Error::new(e).context(format!("failed to read {:?}", path))),
         }
@@ -403,6 +407,35 @@ impl Config {
         }
 
         Ok(warnings)
+    }
+
+    /// Reject settings that can be replaced through a shared directory, including symlinks.
+    pub fn validate_config_location(&self, config_path: &Path) -> anyhow::Result<()> {
+        let configured_path = absolute_path(config_path)?;
+        let containing_dir = configured_path
+            .parent()
+            .context("configuration path has no parent")?
+            .canonicalize()?;
+        let configured_path = containing_dir.join(
+            configured_path
+                .file_name()
+                .context("configuration path has no file name")?,
+        );
+        let resolved_path = std::fs::canonicalize(config_path)?;
+        for share in &self.share.paths {
+            validate_share_path_shape(share)?;
+            let normalized = normalize_share_path(share)?;
+            let resolved = resolve_share_path(share, &normalized)?;
+            let resolved_share = absolute_path(Path::new(&resolved))?;
+            if configured_path.starts_with(&resolved_share)
+                || resolved_path.starts_with(&resolved_share)
+            {
+                bail!(
+                    "設定ファイルは share.paths の配下に保存できません。`izanagi config path` が示す共有領域外の場所へ移し、内容を確認するか、`izanagi init` で再作成してください"
+                );
+            }
+        }
+        Ok(())
     }
 
     // --- Config → 内部型への変換 ---
@@ -669,25 +702,17 @@ pub fn settings_path_for_dir(dir: &Path) -> anyhow::Result<PathBuf> {
 }
 
 /// 設定ファイルを自動解決する。
-///
-/// 1. `~/.izanagi/settings/{hash}/izanagi.toml` が存在すればそれを返す
-/// 2. `./izanagi.toml` が存在する場合は警告付きで使用（非推奨）
-/// 3. どちらもなければ settings パスを返す
+/// プロジェクト内の設定にはフォールバックせず、settings パスを返す。
 pub fn resolve_config_path() -> anyhow::Result<PathBuf> {
-    let settings = settings_path_for_pwd()?;
-    if settings.exists() {
-        return Ok(settings);
-    }
-    let local = std::env::current_dir()?.join("izanagi.toml");
-    if local.exists() {
-        eprintln!(
-            "警告: ./izanagi.toml を使用しています。セキュリティ上の理由から `izanagi init` で \
-             ~/.izanagi/settings/ 以下に移行することを推奨します。"
-        );
-        return Ok(local);
-    }
-    // どちらもない場合は settings パスを返す
-    Ok(settings)
+    settings_path_for_pwd()
+}
+
+fn absolute_path(path: &Path) -> anyhow::Result<PathBuf> {
+    Ok(if path.is_absolute() {
+        path.to_owned()
+    } else {
+        std::env::current_dir()?.join(path)
+    })
 }
 
 fn missing_share_path_warning(path: &str) -> Option<String> {
