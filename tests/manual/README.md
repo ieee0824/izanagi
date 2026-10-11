@@ -72,3 +72,19 @@ reaches the host with the explicitly writable mode. Fixtures deliberately allow
 writes by Unix permissions so the positive control can distinguish access-mode
 protection. Linux CI runs tests/workspace_share.rs against real Landlock with
 `IZANAGI_REQUIRE_LANDLOCK_TEST=1`; lack of ABI v3 fails instead of silently skipping.
+
+
+### QEMU network boundary (#64)
+
+On macOS/aarch64, with the legacy image and tools required by `image_security.py`:
+
+```sh
+python3 tests/manual/qemu_network.py ~/.izanagi/images/alpine-aarch64.qcow2
+```
+
+Uses a disposable overlay without host shares or credentials, checks the forwarded
+listener on 127.0.0.1 and rejection through the host LAN address, then probes a host
+loopback TCP listener via 10.0.2.2 and external 1.1.1.1:443. Both fail with
+`restrict=on` and succeed with `restrict=off` as a positive control. The external
+positive control requires working Internet access; it fails rather than skips if
+that access is unavailable. No application payload is sent to the external endpoint.

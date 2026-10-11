@@ -75,6 +75,9 @@ pub struct QemuSection {
     pub cpus: u32,
     pub memory: String,
     pub image: String,
+    /// Block guest access to the host and external network unless explicitly disabled.
+    #[serde(default = "default_restrict_network")]
+    pub restrict_network: bool,
 }
 
 /// コンテナのネットワークモード。
@@ -194,12 +197,17 @@ impl Default for SandboxSection {
     }
 }
 
+fn default_restrict_network() -> bool {
+    true
+}
+
 impl Default for QemuSection {
     fn default() -> Self {
         Self {
             cpus: 2,
             memory: "4G".to_string(),
             image: "default".to_string(),
+            restrict_network: true,
         }
     }
 }
@@ -313,8 +321,18 @@ impl Config {
         }
 
         self.validate_container_network()?;
+        self.validate_qemu_network()?;
 
         let mut warnings = Vec::new();
+        if self.sandbox.backend == SandboxBackend::Qemu
+            && self
+                .sandbox
+                .qemu
+                .as_ref()
+                .is_some_and(|q| !q.restrict_network)
+        {
+            warnings.push("QEMU network restrictions disabled: guests can reach host loopback services and external IPs; DNS filtering is not an IP firewall".into());
+        }
 
         // share.paths のバリデーション
         warnings.extend(self.validate_share_paths()?);
@@ -348,6 +366,23 @@ impl Config {
             bail!("sandbox.qemu.cpus は 1 以上でなければなりません");
         }
 
+        Ok(())
+    }
+
+    fn validate_qemu_network(&self) -> anyhow::Result<()> {
+        if self.sandbox.backend == SandboxBackend::Qemu
+            && self
+                .sandbox
+                .qemu
+                .as_ref()
+                .is_some_and(|q| q.restrict_network)
+            && (self.dns_proxy.as_ref().is_some_and(|p| p.enabled)
+                || self.http_capture.as_ref().is_some_and(|p| p.enabled))
+        {
+            bail!(
+                "QEMU restrict_network=true blocks proxy access; explicitly set sandbox.qemu.restrict_network=false to enable network proxies (including host loopback access)"
+            );
+        }
         Ok(())
     }
 
@@ -482,6 +517,7 @@ impl Config {
                     image: qemu.image.clone(),
                     share,
                     dns_proxy: dns_proxy_ip.clone(),
+                    restrict_network: qemu.restrict_network,
                 })
             }
             SandboxBackend::Native => {

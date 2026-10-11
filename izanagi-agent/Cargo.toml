@@ -32,6 +32,7 @@ libc = "0.2"
 izanagi = { path = ".." }
 
 [dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
 
 [[bin]]
 name = "izanagi-agent"

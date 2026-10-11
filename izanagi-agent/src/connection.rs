@@ -8,6 +8,8 @@ use crate::exec::{EXEC_USER, execute_command};
 use crate::security::sanitize_anyhow_error;
 use crate::shell::{ShellChild, relay_shell};
 
+const HELLO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 // Rotate data-source priority while leaving control messages first in the outer select.
 async fn next_forwarded<L, T>(
     legacy: &mut tokio::sync::mpsc::Receiver<L>,
@@ -73,9 +75,12 @@ where
         send_seq: 0,
         recv_seq: 0,
     };
-    session
-        .handshake(expected_token.as_ref().as_deref())
-        .await?;
+    tokio::time::timeout(
+        HELLO_TIMEOUT,
+        session.handshake(expected_token.as_ref().as_deref()),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("Hello handshake timed out"))??;
     while let Some(message) = session.recv().await? {
         if !session.dispatch(message).await? {
             break;

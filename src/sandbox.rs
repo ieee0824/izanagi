@@ -22,6 +22,8 @@ pub enum SandboxStatus {
 #[derive(Debug, Clone)]
 pub enum SandboxConfig {
     Qemu {
+        /// Isolate guest networking; only the loopback agent forward remains available.
+        restrict_network: bool,
         cpus: u32,
         memory_mb: u32,
         image: String,

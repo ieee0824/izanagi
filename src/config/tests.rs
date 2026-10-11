@@ -259,6 +259,7 @@ fn to_sandbox_config_qemu() {
         cpus: 4,
         memory: "8G".to_string(),
         image: "ubuntu".to_string(),
+        restrict_network: true,
     });
     config.share.paths = vec!["/home/user/project".to_string()];
     config.share.mount_point = "/mnt".to_string();
@@ -923,5 +924,53 @@ fn writable_share_emits_host_execution_warning() {
             .unwrap()
             .iter()
             .any(|w| w.contains("Writable shares"))
+    );
+}
+
+#[test]
+fn qemu_network_restriction_defaults_and_explicit_opt_out_reach_backend() {
+    for (setting, expected) in [("", true), ("restrict_network = false", false)] {
+        let mut config = Config::default();
+        config.sandbox.backend = SandboxBackend::Qemu;
+        config.sandbox.qemu = Some(
+            toml::from_str(&format!(
+                "cpus = 2\nmemory = \"4G\"\nimage = \"default\"\n{setting}"
+            ))
+            .unwrap(),
+        );
+        match config.to_sandbox_config().unwrap() {
+            crate::sandbox::SandboxConfig::Qemu {
+                restrict_network, ..
+            } => {
+                assert_eq!(restrict_network, expected);
+            }
+            _ => panic!("expected QEMU"),
+        }
+    }
+}
+
+#[test]
+fn restricted_qemu_rejects_network_proxies_until_explicit_opt_out() {
+    let mut config = Config::default();
+    config.sandbox.backend = SandboxBackend::Qemu;
+    config.sandbox.qemu = Some(QemuSection::default());
+    config.dns_proxy = Some(DnsProxySection {
+        enabled: true,
+        listen: default_dns_proxy_listen(),
+    });
+    assert!(
+        config
+            .validate_for_platform(false, true)
+            .unwrap_err()
+            .to_string()
+            .contains("restrict_network")
+    );
+    config.sandbox.qemu.as_mut().unwrap().restrict_network = false;
+    assert!(
+        config
+            .validate_for_platform(false, true)
+            .unwrap()
+            .iter()
+            .any(|w| w.contains("loopback"))
     );
 }
