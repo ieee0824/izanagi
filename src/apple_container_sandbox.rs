@@ -227,7 +227,12 @@ fn push_container_share(args: &mut Vec<String>, share: &ShareConfig) {
         };
         args.extend_from_slice(&[
             "--volume".to_string(),
-            format!("{}:{}", abs_path.display(), share.mount_point.display()),
+            format!(
+                "{}:{}{}",
+                abs_path.display(),
+                share.mount_point.display(),
+                if share.read_only { ":ro" } else { "" }
+            ),
         ]);
     }
 }
@@ -731,6 +736,7 @@ mod tests {
         let share = ShareConfig {
             host_paths: vec![],
             mount_point: PathBuf::from("/workspace"),
+            read_only: false,
         };
         let args = build_run_args("izanagi-test", "izanagi-vm", 9001, &share, None, None, None);
 
@@ -756,6 +762,7 @@ mod tests {
         let share = ShareConfig {
             host_paths: vec![],
             mount_point: PathBuf::from("/workspace"),
+            read_only: false,
         };
         let args = build_run_args(
             "izanagi-test",
@@ -819,6 +826,7 @@ mod tests {
         let share = ShareConfig {
             host_paths: vec![PathBuf::from("/home/user/project")],
             mount_point: PathBuf::from("/workspace"),
+            read_only: false,
         };
         let args = build_run_args("izanagi-test", "izanagi-vm", 8080, &share, None, None, None);
 
@@ -834,6 +842,7 @@ mod tests {
                 PathBuf::from("/home/user/config"),
             ],
             mount_point: PathBuf::from("/workspace"),
+            read_only: false,
         };
         let args = build_run_args("izanagi-test", "izanagi-vm", 8080, &share, None, None, None);
 
@@ -849,6 +858,7 @@ mod tests {
         let share = ShareConfig {
             host_paths: vec![],
             mount_point: PathBuf::from("/workspace"),
+            read_only: false,
         };
         let args = build_run_args(
             "izanagi-test",
@@ -870,6 +880,7 @@ mod tests {
         let share = ShareConfig {
             host_paths: vec![],
             mount_point: PathBuf::from("/workspace"),
+            read_only: false,
         };
         let args = build_run_args(
             "izanagi-test",
@@ -894,6 +905,7 @@ mod tests {
         let share = ShareConfig {
             host_paths: vec![],
             mount_point: PathBuf::from("/workspace"),
+            read_only: false,
         };
         let args = build_run_args("izanagi-test", "izanagi-vm", 9001, &share, None, None, None);
 
@@ -907,6 +919,7 @@ mod tests {
         let share = ShareConfig {
             host_paths: vec![],
             mount_point: PathBuf::from("/workspace"),
+            read_only: false,
         };
         use crate::config::ContainerNetworkMode;
         let args = build_run_args(
@@ -932,6 +945,7 @@ mod tests {
         let share = ShareConfig {
             host_paths: vec![],
             mount_point: PathBuf::from("/workspace"),
+            read_only: false,
         };
         let args = build_run_args("izanagi-test", "izanagi-vm", 9001, &share, None, None, None);
 
@@ -1013,6 +1027,7 @@ mod tests {
         let share = ShareConfig {
             host_paths: vec![],
             mount_point: PathBuf::from("/workspace"),
+            read_only: false,
         };
         let config = SandboxConfig::Landlock { share };
 
@@ -1063,5 +1078,22 @@ mod tests {
             "pid part: {}",
             parts[1]
         );
+    }
+}
+
+#[cfg(test)]
+mod share_security_tests {
+    #[test]
+    fn volume_enforces_both_share_modes() {
+        for (read_only, option) in [(true, ":ro"), (false, "")] {
+            let share = crate::sandbox::ShareConfig {
+                host_paths: vec!["/project".into()],
+                mount_point: "/workspace".into(),
+                read_only,
+            };
+            let mut args = Vec::new();
+            super::push_container_share(&mut args, &share);
+            assert_eq!(args, ["--volume", &format!("/project:/workspace{option}")]);
+        }
     }
 }

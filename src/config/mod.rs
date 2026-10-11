@@ -8,7 +8,7 @@ use crate::detector::Rule;
 use crate::event::SyscallCategory;
 use crate::rules::{
     EnvAccessRule, NetworkAllowlistRule, ProcessBaselineRule, SuspiciousPathRule,
-    UnexpectedExecRule,
+    UnexpectedExecRule, WorkspaceWriteRule,
 };
 use crate::sandbox::{SandboxConfig, ShareConfig};
 use crate::tracer::TraceFilter;
@@ -163,6 +163,9 @@ fn default_https_listen() -> std::net::SocketAddr {
 pub struct ShareSection {
     pub paths: Vec<String>,
     pub mount_point: String,
+    /// Protect the entire share, including Git metadata, by default.
+    #[serde(default = "default_read_only_share")]
+    pub read_only: bool,
 }
 
 /// `[monitor]` セクション。監視対象の syscall カテゴリ。
@@ -209,11 +212,16 @@ impl Default for QemuSection {
     }
 }
 
+fn default_read_only_share() -> bool {
+    true
+}
+
 impl Default for ShareSection {
     fn default() -> Self {
         Self {
             paths: vec![".".to_string()],
             mount_point: "/workspace".to_string(),
+            read_only: true,
         }
     }
 }
@@ -328,6 +336,9 @@ impl Config {
 
         // share.paths のバリデーション
         warnings.extend(self.validate_share_paths()?);
+        if !self.share.read_only {
+            warnings.push("Writable shares allow sandbox code to change host files, including Git hooks/config and build/editor scripts; review changes before host execution".into());
+        }
 
         Ok(warnings)
     }
@@ -486,6 +497,7 @@ impl Config {
         let share = ShareConfig {
             host_paths: self.share.paths.iter().map(PathBuf::from).collect(),
             mount_point: PathBuf::from(&self.share.mount_point),
+            read_only: self.share.read_only,
         };
 
         // DNS プロキシが有効な場合、listen アドレスから IP 部分を抽出する
@@ -610,6 +622,10 @@ impl Config {
         // UnexpectedExecRule と EnvAccessRule は常に有効
         rules.push(Box::new(UnexpectedExecRule::new()));
         rules.push(Box::new(EnvAccessRule::new()));
+        rules.push(Box::new(WorkspaceWriteRule::new(
+            &self.share.paths,
+            &self.share.mount_point,
+        )));
 
         // ProcessBaselineRule: 設定があればそれを使い、なければデフォルトベースライン
         match &self.detect.known_processes {
@@ -649,6 +665,10 @@ impl Config {
 
         rules.push(Box::new(UnexpectedExecRule::new()));
         rules.push(Box::new(EnvAccessRule::new()));
+        rules.push(Box::new(WorkspaceWriteRule::new(
+            &self.share.paths,
+            &self.share.mount_point,
+        )));
 
         // ProcessBaselineRule: 設定があればそれを使い、なければデフォルトベースライン
         match &self.detect.known_processes {

@@ -3,12 +3,14 @@ mod network_allowlist;
 mod process_baseline;
 mod suspicious_path;
 mod unexpected_exec;
+mod workspace_write;
 
 pub use env_access::EnvAccessRule;
 pub use network_allowlist::NetworkAllowlistRule;
 pub use process_baseline::ProcessBaselineRule;
 pub use suspicious_path::SuspiciousPathRule;
 pub use unexpected_exec::UnexpectedExecRule;
+pub use workspace_write::WorkspaceWriteRule;
 
 use std::path::{Component, PathBuf};
 

@@ -56,30 +56,27 @@ mod inner {
         share: &ShareConfig,
         abi: ABI,
     ) -> anyhow::Result<landlock::RulesetCreated> {
+        validate_read_only_abi(share, abi)?;
         let mut ruleset = Ruleset::default()
             .handle_access(AccessFs::from_all(abi))?
             .create()?;
 
-        // host_paths は読み書き可能
+        // Read-only shares deny write, truncation, creation and removal.
         for path in &share.host_paths {
             let fd = PathFd::new(path)?;
-            ruleset = ruleset.add_rule(PathBeneath::new(fd, AccessFs::from_all(abi)))?;
+            let access = if share.read_only {
+                AccessFs::ReadFile | AccessFs::ReadDir | AccessFs::Execute
+            } else {
+                AccessFs::from_all(abi)
+            };
+            ruleset = ruleset.add_rule(PathBeneath::new(fd, access))?;
         }
 
         // NOTE: share.mount_point はゲスト側パス（例: "/workspace"）であり、
         // Landlock はホスト側カーネルで適用されるためルールに含めない。
         // ホスト側のパスは host_paths で指定される。
 
-        // /tmp は読み書きのみに制限（シンボリックリンク作成や Refer 等は除外）
-        {
-            let tmp_access = AccessFs::ReadFile
-                | AccessFs::WriteFile
-                | AccessFs::ReadDir
-                | AccessFs::RemoveFile
-                | AccessFs::MakeReg;
-            let fd = PathFd::new("/tmp")?;
-            ruleset = ruleset.add_rule(PathBeneath::new(fd, tmp_access))?;
-        }
+        ruleset = allow_temporary_directory(ruleset, share)?;
 
         ruleset = allow_runtime_directories(ruleset)?;
 
@@ -90,6 +87,37 @@ mod inner {
         // /sys: デフォルト deny のまま。明示的な許可は行わない。
         // /proc, /sys 全体はルールに含まれないため Landlock の deny-by-default で制限される。
 
+        Ok(ruleset)
+    }
+
+    fn validate_read_only_abi(share: &ShareConfig, abi: ABI) -> anyhow::Result<()> {
+        if share.read_only && matches!(abi, ABI::V1 | ABI::V2) {
+            anyhow::bail!("read-only shares require Landlock ABI v3 to deny file truncation");
+        }
+        Ok(())
+    }
+
+    fn allow_temporary_directory(
+        mut ruleset: landlock::RulesetCreated,
+        share: &ShareConfig,
+    ) -> anyhow::Result<landlock::RulesetCreated> {
+        let temporary = std::path::Path::new("/tmp").canonicalize()?;
+        if share.read_only {
+            for path in &share.host_paths {
+                let shared = path.canonicalize()?;
+                // Landlock grants are additive: /tmp must not grant write access
+                // beneath a read-only share, including aliases and ancestors.
+                if shared.starts_with(&temporary) || temporary.starts_with(&shared) {
+                    return Ok(ruleset);
+                }
+            }
+        }
+        let access = AccessFs::ReadFile
+            | AccessFs::WriteFile
+            | AccessFs::ReadDir
+            | AccessFs::RemoveFile
+            | AccessFs::MakeReg;
+        ruleset = ruleset.add_rule(PathBeneath::new(PathFd::new(temporary)?, access))?;
         Ok(ruleset)
     }
 
@@ -316,6 +344,11 @@ mod inner {
                 anyhow::anyhow!("Landlock is not supported on this kernel")
             })?;
 
+            if let Err(error) = validate_read_only_abi(&share, abi) {
+                self.status = SandboxStatus::Stopped;
+                return Err(error);
+            }
+
             self.share = Some(share);
             self.abi = Some(abi);
             self.status = SandboxStatus::Running;
@@ -429,6 +462,25 @@ mod inner {
             self.status
         }
     }
+    #[cfg(test)]
+    mod read_only_tests {
+        use super::*;
+
+        #[test]
+        fn old_abis_fail_closed_for_read_only_shares() {
+            let mut share = ShareConfig {
+                host_paths: vec![],
+                mount_point: "/workspace".into(),
+                read_only: true,
+            };
+            for abi in [ABI::V1, ABI::V2] {
+                assert!(validate_read_only_abi(&share, abi).is_err());
+            }
+            assert!(validate_read_only_abi(&share, ABI::V3).is_ok());
+            share.read_only = false;
+            assert!(validate_read_only_abi(&share, ABI::V1).is_ok());
+        }
+    }
 }
 
 // ============================================================
@@ -493,12 +545,17 @@ pub fn describe_ruleset(share: &ShareConfig) -> String {
     let mut desc = String::new();
     desc.push_str("Landlock Ruleset:\n");
 
-    desc.push_str("  Writable paths:\n");
+    desc.push_str("  Shared paths:\n");
+    let mode = if share.read_only {
+        "read/execute-only"
+    } else {
+        "read/write"
+    };
     for p in &share.host_paths {
-        desc.push_str(&format!("    - {} (read/write)\n", p.display()));
+        desc.push_str(&format!("    - {} ({mode})\n", p.display()));
     }
     // NOTE: mount_point はゲスト側パスのため Landlock ルールには含めない
-    desc.push_str("    - /tmp (read/write)\n");
+    desc.push_str("    - /tmp (read/write unless overlapping a read-only share)\n");
 
     desc.push_str("  Read/execute-only paths:\n");
     for p in &["/usr", "/lib", "/lib64", "/bin", "/sbin"] {
@@ -538,6 +595,7 @@ mod tests {
         let share = ShareConfig {
             host_paths: vec![PathBuf::from("/home/user/project")],
             mount_point: PathBuf::from("/workspace"),
+            read_only: false,
         };
         let desc = describe_ruleset(&share);
 
@@ -545,7 +603,7 @@ mod tests {
         assert!(desc.contains("/home/user/project (read/write)"));
         // mount_point はゲスト側パスのため含まれない
         assert!(!desc.contains("/workspace (mount_point, read/write)"));
-        assert!(desc.contains("/tmp (read/write)"));
+        assert!(desc.contains("/tmp (read/write unless"));
         assert!(desc.contains("/usr (read/execute-only)"));
         assert!(desc.contains("/etc/resolv.conf (read-only)"));
         // /proc は最小限のエントリのみ許可
@@ -568,6 +626,7 @@ mod tests {
                 PathBuf::from("/home/user/project2"),
             ],
             mount_point: PathBuf::from("/workspace"),
+            read_only: false,
         };
         let desc = describe_ruleset(&share);
 
@@ -580,13 +639,14 @@ mod tests {
         let share = ShareConfig {
             host_paths: vec![],
             mount_point: PathBuf::from("/workspace"),
+            read_only: false,
         };
         let desc = describe_ruleset(&share);
 
         assert!(desc.contains("Landlock Ruleset:"));
         // mount_point はゲスト側パスのため含まれない
         assert!(!desc.contains("/workspace (mount_point, read/write)"));
-        assert!(desc.contains("/tmp (read/write)"));
+        assert!(desc.contains("/tmp (read/write unless"));
     }
 
     #[test]
@@ -601,6 +661,7 @@ mod tests {
         let share = ShareConfig {
             host_paths: vec![PathBuf::from("/tmp")],
             mount_point: PathBuf::from("/workspace"),
+            read_only: false,
         };
         let config = SandboxConfig::Landlock { share };
 
@@ -646,6 +707,7 @@ mod tests {
         let share = ShareConfig {
             host_paths: vec![PathBuf::from("/tmp")],
             mount_point: PathBuf::from("/workspace"),
+            read_only: false,
         };
         let config = SandboxConfig::Landlock { share };
 
@@ -666,6 +728,7 @@ mod tests {
         let share = ShareConfig {
             host_paths: vec![PathBuf::from("/tmp")],
             mount_point: PathBuf::from("/workspace"),
+            read_only: false,
         };
         let config = SandboxConfig::Landlock { share };
         let mut sb = LandlockSandbox::new();
@@ -692,6 +755,7 @@ mod tests {
         let share = ShareConfig {
             host_paths: vec![PathBuf::from("/tmp")],
             mount_point: PathBuf::from("/workspace"),
+            read_only: false,
         };
         let config = SandboxConfig::Landlock { share };
         let mut sb = LandlockSandbox::new();
@@ -731,6 +795,7 @@ mod tests {
             share: ShareConfig {
                 host_paths: vec![PathBuf::from("/tmp")],
                 mount_point: PathBuf::from("/workspace"),
+                read_only: false,
             },
         };
         let mut sb = LandlockSandbox::new();
@@ -764,6 +829,7 @@ mod tests {
             share: ShareConfig {
                 host_paths: vec![],
                 mount_point: PathBuf::from("/workspace"),
+                read_only: false,
             },
             dns_proxy: None,
             network: None,
