@@ -62,7 +62,7 @@ source "qemu" "alpine" {
   use_default_display = false
   boot_wait        = "10s"
   boot_key_interval = "50ms"
-  shutdown_command = "poweroff"
+  shutdown_command = "sh /tmp/izanagi-lock-down.sh && poweroff"
 
   communicator = "ssh"
   ssh_username = "root"
@@ -87,6 +87,17 @@ build {
   provisioner "file" {
     source      = var.agent_binary
     destination = "/usr/local/bin/izanagi-agent"
+  }
+
+  # 最終イメージからビルド用 root 認証と SSH 起動を除去する。
+  provisioner "file" {
+    source      = "${path.root}/lock-down.sh"
+    destination = "/tmp/izanagi-lock-down.sh"
+  }
+
+  provisioner "file" {
+    source      = "${path.root}/verify-image.sh"
+    destination = "/tmp/verify-image.sh"
   }
 
   # agent のセットアップ
