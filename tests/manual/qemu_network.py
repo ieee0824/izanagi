@@ -34,7 +34,9 @@ def check_access(port, target_port, restricted):
     # TCP handshake probes: no credentials or application requests are sent.
     # Restricted mode must fail both; unrestricted mode is the positive control.
     for address, destination in [("10.0.2.2", target_port), ("1.1.1.1", 443)]:
-        result = guest.ssh(port, f"nc -z -w 3 {address} {destination}")
+        result = guest.ssh(port, f"printf IZANAGI_NETWORK_PROBE; nc -z -w 3 {address} {destination}")
+        if b"IZANAGI_NETWORK_PROBE" not in result.stdout or result.returncode not in [0, 1]:
+            raise RuntimeError("guest TCP probe did not execute; cannot establish network isolation")
         if (result.returncode == 0) == restricted:
             raise RuntimeError(f"unexpected reachability of {address}, restrict={restricted}")
 

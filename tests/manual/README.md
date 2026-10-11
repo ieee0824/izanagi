@@ -70,7 +70,8 @@ Git config, reject overwrite/append/truncate/remove/rename/create/hardlink and b
 script writes in read-only mode, verify unchanged host fixtures, then prove a write
 reaches the host with the explicitly writable mode. Fixtures deliberately allow
 writes by Unix permissions so the positive control can distinguish access-mode
-protection. Linux CI runs tests/workspace_share.rs against real Landlock with
+protection. A guest-side command marker rejects transport/CLI failures as evidence
+of write denial. Linux CI runs tests/workspace_share.rs against real Landlock with
 `IZANAGI_REQUIRE_LANDLOCK_TEST=1`; lack of ABI v3 fails instead of silently skipping.
 
 

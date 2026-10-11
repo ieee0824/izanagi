@@ -7,6 +7,7 @@ image overlay and restricted network; credentials and original projects are not 
 import argparse
 from pathlib import Path
 import tempfile
+import time
 
 import image_security as guest
 
@@ -33,16 +34,24 @@ def unchanged(directory):
         raise RuntimeError("host build script changed through read-only share")
 
 
+def checked(execute, command):
+    # A transport/CLI error must never masquerade as a denied guest write.
+    result = execute("printf IZANAGI_SHARE_COMMAND_STARTED; " + command)
+    if b"IZANAGI_SHARE_COMMAND_STARTED" not in result.stdout or result.returncode == 255:
+        raise RuntimeError("guest command did not execute; cannot establish share protection")
+    return result
+
+
 def verify(directory, execute, read_only):
-    if execute("cat .git/config").returncode:
+    if checked(execute, "cat .git/config").returncode:
         raise RuntimeError("shared fixture is not readable")
     if read_only:
         for attempt in ATTEMPTS:
-            if execute(attempt).returncode == 0:
+            if checked(execute, attempt).returncode == 0:
                 raise RuntimeError(f"read-only mutation unexpectedly succeeded: {attempt}")
             unchanged(directory)
     else:
-        result = execute("printf changed > .git/config")
+        result = checked(execute, "printf changed > .git/config")
         if result.returncode:
             raise RuntimeError(f"writable positive control failed: {result.stderr.decode(errors='replace')}")
         if (directory / ".git/config").read_text() != "changed":
@@ -60,6 +69,15 @@ def check_container(directory):
         print(f"PASS: Apple Container read_only={read_only}")
 
 
+def qemu_command(port, command):
+    for _ in range(3):
+        result = guest.ssh(port, command)
+        if result.returncode != 255:
+            return result
+        time.sleep(1)
+    return result
+
+
 def check_qemu(directory, image):
     overlay = directory.parent / "overlay.qcow2"
     created = guest.run(["qemu-img", "create", "-f", "qcow2", "-F", "qcow2", "-b",
@@ -75,10 +93,10 @@ def check_qemu(directory, image):
         process = guest.start(overlay, port, directory.parent / f"serial-{mode}.log", extra_args=extra)
         try:
             guest.wait_ssh(process, port)
-            mounted = guest.ssh(port, "mkdir -p /workspace; modprobe 9pnet_virtio; mount -t 9p -o trans=virtio,version=9p2000.L workspace /workspace")
+            mounted = qemu_command(port, "mkdir -p /workspace; modprobe 9pnet_virtio; mount -t 9p -o trans=virtio,version=9p2000.L workspace /workspace")
             if mounted.returncode:
                 raise RuntimeError(f"9p share mount failed: {mounted.stderr.decode(errors='replace')}")
-            verify(directory, lambda command: guest.ssh(port, "cd /workspace && " + command), read_only)
+            verify(directory, lambda command: qemu_command(port, "cd /workspace && " + command), read_only)
             print(f"PASS: QEMU 9p read_only={read_only}")
         finally:
             guest.stop(process)

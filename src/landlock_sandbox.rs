@@ -97,26 +97,6 @@ mod inner {
         Ok(())
     }
 
-    #[cfg(test)]
-    mod read_only_tests {
-        use super::*;
-
-        #[test]
-        fn old_abis_fail_closed_for_read_only_shares() {
-            let mut share = ShareConfig {
-                host_paths: vec![],
-                mount_point: "/workspace".into(),
-                read_only: true,
-            };
-            for abi in [ABI::V1, ABI::V2] {
-                assert!(validate_read_only_abi(&share, abi).is_err());
-            }
-            assert!(validate_read_only_abi(&share, ABI::V3).is_ok());
-            share.read_only = false;
-            assert!(validate_read_only_abi(&share, ABI::V1).is_ok());
-        }
-    }
-
     fn allow_temporary_directory(
         mut ruleset: landlock::RulesetCreated,
         share: &ShareConfig,
@@ -480,6 +460,25 @@ mod inner {
 
         fn status(&self) -> SandboxStatus {
             self.status
+        }
+    }
+    #[cfg(test)]
+    mod read_only_tests {
+        use super::*;
+
+        #[test]
+        fn old_abis_fail_closed_for_read_only_shares() {
+            let mut share = ShareConfig {
+                host_paths: vec![],
+                mount_point: "/workspace".into(),
+                read_only: true,
+            };
+            for abi in [ABI::V1, ABI::V2] {
+                assert!(validate_read_only_abi(&share, abi).is_err());
+            }
+            assert!(validate_read_only_abi(&share, ABI::V3).is_ok());
+            share.read_only = false;
+            assert!(validate_read_only_abi(&share, ABI::V1).is_ok());
         }
     }
 }

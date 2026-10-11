@@ -13,7 +13,8 @@ import threading
 import time
 
 ROOT = Path(__file__).resolve().parents[2]
-SSH_OPTIONS = ["-o", "PreferredAuthentications=password", "-o", "PubkeyAuthentication=no",
+SSH_OPTIONS = ["-F", "/dev/null", "-o", "IdentityAgent=none",
+               "-o", "PreferredAuthentications=password", "-o", "PubkeyAuthentication=no",
                "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
                "-o", "ConnectTimeout=2", "-o", "LogLevel=ERROR"]
 
