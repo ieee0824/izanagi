@@ -111,6 +111,7 @@ fn configuration() -> SandboxConfig {
         share: ShareConfig {
             host_paths: vec![],
             mount_point: "/workspace".into(),
+            read_only: false,
         },
     }
 }

@@ -13,7 +13,8 @@ import threading
 import time
 
 ROOT = Path(__file__).resolve().parents[2]
-SSH_OPTIONS = ["-o", "PreferredAuthentications=password", "-o", "PubkeyAuthentication=no",
+SSH_OPTIONS = ["-F", "/dev/null", "-o", "IdentityAgent=none",
+               "-o", "PreferredAuthentications=password", "-o", "PubkeyAuthentication=no",
                "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
                "-o", "ConnectTimeout=2", "-o", "LogLevel=ERROR"]
 
@@ -40,7 +41,7 @@ def available_port():
         return sock.getsockname()[1]
 
 
-def start(overlay, port, serial, restrict=True):
+def start(overlay, port, serial, restrict=True, extra_args=None):
     command = ["qemu-system-aarch64", "-accel", "hvf", "-cpu", "host", "-m", "1024",
                "-smp", "2", "-M", "virt", "-bios",
                "/opt/homebrew/share/qemu/edk2-aarch64-code.fd", "-drive",
@@ -48,6 +49,7 @@ def start(overlay, port, serial, restrict=True):
                f"user,id=net0,restrict={'on' if restrict else 'off'},hostfwd=tcp:127.0.0.1:{port}-:22",
                "-device", "virtio-net-pci,netdev=net0", "-display", "none",
                "-serial", "stdio", "-monitor", "none"]
+    command.extend(extra_args or [])
     process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                stderr=subprocess.DEVNULL)
     process.serial_path = serial

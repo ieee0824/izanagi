@@ -254,6 +254,11 @@ fn convert_raw_event(
         )));
     }
 
+    if syscall == Syscall::OpenAt {
+        // The path is followed by flags, as in the DTrace open/openat schema.
+        args.push(crate::event::SyscallArg::Int(raw.arg2 as i64));
+    }
+
     Some(SyscallEvent {
         timestamp,
         pid: raw.pid,
@@ -456,7 +461,29 @@ mod tests {
             assert_eq!(event.pid, 42);
             assert_eq!(&*event.process_name, "bash");
             assert_eq!(event.syscall, crate::event::Syscall::OpenAt);
-            assert_eq!(event.args.len(), 1);
+            assert_eq!(event.args.len(), 2);
+        }
+
+        #[test]
+        fn openat_write_flags_reach_workspace_warning_rule() {
+            use crate::detector::Rule;
+            let rule = crate::rules::WorkspaceWriteRule::new(&[], "/workspace");
+            let mut raw = make_raw_event(
+                SyscallId::OpenAt as u32,
+                b"fixture",
+                b"/workspace/.git/config",
+            );
+            assert!(
+                rule.check(&convert_raw_event(&raw, Duration::ZERO).unwrap())
+                    .is_none()
+            );
+            raw.arg2 = 1;
+            let observed = convert_raw_event(&raw, Duration::ZERO).unwrap();
+            assert!(rule.check(&observed).is_some());
+            assert!(matches!(
+                observed.args.last(),
+                Some(crate::event::SyscallArg::Int(1))
+            ));
         }
 
         #[test]
@@ -487,7 +514,7 @@ mod tests {
             raw.path_len = (PATH_BUF_SIZE + 100) as u32;
             // path_buf は全ゼロだが path_len が大きくても panic しないことを確認
             let event = convert_raw_event(&raw, Duration::ZERO).unwrap();
-            assert_eq!(event.args.len(), 1);
+            assert_eq!(event.args.len(), 2);
         }
 
         #[test]

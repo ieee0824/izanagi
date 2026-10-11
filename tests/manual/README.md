@@ -18,9 +18,11 @@ require_auth = true
 cpus = 2
 memory = "2G"
 image = "/absolute/path/to/test-overlay.qcow2"
+restrict_network = false # 専用 fixture のホスト HTTP プロキシに接続する
 [share]
 paths = ["/absolute/path/to/artifacts/workspace"]
 mount_point = "/workspace"
+read_only = false # 専用 fixture 内の receiver log と計測結果を書き込む
 [monitor]
 syscalls = ["file", "network", "process"]
 [detect]
@@ -52,6 +54,27 @@ Python 3.11 以上、macOS の PTY と QEMU HVF を使用する。停止した f
 `observed-events-second.jsonl`、`results-second.json`、`writer-negative-results.json`、`resources.json`、`shell-results.json`、`up-second.log` を保存する。host は 0.5 秒間隔の RSS と `ps` の lifetime `%cpu`、guest は実行前後の RSS/CPU、HTTP は各系列 2 requests の round-trip 時間を記録する。これらを profiler の瞬時 CPU、推論時間、一般性能と呼ばない。overlay/collector/host/fixture の SHA256 と source commit は実行前に別途記録する。
 
 Linux collector は成功した `tcp_sendmsg_locked` の送信範囲と実 socket namespace を取得する。kernel BTF の layout・関数 signature 検証と writer probe の装着が開始条件。raw ABI v2 の agent/object を使う。試験は正例 4 requests が `ConfirmedWriter` で mock 分類されることを確認する。続いて fork/dup と SCM_RIGHTS により同じ HTTP リクエストの header/body を別プロセスで送り、転送は完了しても複数 writer として棄権することを確認する。欠落や unsupported な転送を成功した writer proof に昇格させない。通常 install/build や広い攻撃集合の精度は、この小さな試験から推定しない。
+
+
+### Read-only workspace shares (#63)
+
+Only a newly created fixture directory is shared. Original projects and credentials
+are not shared, and QEMU uses a disposable legacy-image overlay.
+
+```sh
+python3 tests/manual/workspace_share.py qemu --image ~/.izanagi/images/alpine-aarch64.qcow2
+python3 tests/manual/workspace_share.py apple-container
+```
+
+The QEMU check requires image_security.py prerequisites. The Apple Container check
+requires a running container service and cached `alpine:3.23`. Both checks read a
+Git config, reject overwrite/append/truncate/remove/rename/create/hardlink and build
+script writes in read-only mode, verify unchanged host fixtures, then prove a write
+reaches the host with the explicitly writable mode. Fixtures deliberately allow
+writes by Unix permissions so the positive control can distinguish access-mode
+protection. A guest-side command marker rejects transport/CLI failures as evidence
+of write denial. Linux CI runs tests/workspace_share.rs against real Landlock with
+`IZANAGI_REQUIRE_LANDLOCK_TEST=1`; lack of ABI v3 fails instead of silently skipping.
 
 
 ### QEMU network boundary (#64)
