@@ -246,6 +246,11 @@ Claude Desktop の設定例:
 設定ファイルは `~/.izanagi/settings/{pwd の SHA256 ハッシュ}/izanagi.toml` に保存され、
 プロジェクトディレクトリごとに独立した設定を持てる。
 
+`./izanagi.toml` は自動読み込みしない。既存の設定は内容を確認して `izanagi config path` が示す場所へ移すか、
+`izanagi init` で再作成する。`-c /path/to/izanagi.toml` による明示指定は引き続き利用できるが、
+設定ファイルは `share.paths` の外に置く必要がある。設定ファイルや共有パスのシンボリックリンクも検証する。
+既定の settings ディレクトリを含むパスを共有している場合は、共有範囲を狭めるか共有領域外の設定を明示する。
+
 ```toml
 [sandbox]
 backend = "native"              # native | apple-container | qemu

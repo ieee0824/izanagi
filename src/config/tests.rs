@@ -849,21 +849,6 @@ fn settings_path_differs_by_dir() {
     assert_ne!(p1, p2);
 }
 
-/// `resolve_config_path` 内で `current_dir().join("izanagi.toml")` が
-/// 絶対パスを返すことを検証する (#285)。
-/// `set_current_dir` はプロセスグローバルでテスト並列実行に影響するため、
-/// resolve_config_path 自体ではなく、該当ロジックを直接テストする。
-#[test]
-fn current_dir_join_returns_absolute_path() {
-    let path = std::env::current_dir()
-        .expect("current_dir should succeed")
-        .join("izanagi.toml");
-    assert!(
-        path.is_absolute(),
-        "current_dir().join(\"izanagi.toml\") should be absolute, got: {path:?}"
-    );
-}
-
 #[test]
 fn validation_preserves_backend_then_platform_then_share_error_priority() {
     let mut config = Config::default();

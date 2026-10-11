@@ -42,6 +42,8 @@ fn cmd_config_mitm(config: &Config, config_path: &Path) -> anyhow::Result<u8> {
 
     config.detect.allowed_hosts = prompt_allowed_hosts(&config)?;
 
+    config.validate_config_location(config_path)?;
+
     // 設定ファイルに書き戻し
     write_config(config_path, &config)?;
 

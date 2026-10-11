@@ -524,7 +524,8 @@ fn load_cli_config(cli: &Cli) -> anyhow::Result<(PathBuf, Config)> {
     if !config_path.exists() {
         anyhow::bail!(
             "設定ファイルが見つかりません: {}\n\
-             `izanagi init` で設定ファイルを生成してください。",
+             `izanagi init` で設定ファイルを生成してください。\n\
+             ./izanagi.toml は自動読み込みしません。既存設定は共有領域外の上記パスへ移し、内容を確認してください。",
             config_path.display()
         );
     }
