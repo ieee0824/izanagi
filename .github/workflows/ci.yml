@@ -102,6 +102,27 @@ jobs:
           tar --zstd -xf "$archive" -C "$HOME/.cargo/bin"
       - run: cargo build --manifest-path izanagi-ebpf/Cargo.toml --release --target bpfel-unknown-none -Z build-std=core
 
+  image-security:
+    name: Image security (${{ matrix.image }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [debian:13-slim, alpine:3.23]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Verify finalization and unsafe-state regressions
+        run: |
+          docker run --rm -v "$PWD:/checks:ro" "${{ matrix.image }}" sh -eu -c '
+            if command -v apt-get >/dev/null; then
+              apt-get update
+              DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server procps systemd
+            else
+              apk add --no-cache openssh openrc procps shadow
+            fi
+            sh /checks/tests/image-security.sh /checks/packer
+          '
+
   quality:
     name: Format and Clippy
     runs-on: ubuntu-latest
