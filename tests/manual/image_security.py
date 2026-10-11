@@ -40,12 +40,12 @@ def available_port():
         return sock.getsockname()[1]
 
 
-def start(overlay, port, serial):
+def start(overlay, port, serial, restrict=True):
     command = ["qemu-system-aarch64", "-accel", "hvf", "-cpu", "host", "-m", "1024",
                "-smp", "2", "-M", "virt", "-bios",
                "/opt/homebrew/share/qemu/edk2-aarch64-code.fd", "-drive",
                f"file={overlay},format=qcow2,if=virtio", "-netdev",
-               f"user,id=net0,restrict=on,hostfwd=tcp:127.0.0.1:{port}-:22",
+               f"user,id=net0,restrict={'on' if restrict else 'off'},hostfwd=tcp:127.0.0.1:{port}-:22",
                "-device", "virtio-net-pci,netdev=net0", "-display", "none",
                "-serial", "stdio", "-monitor", "none"]
     process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,

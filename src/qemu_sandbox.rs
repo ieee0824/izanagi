@@ -105,6 +105,7 @@ pub struct QemuArgsParams<'a> {
     pub token: Option<&'a str>,
     pub secret: Option<&'a str>,
     pub dns_proxy: Option<&'a str>,
+    pub restrict_network: bool,
 }
 
 /// QEMU コマンドライン引数を構築する。
@@ -152,6 +153,7 @@ pub fn build_qemu_args(params: &QemuArgsParams<'_>) -> Vec<String> {
         token,
         secret,
         dns_proxy,
+        restrict_network,
     } = params;
     let mut args = Vec::new();
 
@@ -178,7 +180,7 @@ pub fn build_qemu_args(params: &QemuArgsParams<'_>) -> Vec<String> {
 
     push_qemu_share(&mut args, share);
 
-    push_qemu_network(&mut args, *host_port, *dns_proxy);
+    push_qemu_network(&mut args, *host_port, *dns_proxy, *restrict_network);
 
     // ヘッドレスモード
     args.push("-nographic".to_string());
@@ -188,9 +190,17 @@ pub fn build_qemu_args(params: &QemuArgsParams<'_>) -> Vec<String> {
     args
 }
 
-fn push_qemu_network(args: &mut Vec<String>, host_port: u16, dns_proxy: Option<&str>) {
+fn push_qemu_network(
+    args: &mut Vec<String>,
+    host_port: u16,
+    dns_proxy: Option<&str>,
+    restrict_network: bool,
+) {
     // ネットワーク (TCP ポートフォワーディング + DNS プロキシ)
-    let mut netdev = format!("user,id=net0,hostfwd=tcp::{}-:{}", host_port, AGENT_PORT);
+    let restriction = if restrict_network { "on" } else { "off" };
+    let mut netdev = format!(
+        "user,id=net0,restrict={restriction},hostfwd=tcp:127.0.0.1:{host_port}-:{AGENT_PORT}"
+    );
     if let Some(dns_ip) = dns_proxy {
         netdev.push_str(&format!(",dns={}", dns_ip));
     }
@@ -332,6 +342,7 @@ struct QemuBootSettings {
     image_path: PathBuf,
     share: ShareConfig,
     dns_proxy: Option<String>,
+    restrict_network: bool,
 }
 
 impl QemuSandbox {
@@ -366,19 +377,21 @@ impl QemuSandbox {
     }
 
     fn boot_settings(&mut self, config: &SandboxConfig) -> anyhow::Result<QemuBootSettings> {
-        let (cpus, memory_mb, image, share, dns_proxy) = match config {
+        let (cpus, memory_mb, image, share, dns_proxy, restrict_network) = match config {
             SandboxConfig::Qemu {
                 cpus,
                 memory_mb,
                 image,
                 share,
                 dns_proxy,
+                restrict_network,
             } => (
                 *cpus,
                 *memory_mb,
                 image.clone(),
                 share.clone(),
                 dns_proxy.clone(),
+                *restrict_network,
             ),
             _ => {
                 self.status = SandboxStatus::Stopped;
@@ -401,6 +414,7 @@ impl QemuSandbox {
             image_path,
             share,
             dns_proxy,
+            restrict_network,
         })
     }
 
@@ -450,6 +464,7 @@ impl QemuSandbox {
             })?),
             secret: secret_file_path.as_ref().and_then(|p| p.to_str()),
             dns_proxy: boot.dns_proxy.as_deref(),
+            restrict_network: boot.restrict_network,
         });
 
         // バッファをリセットして QEMU を起動
@@ -1098,6 +1113,7 @@ mod tests {
             token,
             secret,
             dns_proxy,
+            restrict_network: true,
         })
     }
 
@@ -1237,7 +1253,7 @@ mod tests {
             .iter()
             .find(|a| a.starts_with("user,id=net0"))
             .expect("netdev arg should exist");
-        assert!(netdev_arg.contains("hostfwd=tcp::12345-:9001"));
+        assert!(netdev_arg.contains("hostfwd=tcp:127.0.0.1:12345-:9001"));
         assert!(args.contains(&"virtio-net-pci,netdev=net0".to_string()));
     }
 
@@ -1257,7 +1273,7 @@ mod tests {
             .find(|a| a.starts_with("user,id=net0"))
             .expect("netdev arg should exist");
         assert!(netdev_arg.contains("dns=10.0.2.2"));
-        assert!(netdev_arg.contains("hostfwd=tcp::9001-:9001"));
+        assert!(netdev_arg.contains("hostfwd=tcp:127.0.0.1:9001-:9001"));
     }
 
     #[test]
@@ -1340,6 +1356,7 @@ mod tests {
             image: "nonexistent_image_xyz".to_string(),
             share,
             dns_proxy: None,
+            restrict_network: true,
         };
 
         let mut sb = QemuSandbox::new();
@@ -1594,5 +1611,20 @@ mod tests {
                 .is_none()
         );
         agent.await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod network_security_tests {
+    #[test]
+    fn restrict_modes_keep_agent_forward_on_loopback_only() {
+        for (restricted, setting) in [(true, "on"), (false, "off")] {
+            let mut args = Vec::new();
+            super::push_qemu_network(&mut args, 47124, None, restricted);
+            assert_eq!(
+                args[1],
+                format!("user,id=net0,restrict={setting},hostfwd=tcp:127.0.0.1:47124-:9001")
+            );
+        }
     }
 }
