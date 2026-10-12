@@ -176,6 +176,12 @@ where
 
     async fn dispatch(&mut self, message: Message) -> anyhow::Result<bool> {
         match message {
+            Message::DnsStatus { .. } => {
+                self.send(&Message::DnsStatus {
+                    endpoint: crate::dns::status(),
+                })
+                .await?;
+            }
             Message::Exec { cmd, env } => {
                 if self.authorize("Exec").await? {
                     self.exec(cmd, env).await?;

@@ -118,7 +118,7 @@ pub struct DnsProxySection {
     #[serde(default)]
     pub enabled: bool,
     /// DNS プロキシのリッスンアドレス。サンドボックスの DNS 設定に使用する。
-    /// デフォルトは `"127.0.0.1:53"`。
+    /// デフォルトは `"127.0.0.1:15353"`。
     #[serde(default = "default_dns_proxy_listen")]
     pub listen: String,
 }
@@ -322,6 +322,7 @@ impl Config {
 
         self.validate_container_network()?;
         self.validate_qemu_network()?;
+        self.validate_dns_proxy(is_macos)?;
 
         let mut warnings = Vec::new();
         if self.sandbox.backend == SandboxBackend::Qemu
@@ -399,7 +400,7 @@ impl Config {
             bail!(
                 "sandbox.apple_container.network = \"none\" は現在サポートされていません。\
                  ポートフォワード (-p) が無効になり、エージェントとの通信ができません。\
-                 ネットワーク制限には dns_proxy の使用を推奨します"
+                 ネットワーク隔離には QEMU restrict_network=true を使用してください"
             );
         }
 
@@ -494,14 +495,15 @@ impl Config {
 
     /// プラットフォーム判定を引数として受け取る SandboxConfig 変換。テストで各プラットフォームの挙動を検証可能。
     fn to_sandbox_config_for_platform(&self, is_linux: bool) -> anyhow::Result<SandboxConfig> {
+        self.validate_dns_proxy(!is_linux)?;
         let share = ShareConfig {
             host_paths: self.share.paths.iter().map(PathBuf::from).collect(),
             mount_point: PathBuf::from(&self.share.mount_point),
             read_only: self.share.read_only,
         };
 
-        // DNS プロキシが有効な場合、listen アドレスから IP 部分を抽出する
-        let dns_proxy_ip = self.dns_proxy_ip();
+        // DNS プロキシが有効な場合、listen の IP とポートを保持する
+        let dns_proxy_endpoint = self.dns_proxy_endpoint();
 
         match self.sandbox.backend {
             SandboxBackend::Qemu => {
@@ -516,7 +518,7 @@ impl Config {
                     memory_mb,
                     image: qemu.image.clone(),
                     share,
-                    dns_proxy: dns_proxy_ip.clone(),
+                    dns_proxy: dns_proxy_endpoint.clone(),
                     restrict_network: qemu.restrict_network,
                 })
             }
@@ -524,10 +526,10 @@ impl Config {
                 if is_linux {
                     Ok(SandboxConfig::Landlock { share })
                 } else {
-                    self.apple_sandbox_config(share, dns_proxy_ip)
+                    self.apple_sandbox_config(share, dns_proxy_endpoint)
                 }
             }
-            SandboxBackend::AppleContainer => self.apple_sandbox_config(share, dns_proxy_ip),
+            SandboxBackend::AppleContainer => self.apple_sandbox_config(share, dns_proxy_endpoint),
         }
     }
 
@@ -555,26 +557,43 @@ impl Config {
         })
     }
 
-    /// DNS プロキシが有効な場合、listen アドレスから IP 部分を抽出する。
-    /// `listen` は `SocketAddr` 形式（例: `"127.0.0.1:53"`, `"[::1]:53"`）を期待する。
-    fn dns_proxy_ip(&self) -> Option<String> {
-        let section = self.dns_proxy.as_ref()?;
-        if !section.enabled {
-            return None;
+    /// Preserve the host endpoint, including its nonstandard port.
+    fn dns_proxy_endpoint(&self) -> Option<String> {
+        self.dns_proxy
+            .as_ref()
+            .filter(|p| p.enabled)
+            .and_then(|p| p.listen.parse::<std::net::SocketAddr>().ok())
+            .map(|addr| addr.to_string())
+    }
+
+    fn validate_dns_proxy(&self, is_macos: bool) -> anyhow::Result<()> {
+        let Some(section) = self.dns_proxy.as_ref().filter(|p| p.enabled) else {
+            return Ok(());
+        };
+        let addr: std::net::SocketAddr = section
+            .listen
+            .parse()
+            .context("dns_proxy.listen must be an IP:port endpoint")?;
+        if addr.port() == 0 || addr.ip().is_unspecified() || addr.ip().is_multicast() {
+            bail!("dns_proxy.listen must be a concrete unicast address with a nonzero port");
         }
-        match section.listen.parse::<std::net::SocketAddr>() {
-            Ok(addr) => Some(addr.ip().to_string()),
-            Err(_) => {
-                // SocketAddr としてパースできない場合は、IP アドレス単体として試みる
-                match section.listen.parse::<std::net::IpAddr>() {
-                    Ok(ip) => Some(ip.to_string()),
-                    Err(_) => {
-                        eprintln!("警告: dns_proxy.listen のパースに失敗: {}", section.listen);
-                        None
-                    }
+        match self.sandbox.backend {
+            SandboxBackend::Qemu
+                if addr.ip().is_loopback() && addr.ip() != std::net::Ipv4Addr::LOCALHOST =>
+            {
+                bail!("QEMU DNS relay supports only 127.0.0.1 as host loopback");
+            }
+            SandboxBackend::Qemu => {}
+            SandboxBackend::AppleContainer | SandboxBackend::Native if is_macos => {
+                if addr.ip().is_loopback() {
+                    bail!(
+                        "container DNS relay needs a guest-reachable host address; host loopback is not reachable"
+                    );
                 }
             }
+            _ => bail!("DNS proxy integration requires QEMU or Apple Container"),
         }
+        Ok(())
     }
 
     /// Config から TraceFilter への変換。

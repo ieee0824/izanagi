@@ -91,3 +91,33 @@ loopback TCP listener via 10.0.2.2 and external 1.1.1.1:443. Both fail with
 `restrict=on` and succeed with `restrict=off` as a positive control. The external
 positive control requires working Internet access; it fails rather than skips if
 that access is unavailable. No application payload is sent to the external endpoint.
+
+## Guest DNS integration (#65)
+
+Use the same revision for the host, agent and guest probe. The DNS component suite
+starts the actual proxy and checks that UDP/TCP relay requests appear as `BLOCKED`.
+The following manual regression additionally exercises the production backend
+startup and the guest's normal system resolver:
+
+```sh
+cargo build --locked --manifest-path izanagi-dns-proxy/Cargo.toml
+cargo build --locked --example dns_sandbox_smoke
+cargo zigbuild --locked --manifest-path izanagi-agent/Cargo.toml --target aarch64-unknown-linux-gnu --release
+cargo zigbuild --locked --example dns_guest_probe --target aarch64-unknown-linux-gnu --release
+python3 tests/manual/guest_dns.py container
+python3 tests/manual/guest_dns.py qemu --image ~/.izanagi/images/debian-aarch64.qcow2
+```
+
+The macOS/aarch64 QEMU check uses `image_security.py`'s legacy provisioning login
+only on a disposable overlay. It installs the new agent/probe and a fixture-only
+command allowlist, then stops the provisioning VM before production startup.
+It never shares host files or alters the backing image. The container check builds
+and deletes a dedicated Debian fixture image. Both require a `BLOCKED` entry for
+`denied.izanagi-test.org` in the actual host proxy log. They create a private
+fixture HMAC key, use UDP and TCP on a nonstandard host port, and stop all services.
+
+The new read-only `DnsStatus` message is appended to v3's existing message variants;
+existing frames retain their encoding. DNS-enabled startup rejects an older guest
+that cannot confirm the configured relay, without needing to add `cat` to a command
+allowlist. Test the root status regression and DNS startup failure regression for
+unconfigured/mismatched agents, unreachable upstreams and released listeners.

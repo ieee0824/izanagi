@@ -55,7 +55,7 @@ fn prompt_dns_proxy(config: &Config) -> anyhow::Result<DnsProxySection> {
     // DNS プロキシ設定
     let dns_enabled = Confirm::new()
         .with_prompt("DNS プロキシを有効にしますか？")
-        .default(true)
+        .default(config.dns_proxy.as_ref().is_some_and(|dns| dns.enabled))
         .interact()?;
 
     let dns_listen = if dns_enabled {
@@ -65,7 +65,7 @@ fn prompt_dns_proxy(config: &Config) -> anyhow::Result<DnsProxySection> {
             .map(|d| d.listen.clone())
             .unwrap_or_else(|| "127.0.0.1:15353".to_string());
         Input::new()
-            .with_prompt("DNS プロキシのリッスンアドレス")
+            .with_prompt("DNS プロキシの guest から到達可能な IP:port (QEMU は host loopback 可)")
             .default(current)
             .validate_with(|input: &String| -> Result<(), String> {
                 input
