@@ -8,6 +8,9 @@ use izanagi::guest_dns::DnsRelay;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpStream, UdpSocket};
 
+// Keep ephemeral TCP reservations from being reused by the other live socket test.
+static PORT_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 struct Fixture(std::path::PathBuf);
 impl Drop for Fixture {
     fn drop(&mut self) {
@@ -101,6 +104,7 @@ async fn start_proxy() -> (
 
 #[tokio::test]
 async fn guest_udp_and_tcp_queries_reach_real_proxy_and_log_blocked() {
+    let _guard = PORT_TEST_LOCK.lock().await;
     let (_fixture, mut child, host, log) = start_proxy().await;
     let relay = DnsRelay::bind("127.0.0.1:0".parse().unwrap(), host)
         .await
@@ -134,6 +138,7 @@ async fn guest_udp_and_tcp_queries_reach_real_proxy_and_log_blocked() {
 
 #[tokio::test]
 async fn relay_startup_rejects_unreachable_upstream_and_releases_both_listeners() {
+    let _guard = PORT_TEST_LOCK.lock().await;
     let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = reservation.local_addr().unwrap();
     drop(reservation);
@@ -141,7 +146,14 @@ async fn relay_startup_rejects_unreachable_upstream_and_releases_both_listeners(
         .unwrap()
         .local_addr()
         .unwrap();
-    assert!(DnsRelay::bind(address, dead).await.is_err());
+    let error = DnsRelay::bind(address, dead)
+        .await
+        .err()
+        .expect("unreachable host must fail startup");
+    assert!(
+        error.to_string().contains("host DNS proxy"),
+        "failure before reachability check: {error:#}"
+    );
     let _udp = UdpSocket::bind(address).await.unwrap();
     let _tcp = tokio::net::TcpListener::bind(address).await.unwrap();
 }

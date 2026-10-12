@@ -65,7 +65,8 @@ impl DnsRelay {
             .context("bind guest DNS TCP")?;
         tokio::time::timeout(TIMEOUT, probe(upstream))
             .await
-            .context("host DNS proxy unreachable (UDP/TCP)")??;
+            .context("host DNS proxy unreachable (UDP/TCP)")?
+            .context("host DNS proxy probe failed (UDP/TCP)")?;
         Ok(Self { udp, tcp, upstream })
     }
 
