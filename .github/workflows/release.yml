@@ -1,0 +1,164 @@
+name: Release binaries
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_VERSION: "1.93.1"
+
+jobs:
+  version:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - id: version
+        name: Validate release version
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          python3 - <<'PY'
+          import os, tomllib
+          from pathlib import Path
+          version = tomllib.loads(Path('Cargo.toml').read_text())['package']['version']
+          for component in ('izanagi-agent', 'izanagi-dns-proxy', 'izanagi-http-capture'):
+              component_version = tomllib.loads(Path(component, 'Cargo.toml').read_text())['package']['version']
+              if component_version != version:
+                  raise SystemExit(f'{component} version must match the host version')
+          if os.environ['REF_TYPE'] == 'tag' and os.environ['REF_NAME'] != f'v{version}':
+              raise SystemExit('Release tag must match the Cargo.toml version')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'version={version}\n')
+          PY
+
+  ebpf:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f
+        with:
+          toolchain: nightly-2026-02-12
+          components: rust-src
+      - name: Install bpf-linker
+        run: |
+          archive="$RUNNER_TEMP/bpf-linker.tar.zst"
+          curl --fail --location --retry 3 --output "$archive" https://github.com/aya-rs/bpf-linker/releases/download/v0.11.1/bpf-linker-x86_64-unknown-linux-musl.tar.zst
+          echo "e058a6aecc9e65fa4c977b298a8e4b738424d7629769fd352eed409fb57e16e8  $archive" | sha256sum --check
+          tar --zstd -xf "$archive" -C "$HOME/.cargo/bin"
+      - name: Build kernel probes
+        run: cargo build --manifest-path izanagi-ebpf/Cargo.toml --release --target bpfel-unknown-none -Z build-std=core
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ebpf-object
+          path: izanagi-ebpf/target/bpfel-unknown-none/release/izanagi-ebpf
+          if-no-files-found: error
+
+  build:
+    needs: [version, ebpf]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            features: landlock,ebpf
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            features: landlock,ebpf
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            features: ""
+          - os: macos-15
+            target: aarch64-apple-darwin
+            features: ""
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: |
+            . -> target
+            izanagi-agent -> target
+            izanagi-dns-proxy -> target
+            izanagi-http-capture -> target
+      - name: Build and smoke test native binaries
+        env:
+          TARGET: ${{ matrix.target }}
+          FEATURES: ${{ matrix.features }}
+        run: |
+          flags=()
+          if [[ -n "$FEATURES" ]]; then flags=(--features "$FEATURES"); fi
+          cargo build --locked --release --bin izanagi --target "$TARGET" "${flags[@]}"
+          for component in izanagi-dns-proxy izanagi-http-capture; do
+            cargo build --locked --release --manifest-path "$component/Cargo.toml" --target "$TARGET"
+          done
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            cargo build --locked --release --manifest-path izanagi-agent/Cargo.toml --features ebpf --target "$TARGET"
+          else
+            for binary in "target/$TARGET/release/izanagi" "izanagi-dns-proxy/target/$TARGET/release/izanagi-dns-proxy" "izanagi-http-capture/target/$TARGET/release/izanagi-http-capture"; do
+              codesign --sign - --force "$binary"
+              codesign --verify "$binary"
+            done
+          fi
+          "target/$TARGET/release/izanagi" --version
+          "target/$TARGET/release/izanagi" --help
+          for component in izanagi-dns-proxy izanagi-http-capture; do
+            "$component/target/$TARGET/release/$component" --help
+          done
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        if: runner.os == 'Linux'
+        with:
+          name: ebpf-object
+          path: ebpf-object
+      - name: Package
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: python3 tools/package-release.py --version "$VERSION" --target "$TARGET" --ebpf-object ebpf-object/izanagi-ebpf
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: [build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+      - name: Verify and publish release
+        env:
+          GH_TOKEN: >-
+            ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          cd dist
+          cat *.sha256 > SHA256SUMS
+          sha256sum --check SHA256SUMS
+          flags=()
+          if [[ "$RELEASE_TAG" == *-* ]]; then flags=(--prerelease); fi
+          gh release create "$RELEASE_TAG" *.tar.gz SHA256SUMS --verify-tag --generate-notes --title "$RELEASE_TAG" "${flags[@]}"
