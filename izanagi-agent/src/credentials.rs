@@ -6,7 +6,7 @@ pub(crate) fn lookup_user(
     // getpwnam_r is thread-safe; no passwd pointer crosses an await or a fork.
     let c_user =
         std::ffi::CString::new(user).map_err(|_| anyhow::anyhow!("invalid execution user"))?;
-    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut entry = unsafe { std::mem::zeroed::<libc::passwd>() };
     let mut buf_size: usize = 1024;
     let mut found = None;
     loop {
@@ -15,18 +15,18 @@ pub(crate) fn lookup_user(
         let ret = unsafe {
             libc::getpwnam_r(
                 c_user.as_ptr(),
-                &mut pwd,
+                &mut entry,
                 buf.as_mut_ptr() as *mut libc::c_char,
                 buf.len(),
                 &mut result,
             )
         };
         if ret == 0 && !result.is_null() {
-            let home = unsafe { std::ffi::CStr::from_ptr(pwd.pw_dir) }
+            let home = unsafe { std::ffi::CStr::from_ptr(entry.pw_dir) }
                 .to_str()
                 .unwrap_or("/home/izanagi")
                 .to_owned();
-            found = Some((pwd.pw_uid, pwd.pw_gid, home));
+            found = Some((entry.pw_uid, entry.pw_gid, home));
             break;
         } else if ret == libc::ERANGE && buf_size < 1_048_576 {
             buf_size *= 2;
