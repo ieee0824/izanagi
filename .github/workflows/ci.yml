@@ -73,6 +73,18 @@ jobs:
           else
             cargo test --locked --all-targets --manifest-path "${{ matrix.manifest }}"
           fi
+      - name: Test privileged agent credentials on Linux
+        if: matrix.manifest == 'izanagi-agent/Cargo.toml'
+        shell: bash
+        run: |
+          agent_test=$(cargo test --locked --manifest-path izanagi-agent/Cargo.toml --no-run --message-format=json | python3 -c 'import sys,json; artifacts=[json.loads(line) for line in sys.stdin if line.startswith("{")]; print(next(a["executable"] for a in artifacts if a.get("reason")=="compiler-artifact" and a.get("profile",{}).get("test") and a.get("executable") and a.get("target",{}).get("name")=="izanagi-agent"))')
+          sudo useradd --no-create-home --home-dir /home/izanagi --shell /bin/bash izanagi
+          sudo install -d -m 0755 /workspace
+          credential_fixture=$(mktemp -d /tmp/izanagi-credentials.XXXXXX)
+          trap 'rm -rf -- "$credential_fixture"' EXIT
+          chmod 0755 "$credential_fixture"
+          sudo install -m 0755 "$agent_test" "$credential_fixture/agent-test"
+          sudo "$credential_fixture/agent-test" privilege_tests::privileged_ --ignored --nocapture --test-threads=1
 
   agent-ebpf:
     name: Check agent eBPF feature
