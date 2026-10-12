@@ -126,6 +126,8 @@ unconfigured/mismatched agents, unreachable upstreams and released listeners.
 
 CI's Linux agent component job runs `privilege_tests::privileged_` explicitly as
 root in a disposable runner, with a fixture `izanagi` account and `/workspace`.
+CI installs the test executable in a dedicated traversable temporary directory;
+the runner's private source/build directory permissions remain unchanged.
 The tests are ignored in ordinary non-root component suites. Never run them in a
 production agent process: they deliberately seed groups `0` and `12345` in their
 own test process.
