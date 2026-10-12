@@ -20,8 +20,7 @@ chrono = "0.4"
 clap = { version = "4", features = ["derive"] }
 rcgen = { version = "0.14", features = ["pem"] }
 rustls = "0.23"
-rustls-pemfile = "2"
-rustls-pki-types = "1"
+rustls-pki-types = "1.9"
 time = "0.3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "time", "signal", "sync"] }
 tokio-rustls = "0.26"

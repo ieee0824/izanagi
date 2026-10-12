@@ -508,10 +508,10 @@ mod tests {
 
         // CA を信頼する rustls クライアント
         let mut root_store = rustls::RootCertStore::empty();
-        let mut cursor = std::io::Cursor::new(ca.cert_pem().as_bytes());
-        let certs: Vec<_> = rustls_pemfile::certs(&mut cursor)
-            .filter_map(|r| r.ok())
-            .collect();
+        use rustls_pki_types::pem::PemObject;
+        let certs = rustls_pki_types::CertificateDer::pem_slice_iter(ca.cert_pem().as_bytes())
+            .collect::<Result<Vec<_>, _>>()
+            .expect("generated CA certificate must contain valid PEM");
         for cert in &certs {
             root_store.add(cert.clone()).unwrap();
         }
