@@ -257,13 +257,36 @@ impl Default for DetectSection {
 
 // --- Validation ---
 
-/// 共有が禁止されている機密パスのプレフィックス。
-const SENSITIVE_PATH_PREFIXES: &[&str] = &["~/.ssh", "~/.aws", "~/.gnupg", "~/.config/gh"];
+/// 共有対象と祖先・子孫の重なりを拒否する機密パス。
+const SENSITIVE_SHARE_PATHS: &[&str] = &["~/.ssh", "~/.aws", "~/.gnupg", "~/.config/gh"];
 
 /// 共有が禁止されているシステムディレクトリ。
 /// これらのパスそのものを共有対象にすることを禁止する。
 const FORBIDDEN_SHARE_PATHS: &[&str] = &[
-    "/etc", "/var", "/home", "/root", "/usr", "/bin", "/sbin", "/lib", "/sys", "/proc",
+    "/",
+    "/etc",
+    "/var",
+    "/home",
+    "/root",
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/lib",
+    "/lib64",
+    "/sys",
+    "/proc",
+    "/dev",
+    "/boot",
+    "/opt",
+    "/Users",
+    "/private",
+    "/System",
+    "/Library",
+    "/Applications",
+    "/Volumes",
+    "/System/Volumes",
+    "/System/Volumes/Data",
+    "/System/Volumes/Data/System",
 ];
 
 impl Config {
@@ -421,32 +444,7 @@ impl Config {
             // 存在するパスはシンボリックリンクを解決して実パスを取得する
             let resolved = resolve_share_path(path, &normalized)?;
 
-            // システムディレクトリの共有を禁止（正規化後のパスで判定）
-            // resolved がシステムディレクトリそのものである場合のみ拒否。
-            // /home/user/project のような子孫パスは許可する。
-            let resolved_path = Path::new(&resolved);
-            for forbidden in FORBIDDEN_SHARE_PATHS {
-                let forbidden_path = Path::new(forbidden);
-                if resolved_path == forbidden_path {
-                    bail!(
-                        "share.paths にシステムディレクトリ \"{}\" を指定することはできません",
-                        path
-                    );
-                }
-            }
-
-            // 機密パスとの重複チェック（正規化後・シンボリックリンク解決後のパスで判定）
-            for sensitive in SENSITIVE_PATH_PREFIXES {
-                let sensitive_expanded = crate::util::expand_tilde(sensitive)?;
-                if normalized.starts_with(&sensitive_expanded)
-                    || resolved.starts_with(&sensitive_expanded)
-                {
-                    bail!(
-                        "share.paths に機密パス \"{}\" を指定することはできません",
-                        path
-                    );
-                }
-            }
+            validate_share_boundaries(path, Path::new(&normalized), Path::new(&resolved))?;
 
             if let Some(warning) = missing_share_path_warning(path) {
                 warnings.push(warning);
@@ -459,16 +457,17 @@ impl Config {
     /// Reject settings that can be replaced through a shared directory, including symlinks.
     pub fn validate_config_location(&self, config_path: &Path) -> anyhow::Result<()> {
         let configured_path = absolute_path(config_path)?;
-        let containing_dir = configured_path
-            .parent()
-            .context("configuration path has no parent")?
-            .canonicalize()?;
+        let containing_dir = canonical_boundary_path(
+            configured_path
+                .parent()
+                .context("configuration path has no parent")?,
+        )?;
         let configured_path = containing_dir.join(
             configured_path
                 .file_name()
                 .context("configuration path has no file name")?,
         );
-        let resolved_path = std::fs::canonicalize(config_path)?;
+        let resolved_path = canonical_boundary_path(config_path)?;
         for share in &self.share.paths {
             validate_share_path_shape(share)?;
             let normalized = normalize_share_path(share)?;
@@ -823,20 +822,167 @@ fn validate_share_path_shape(path: &str) -> anyhow::Result<()> {
 }
 
 fn resolve_share_path(path: &str, normalized: &str) -> anyhow::Result<String> {
-    Ok({
-        let normalized_path = Path::new(&normalized);
-        if normalized_path.exists() {
-            let canon = std::fs::canonicalize(normalized_path).with_context(|| {
-                format!(
-                    "share.paths のパス \"{}\" のシンボリックリンク解決に失敗しました",
-                    path
-                )
-            })?;
-            canon.to_string_lossy().to_string()
-        } else {
-            normalized.to_owned()
+    resolve_existing_prefix(Path::new(normalized))
+        .with_context(|| {
+            format!(
+                "share.paths のパス \"{}\" のシンボリックリンク解決に失敗しました",
+                path
+            )
+        })
+        .map(|resolved| resolved.to_string_lossy().into_owned())
+}
+
+/// Resolve the existing prefix too, so missing children below an alias stay protected.
+fn resolve_existing_prefix(path: &Path) -> anyhow::Result<PathBuf> {
+    let absolute = absolute_path(path)?;
+    let mut ancestor = absolute.as_path();
+    let mut missing = Vec::new();
+    loop {
+        match canonical_boundary_path(ancestor) {
+            Ok(mut resolved) => {
+                append_missing_components(&mut resolved, &missing)?;
+                return Ok(resolved);
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                // An existing dangling symlink must fail closed, not become a lexical path.
+                if std::fs::symlink_metadata(ancestor).is_ok() {
+                    return Err(error.into());
+                }
+                missing.push(
+                    ancestor
+                        .file_name()
+                        .context("path has no resolvable ancestor")?,
+                );
+                ancestor = ancestor
+                    .parent()
+                    .context("path has no resolvable ancestor")?;
+            }
+            Err(error) => return Err(error.into()),
         }
-    })
+    }
+}
+
+/// Use the filesystem's actual names on macOS: realpath leaves case/firmlink aliases intact.
+fn canonical_boundary_path(path: &Path) -> std::io::Result<PathBuf> {
+    let canonical = std::fs::canonicalize(path)?;
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::{ffi::OsStrExt, fs::OpenOptionsExt};
+        // O_EVTONLY obtains a descriptor without reading file contents.
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_EVTONLY)
+            .open(canonical)?;
+        let mut bytes = [0u8; libc::PATH_MAX as usize];
+        // SAFETY: F_GETPATH writes at most PATH_MAX bytes to the provided live buffer.
+        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, bytes.as_mut_ptr()) } == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let length = bytes
+            .iter()
+            .position(|byte| *byte == 0)
+            .ok_or_else(|| std::io::Error::other("filesystem returned an unterminated path"))?;
+        Ok(PathBuf::from(std::ffi::OsStr::from_bytes(&bytes[..length])))
+    }
+    #[cfg(not(target_os = "macos"))]
+    Ok(canonical)
+}
+
+fn append_missing_components(
+    resolved: &mut PathBuf,
+    missing: &[&std::ffi::OsStr],
+) -> anyhow::Result<()> {
+    #[cfg(target_os = "macos")]
+    if !missing.is_empty() {
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::ffi::CString::new(resolved.as_os_str().as_bytes())?;
+        // SAFETY: path is a live, NUL-terminated pathname; pathconf does not retain it.
+        let case_sensitive = unsafe { libc::pathconf(path.as_ptr(), libc::_PC_CASE_SENSITIVE) };
+        anyhow::ensure!(
+            case_sensitive == 0 || case_sensitive == 1,
+            "filesystem case sensitivity could not be determined"
+        );
+        if case_sensitive == 0 {
+            // Protected directory names are ASCII; preserve Unicode bytes while folding ASCII aliases.
+            for component in missing.iter().rev() {
+                resolved.push(std::ffi::OsStr::from_bytes(
+                    &component.as_bytes().to_ascii_lowercase(),
+                ));
+            }
+            return Ok(());
+        }
+    }
+    for component in missing.iter().rev() {
+        resolved.push(component);
+    }
+    Ok(())
+}
+
+fn validate_share_boundaries(
+    original: &str,
+    normalized: &Path,
+    resolved: &Path,
+) -> anyhow::Result<()> {
+    let normalized = absolute_path(normalized)?;
+    let shares = [normalized.as_path(), resolved];
+    validate_system_share(original, &shares)?;
+    let home_path = absolute_path(Path::new(&crate::util::expand_tilde("~")?))?;
+    let resolved_home = resolve_existing_prefix(&home_path)?;
+    if shares
+        .iter()
+        .any(|share| home_path.starts_with(share) || resolved_home.starts_with(share))
+    {
+        bail!(
+            "share.paths にホームディレクトリを含む \"{}\" を指定することはできません",
+            original
+        );
+    }
+    for sensitive in SENSITIVE_SHARE_PATHS {
+        let sensitive = PathBuf::from(crate::util::expand_tilde(sensitive)?);
+        validate_sensitive_share(original, &shares, &sensitive)?;
+    }
+    Ok(())
+}
+
+fn validate_system_share(original: &str, shares: &[&Path]) -> anyhow::Result<()> {
+    for forbidden in FORBIDDEN_SHARE_PATHS {
+        let forbidden = Path::new(forbidden);
+        let canonical = resolve_existing_prefix(forbidden)?;
+        if shares
+            .iter()
+            .any(|share| *share == forbidden || *share == canonical)
+        {
+            bail!(
+                "share.paths にシステムディレクトリ \"{}\" を指定することはできません",
+                original
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_sensitive_share(
+    original: &str,
+    shares: &[&Path],
+    sensitive: &Path,
+) -> anyhow::Result<()> {
+    let canonical = resolve_existing_prefix(sensitive)
+        .with_context(|| format!("機密パス \"{}\" の解決に失敗しました", sensitive.display()))?;
+    if shares
+        .iter()
+        .any(|share| paths_overlap(share, sensitive) || paths_overlap(share, &canonical))
+    {
+        bail!(
+            "share.paths に機密パスと重なる \"{}\" を指定することはできません",
+            original
+        );
+    }
+    Ok(())
+}
+
+fn paths_overlap(left: &Path, right: &Path) -> bool {
+    left.starts_with(right) || right.starts_with(left)
 }
 
 #[cfg(test)]

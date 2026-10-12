@@ -1016,3 +1016,34 @@ fn dns_proxy_rejects_unreachable_or_ambiguous_endpoints() {
     config.sandbox.backend = SandboxBackend::Native;
     assert!(config.validate_for_platform(true, false).is_err());
 }
+
+#[test]
+fn sensitive_directory_alias_protects_its_target_and_missing_descendants() {
+    let directory = tempfile::tempdir().unwrap();
+    let external = tempfile::tempdir().unwrap();
+    let target = external.path().join("keys");
+    std::fs::create_dir(&target).unwrap();
+    let sensitive = directory.path().join(".ssh");
+    std::os::unix::fs::symlink(&target, &sensitive).unwrap();
+    for share in [
+        external.path().to_owned(),
+        target.clone(),
+        target.join("missing-key"),
+    ] {
+        let resolved = resolve_existing_prefix(&share).unwrap();
+        assert!(validate_sensitive_share("fixture", &[&share, &resolved], &sensitive).is_err());
+    }
+    let sibling = external.path().join("keys-backup");
+    let resolved = resolve_existing_prefix(&sibling).unwrap();
+    assert!(validate_sensitive_share("fixture", &[&sibling, &resolved], &sensitive).is_ok());
+}
+
+#[test]
+fn dangling_share_alias_and_missing_children_fail_closed() {
+    let directory = tempfile::tempdir().unwrap();
+    let alias = directory.path().join("dangling");
+    std::os::unix::fs::symlink(directory.path().join("missing-target"), &alias).unwrap();
+    for share in [alias.clone(), alias.join("missing-child")] {
+        assert!(resolve_existing_prefix(&share).is_err());
+    }
+}

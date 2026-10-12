@@ -131,3 +131,48 @@ fn relative_share_is_resolved_from_current_directory() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("share.paths"));
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn apfs_data_volume_paths_cannot_bypass_shared_config_guard() {
+    let directory = temporary();
+    let root = directory.canonicalize().unwrap();
+    let shared = root.join("shared");
+    std::fs::create_dir(&shared).unwrap();
+    let config_path = shared.join("izanagi.toml");
+    let data_shared = PathBuf::from("/System/Volumes/Data").join(shared.strip_prefix("/").unwrap());
+    let data_config = data_shared.join("izanagi.toml");
+    let mut config = izanagi::config::Config::default();
+    for share in [&shared, &data_shared] {
+        config.share.paths = vec![share.to_str().unwrap().to_owned()];
+        std::fs::write(&config_path, toml::to_string(&config).unwrap()).unwrap();
+        for path in [&config_path, &data_config] {
+            assert!(
+                izanagi::config::Config::load(path).is_err(),
+                "shared config accepted via {}",
+                path.display()
+            );
+        }
+    }
+    let trusted = root.join("trusted.toml");
+    std::fs::write(&trusted, toml::to_string(&config).unwrap()).unwrap();
+    assert!(izanagi::config::Config::load(&trusted).is_ok());
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn case_aliases_cannot_bypass_shared_config_guard() {
+    let directory = temporary();
+    let shared = directory.join("Shared");
+    std::fs::create_dir(&shared).unwrap();
+    let config_path = shared.join("izanagi.toml");
+    let alias = directory.join("sHARED");
+    if alias.exists() {
+        let mut config = izanagi::config::Config::default();
+        config.share.paths = vec![alias.to_str().unwrap().to_owned()];
+        std::fs::write(&config_path, toml::to_string(&config).unwrap()).unwrap();
+        assert!(izanagi::config::Config::load(&config_path).is_err());
+    }
+    std::fs::remove_dir_all(directory).unwrap();
+}
