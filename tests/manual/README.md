@@ -121,3 +121,23 @@ existing frames retain their encoding. DNS-enabled startup rejects an older gues
 that cannot confirm the configured relay, without needing to add `cat` to a command
 allowlist. Test the root status regression and DNS startup failure regression for
 unconfigured/mismatched agents, unreachable upstreams and released listeners.
+
+## Agent supplementary-group regression (#67)
+
+CI's Linux agent component job runs `privilege_tests::privileged_` explicitly as
+root in a disposable runner, with a fixture `izanagi` account and `/workspace`.
+The tests are ignored in ordinary non-root component suites. Never run them in a
+production agent process: they deliberately seed groups `0` and `12345` in their
+own test process.
+
+The authenticated Exec and PTY Shell paths execute a reporter under the target
+UID/GID. It checks `getgroups()` directly, requiring no inherited supplementary
+groups and the target primary GID. A separate subprocess regression makes each
+of the three identity transitions fail and requires spawn to refuse exec.
+The parent retains its original seeded groups after both real paths finish.
+
+For a local Linux root fixture, build the agent test executable with
+`cargo test --locked --manifest-path izanagi-agent/Cargo.toml --no-run`, then run
+that executable with `privilege_tests::privileged_ --ignored --nocapture
+--test-threads=1`. The lookup uses `getpwnam_r` before fork; the child only performs
+credential syscalls, session/chdir setup, dumpability setup and exec.
