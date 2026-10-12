@@ -24,9 +24,12 @@
 mod admission;
 mod config;
 mod connection;
+mod credentials;
 mod crypto;
 mod dns;
 mod exec;
+#[cfg(all(test, target_os = "linux"))]
+mod privilege_tests;
 mod security;
 mod shell;
 mod sidecar;

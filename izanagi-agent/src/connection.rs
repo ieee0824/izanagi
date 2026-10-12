@@ -239,7 +239,7 @@ where
                     stderr,
                 })
                 .await?;
-                eprintln!("exec completed with exit code {}", exit_code);
+                eprintln!("exec completed");
             }
             Err(error) => {
                 eprintln!("exec error: {}", sanitize_anyhow_error(&error));
@@ -483,7 +483,7 @@ enum ShellLaunch {
 fn prepare_shell(rows: u16, cols: u16) -> anyhow::Result<ShellLaunch> {
     use std::os::unix::io::FromRawFd;
     // All user lookup, environment validation and allocation happen before fork.
-    let Some((uid, gid, home_dir)) = lookup_shell_user()? else {
+    let Some((uid, gid, home_dir)) = crate::credentials::lookup_user(EXEC_USER)? else {
         return Ok(ShellLaunch::Rejected(format!(
             "user '{}' not found",
             EXEC_USER
@@ -501,42 +501,6 @@ fn prepare_shell(rows: u16, cols: u16) -> anyhow::Result<ShellLaunch> {
     let child = ShellChild::new(pid);
     let master = unsafe { std::fs::File::from_raw_fd(master_fd) };
     Ok(ShellLaunch::Ready(master, child))
-}
-
-fn lookup_shell_user() -> anyhow::Result<Option<(libc::uid_t, libc::gid_t, String)>> {
-    // getpwnam_r is thread-safe; no passwd pointer crosses an await or a fork.
-    let c_user =
-        std::ffi::CString::new(EXEC_USER).map_err(|_| anyhow::anyhow!("invalid EXEC_USER"))?;
-    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
-    let mut buf_size: usize = 1024;
-    let mut found = None;
-    loop {
-        let mut buf = vec![0u8; buf_size];
-        let mut result: *mut libc::passwd = std::ptr::null_mut();
-        let ret = unsafe {
-            libc::getpwnam_r(
-                c_user.as_ptr(),
-                &mut pwd,
-                buf.as_mut_ptr() as *mut libc::c_char,
-                buf.len(),
-                &mut result,
-            )
-        };
-        if ret == 0 && !result.is_null() {
-            let home = unsafe { std::ffi::CStr::from_ptr(pwd.pw_dir) }
-                .to_str()
-                .unwrap_or("/home/izanagi")
-                .to_owned();
-            found = Some((pwd.pw_uid, pwd.pw_gid, home));
-            break;
-        } else if ret == libc::ERANGE && buf_size < 1_048_576 {
-            buf_size *= 2;
-            continue;
-        } else {
-            break;
-        }
-    }
-    Ok(found)
 }
 
 fn shell_environment(home_dir: &str) -> anyhow::Result<Vec<std::ffi::CString>> {
@@ -617,10 +581,7 @@ fn exec_shell_child(
 ) -> ! {
     // Post-fork: async-signal-safe libc calls only, without allocation or logging.
     unsafe {
-        if libc::setgid(gid) != 0 {
-            libc::_exit(126);
-        }
-        if libc::setuid(uid) != 0 {
+        if crate::credentials::drop_identity(uid, gid).is_err() {
             libc::_exit(126);
         }
 

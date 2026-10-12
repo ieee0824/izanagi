@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::sync::OnceLock;
 
 use anyhow::Result;
 use tokio::io::AsyncReadExt;
@@ -13,27 +12,6 @@ pub(crate) const EXEC_USER: &str = "izanagi";
 const EXEC_TIMEOUT_SECS: u64 = 300;
 
 use izanagi::exec_output::{MAX_OUTPUT_SIZE, truncate_output};
-
-/// EXEC_USER の存在チェック結果をキャッシュする。
-/// VM 内でユーザーが動的に追加・削除されることはないため、起動後1回だけチェックすれば十分。
-static EXEC_USER_EXISTS: OnceLock<bool> = OnceLock::new();
-
-/// EXEC_USER が存在するか確認し、結果をキャッシュする。
-async fn check_exec_user_exists() -> bool {
-    if let Some(&cached) = EXEC_USER_EXISTS.get() {
-        return cached;
-    }
-    let exists = tokio::process::Command::new("id")
-        .arg(EXEC_USER)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .await
-        .map(|s| s.success())
-        .unwrap_or(false);
-    let _ = EXEC_USER_EXISTS.set(exists);
-    exists
-}
 
 /// VM 内でコマンドを非特権ユーザーとして実行する。
 /// agent 自体は root で動作するが（eBPF に必要）、
@@ -52,24 +30,17 @@ pub(crate) async fn execute_command(
     // 危険な環境変数を除外
     let env = sanitize_env(env);
 
-    // EXEC_USER が存在するか確認（結果はキャッシュされる）
-    let use_su = check_exec_user_exists().await;
-
-    let mut child = spawn_exec(cmd, &env, use_su)?;
+    let mut child = spawn_exec(cmd, &env)?;
     collect_exec_output(&mut child, EXEC_TIMEOUT_SECS).await
 }
 
-fn spawn_exec(
-    cmd: &[String],
-    env: &HashMap<String, String>,
-    user_exists: bool,
-) -> Result<tokio::process::Child> {
-    if !user_exists {
+fn spawn_exec(cmd: &[String], env: &HashMap<String, String>) -> Result<tokio::process::Child> {
+    let Some((uid, gid, _)) = crate::credentials::lookup_user(EXEC_USER)? else {
         anyhow::bail!(
             "execution user '{}' not found. Refusing to execute as root.",
             EXEC_USER
         );
-    }
+    };
     // 非特権ユーザーとしてコマンドを実行。
     // su を使わず pre_exec 内で直接 setgid/setuid + prctl を行うことで、
     // exec 後も PR_SET_DUMPABLE=0 が維持され /proc/self/environ が保護される。
@@ -90,43 +61,34 @@ fn spawn_exec(
         .env("USER", EXEC_USER)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    configure_exec_credentials(&mut command);
+    configure_exec_credentials(&mut command, uid, gid);
     command.spawn().map_err(|e| sanitize_exec_error(&e))
 }
 
-fn configure_exec_credentials(command: &mut tokio::process::Command) {
+fn configure_exec_credentials(
+    command: &mut tokio::process::Command,
+    uid: libc::uid_t,
+    gid: libc::gid_t,
+) {
     #[cfg(unix)]
     {
         #[allow(unused_imports)]
         use std::os::unix::process::CommandExt;
-        let exec_user = EXEC_USER.to_string();
         unsafe {
-            command.pre_exec(move || drop_exec_privileges(&exec_user));
+            command.pre_exec(move || drop_exec_privileges(uid, gid));
         }
     }
 }
 
 #[cfg(unix)]
-fn drop_exec_privileges(exec_user: &str) -> std::io::Result<()> {
-    // Preserve the child setup order: session, group, user, then dumpability.
+fn drop_exec_privileges(uid: libc::uid_t, gid: libc::gid_t) -> std::io::Result<()> {
+    // Preserve the child setup order: session, supplementary groups, primary group, user, then dumpability.
     unsafe {
         // 新しいプロセスグループを作成（タイムアウト時に孫プロセスも含めて kill するため）
         if libc::setsid() == -1 {
             return Err(std::io::Error::last_os_error());
         }
-        // 非特権ユーザーに権限降格
-        let c_user = std::ffi::CString::new(exec_user)
-            .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
-        let pw = libc::getpwnam(c_user.as_ptr());
-        if pw.is_null() {
-            return Err(std::io::Error::from_raw_os_error(libc::ENOENT));
-        }
-        if libc::setgid((*pw).pw_gid) != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        if libc::setuid((*pw).pw_uid) != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
+        crate::credentials::drop_identity(uid, gid)?;
         // /proc/self/environ のパーミッションを制限。
         // setuid 後かつ exec 前に設定するため、exec される /bin/sh と
         // その子プロセス (node 等) でも dumpable=0 が維持される。
