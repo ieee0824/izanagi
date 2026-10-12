@@ -246,7 +246,7 @@ impl Engine {
         &mut self,
         trace_filter: &TraceFilter,
     ) -> anyhow::Result<tokio::sync::mpsc::Receiver<Arc<SyscallEvent>>> {
-        // QEMU バックエンド使用時、sandbox のセッショントークン・ポート・シークレットを tracer に渡す。
+        // QEMU/コンテナのセッション認証情報を tracer に渡す。
         // Sandbox の up() 後にトークンとポートが確定するため、ここで設定する。
         if let Some(token) = self.sandbox.session_token() {
             let token_hash = sha256_hex(token);
@@ -257,7 +257,12 @@ impl Engine {
         }
         // VmAgentTracer は agent と同じ HMAC シークレットで認証する必要がある。
         // シークレットの読み込みに失敗した場合はエラーを伝播し、認証なしで tracer を起動しない。
-        match crate::protocol::load_shared_secret_from_env() {
+        match self
+            .sandbox
+            .agent_secret()
+            .map(|key| Ok(Some(key.to_vec())))
+            .unwrap_or_else(crate::protocol::load_shared_secret_from_env)
+        {
             Ok(Some(auth_key)) => self.tracer.set_secret(auth_key),
             Ok(None) => {}
             Err(error) => {
@@ -473,12 +478,16 @@ mod tests {
 
     struct MockSandbox {
         status: SandboxStatus,
+        auth_key: Option<Vec<u8>>,
+        port: Option<u16>,
     }
 
     impl MockSandbox {
         fn new() -> Self {
             Self {
                 status: SandboxStatus::Stopped,
+                auth_key: None,
+                port: None,
             }
         }
     }
@@ -513,6 +522,12 @@ mod tests {
 
         fn status(&self) -> SandboxStatus {
             self.status
+        }
+        fn agent_secret(&self) -> Option<&[u8]> {
+            self.auth_key.as_deref()
+        }
+        fn agent_host_port(&self) -> Option<u16> {
+            self.port
         }
     }
 
@@ -599,6 +614,51 @@ mod tests {
             categories: vec![],
             pids: None,
         }
+    }
+
+    struct SessionAuthTracer {
+        authenticated: std::sync::atomic::AtomicBool,
+        port: std::sync::atomic::AtomicU16,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::tracer::Tracer for SessionAuthTracer {
+        async fn start(
+            &self,
+            _: &TraceFilter,
+        ) -> anyhow::Result<mpsc::Receiver<Arc<SyscallEvent>>> {
+            assert!(self.authenticated.load(Ordering::SeqCst));
+            assert_eq!(self.port.load(Ordering::SeqCst), 19001);
+            Ok(mpsc::channel(1).1)
+        }
+        async fn stop(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn set_secret(&self, key: Vec<u8>) {
+            self.authenticated
+                .store(key == b"fixture-container-session", Ordering::SeqCst);
+        }
+        fn set_agent_port(&self, port: u16) {
+            self.port.store(port, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn monitoring_uses_sandbox_session_key_and_forwarded_port() {
+        let sandbox = MockSandbox {
+            auth_key: Some(b"fixture-container-session".to_vec()),
+            port: Some(19001),
+            ..MockSandbox::new()
+        };
+        let tracer = SessionAuthTracer {
+            authenticated: AtomicBool::new(false),
+            port: std::sync::atomic::AtomicU16::new(0),
+        };
+        let mut engine = Engine::new(Box::new(sandbox), Box::new(tracer), Detector::new(vec![]));
+        engine
+            .start_monitoring_source(&dummy_trace_filter())
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

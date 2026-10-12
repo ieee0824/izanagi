@@ -89,7 +89,8 @@ fn config_display_authentication_precedes_verbose_output_and_never_prints_creden
         rand::random::<u64>()
     ));
     let mut config = Config::default();
-    config.sandbox.backend = izanagi::config::SandboxBackend::Native;
+    config.sandbox.backend = izanagi::config::SandboxBackend::Qemu;
+    config.sandbox.qemu = Some(Default::default());
     config.sandbox.tracer = izanagi::config::TracerBackend::None;
     config.sandbox.require_auth = Some(true);
     std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
@@ -126,4 +127,32 @@ fn config_display_authentication_precedes_verbose_output_and_never_prints_creden
     assert!(String::from_utf8_lossy(&accepted.stderr).contains("設定ファイル:"));
     assert!(!String::from_utf8_lossy(&accepted.stdout).contains("CANARY-AUTH"));
     assert!(!String::from_utf8_lossy(&accepted.stderr).contains("CANARY-AUTH"));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn container_config_does_not_require_or_read_host_long_term_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let mut config = Config::default();
+    config.sandbox.tracer = izanagi::config::TracerBackend::None;
+    for backend in [
+        izanagi::config::SandboxBackend::Native,
+        izanagi::config::SandboxBackend::AppleContainer,
+    ] {
+        config.sandbox.backend = backend;
+        std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_izanagi"))
+            .arg("-c")
+            .arg(&path)
+            .args(["config", "show"])
+            .env_remove("IZANAGI_SHARED_SECRET")
+            .env(
+                "IZANAGI_SECRET_FILE",
+                dir.path().join("nonexistent-host-key"),
+            )
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+    }
 }

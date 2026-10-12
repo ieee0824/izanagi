@@ -29,12 +29,15 @@ pub enum SessionBackend {
     /// Apple Container バックエンド。
     #[serde(rename = "apple-container")]
     AppleContainer {
-        /// コンテナ名。`container exec` で使用。
+        /// コンテナ名。管理・診断で使用。
         container_name: String,
         /// イメージ名。
         image: String,
-        /// マウントポイント。exec/shell の -w オプションに使用。
+        /// 共有マウントポイント。
         mount_point: String,
+        /// 起動プロセスが所有する、使い捨て認証ファイルへの参照。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth: Option<ContainerSessionAuth>,
     },
     /// QEMU バックエンド。
     #[serde(rename = "qemu")]
@@ -46,6 +49,41 @@ pub enum SessionBackend {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         token_hash: Option<String>,
     },
+}
+
+/// Container credentials are kept out of the session JSON; only their private path is persisted.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ContainerSessionAuth {
+    pub host_port: u16,
+    pub secret_file: PathBuf,
+}
+
+impl SessionBackend {
+    pub async fn connect_agent(&self) -> anyhow::Result<crate::agent_session::AgentClient> {
+        let (port, secret, token_hash) = match self {
+            Self::AppleContainer { auth, .. } => {
+                let auth = auth
+                    .as_ref()
+                    .context("コンテナの認証情報がありません。セッションを再起動してください")?;
+                (
+                    auth.host_port,
+                    Some(crate::protocol::load_shared_secret_from_file(
+                        &auth.secret_file,
+                    )?),
+                    None,
+                )
+            }
+            Self::Qemu {
+                host_port,
+                token_hash,
+            } => (
+                *host_port,
+                crate::protocol::load_shared_secret_from_env()?,
+                token_hash.clone(),
+            ),
+        };
+        crate::agent_session::connect(port, secret, token_hash).await
+    }
 }
 
 /// セッションファイルのパスを返す。
@@ -142,6 +180,16 @@ mod tests {
         std::env::temp_dir().join(format!("izanagi_session_test_{}", id))
     }
 
+    #[tokio::test]
+    async fn legacy_container_session_requires_restart_instead_of_runtime_exec() {
+        let backend: SessionBackend = serde_json::from_str(r#"{"type":"apple-container","container_name":"old","image":"image","mount_point":"/workspace"}"#).unwrap();
+        let error = match backend.connect_agent().await {
+            Ok(_) => panic!("legacy session unexpectedly authenticated"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("再起動"));
+    }
+
     #[test]
     fn save_and_load_apple_container_session() {
         let dir = test_dir();
@@ -152,6 +200,7 @@ mod tests {
                 container_name: "izanagi-abc123".to_string(),
                 image: "izanagi-vm".to_string(),
                 mount_point: "/workspace".to_string(),
+                auth: None,
             },
             pid: 12345,
             started_at: 1700000000,

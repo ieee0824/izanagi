@@ -689,6 +689,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "smallvec",
+ "tempfile",
  "tokio",
  "toml",
  "zeroize",

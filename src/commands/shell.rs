@@ -1,7 +1,5 @@
-use anyhow::Context;
 use izanagi::config::Config;
-use izanagi::protocol::load_shared_secret_from_env;
-use izanagi::session::{self, Session, SessionBackend};
+use izanagi::session::{self, Session};
 
 use super::{acquire_instance_lock, izanagi_dir, start_engine, stop_engine};
 
@@ -39,56 +37,22 @@ pub async fn cmd_shell(config: &Config) -> anyhow::Result<u8> {
 
 /// up 中のセッションに接続してシェルを起動する。
 async fn shell_on_session(sess: &Session) -> anyhow::Result<u8> {
-    match &sess.backend {
-        SessionBackend::AppleContainer {
-            container_name,
-            mount_point,
-            ..
-        } => {
-            let args =
-                izanagi::apple_container_sandbox::build_shell_args(container_name, mount_point);
-
-            let status = tokio::process::Command::new("container")
-                .args(&args)
-                .stdin(std::process::Stdio::inherit())
-                .stdout(std::process::Stdio::inherit())
-                .stderr(std::process::Stdio::inherit())
-                .status()
-                .await
-                .context("container exec -it の実行に失敗")?;
-
-            Ok(status
-                .code()
-                .and_then(|c| u8::try_from(c).ok())
-                .unwrap_or(1))
-        }
-        SessionBackend::Qemu {
-            host_port,
-            token_hash,
-        } => qemu_interactive_shell(*host_port, token_hash.as_deref()).await,
-    }
-}
-
-/// QEMU セッションに接続して対話的シェルを実行する。
-async fn qemu_interactive_shell(host_port: u16, token_hash: Option<&str>) -> anyhow::Result<u8> {
-    use tokio::net::TcpStream;
-
-    let addr = format!("127.0.0.1:{}", host_port);
-    let stream = TcpStream::connect(&addr)
-        .await
-        .context("agent への接続に失敗")?;
-    let (reader, writer) = tokio::io::split(stream);
-
-    let secret = load_shared_secret_from_env()?;
-    let mut client = izanagi::protocol_client::ProtocolClient::new(reader, writer, secret);
-
-    // Hello ハンドシェイク + Ready 待ち
-    client
-        .handshake_and_wait_ready(token_hash.map(|s| s.to_string()))
-        .await?;
-
+    let mut client = sess.backend.connect_agent().await?;
     let code = izanagi::terminal_shell::interactive_shell(&mut client).await?;
     Ok(code.try_into().unwrap_or(1))
+}
+
+#[cfg(test)]
+async fn qemu_interactive_shell(host_port: u16, token_hash: Option<&str>) -> anyhow::Result<u8> {
+    let sess = Session {
+        backend: izanagi::session::SessionBackend::Qemu {
+            host_port,
+            token_hash: token_hash.map(str::to_string),
+        },
+        pid: 0,
+        started_at: 0,
+    };
+    shell_on_session(&sess).await
 }
 
 #[cfg(test)]
