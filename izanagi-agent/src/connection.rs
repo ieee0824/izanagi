@@ -239,7 +239,7 @@ where
                     stderr,
                 })
                 .await?;
-                eprintln!("exec completed with exit code {}", exit_code);
+                eprintln!("exec completed");
             }
             Err(error) => {
                 eprintln!("exec error: {}", sanitize_anyhow_error(&error));
