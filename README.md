@@ -293,12 +293,12 @@ allowed_hosts = [
 # known_processes = ["node", "npm", "cargo"]  # 未指定時はデフォルトベースラインを使用
 
 [dns_proxy]
-enabled = true
-listen = "127.0.0.1:15353"       # DNS プロキシのリッスンアドレス
+enabled = false                # 有効化する際は下記「サンドボックス DNS 統合」を参照
+listen = "127.0.0.1:15353"       # QEMU 用のホスト listen
 
 # [sandbox.apple_container]
 # image = "izanagi-vm"
-# network = "none"               # ネットワーク完全遮断（現在未サポート、dns_proxy 推奨）
+# network = "none"               # ネットワーク完全遮断（現在未サポート）
 ```
 
 ## バックエンド自動選択
@@ -379,9 +379,15 @@ enabled = true
 listen = "127.0.0.1:15353"
 ```
 
-`izanagi up` 時にサンドボックスの DNS をプロキシに向ける:
-- **Apple Container**: `container run --dns <ip>`
-- **QEMU**: `-netdev user,...,dns=<ip>`
+ゲスト agent が `127.0.0.1:53` の UDP/TCP リレーを起動し、ホストの `listen` の **IP とポート両方**へ転送します。ゲストの `/etc/resolv.conf` はこのリレーだけを使います。NSS の `hosts` も `files dns` に設定して systemd-resolved/mDNS への別経路を外し、systemd 管理 resolver への symlink は guest 内で通常ファイルに置き換えます。
+
+- **QEMU**: 上記のホスト loopback はゲストから `10.0.2.2:15353` として到達します。`sandbox.qemu.restrict_network = false` を明示してください。`dns=` は転送に使用しません。
+- **Apple Container**: `listen` にゲストから到達できるホストの IP（例: `192.168.1.2:15353`）を指定してください。ホストの loopback、未指定アドレス (`0.0.0.0`)、ポートなしの設定は拒否します。必要なホストファイアウォール許可はゲストからの UDP/TCP のみに限定してください。
+- **native Linux**: 自動 DNS 統合は未対応のため、有効化すると起動エラーになります。
+
+host と guest agent/image を同じリビジョンで更新してください。起動時に guest から両トランスポートでプロキシの応答を確認し、失敗時は agent を Ready にせず終了します。host も同じ認証・token handshake 内の読み取り専用 `DnsStatus` で resolver の設定を検証し、古い agent/image を拒否してサンドボックスを停止します。guest の resolver が書き換わった場合も agent を終了します。既存 v3 メッセージの形式は維持し、DNS 有効時だけ追加の status メッセージを使用します。起動確認の `izanagi-dns-probe.invalid` は通常の allowlist では `BLOCKED` として記録されます。
+
+DNS allowlist は名前解決のフィルタです。直接 IP 宛ての通信、独自 DNS/DoH を遮断するネットワークファイアウォールではありません。
 
 ## 検知ルール
 

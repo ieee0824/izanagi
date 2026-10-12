@@ -28,7 +28,7 @@ pub enum SandboxConfig {
         memory_mb: u32,
         image: String,
         share: ShareConfig,
-        /// DNS プロキシの IP アドレス（QEMU の -netdev dns= に渡す）。
+        /// ホスト DNS プロキシの IP:port（guest agent のリレーに渡す）。
         dns_proxy: Option<String>,
     },
     /// Linux Landlock ベースの軽量隔離。
@@ -37,7 +37,7 @@ pub enum SandboxConfig {
     AppleContainer {
         image: String,
         share: ShareConfig,
-        /// DNS プロキシの IP アドレス（container run --dns に渡す）。
+        /// ホスト DNS プロキシの到達可能な IP:port（guest agent に渡す）。
         dns_proxy: Option<String>,
         /// ネットワークモード（None でデフォルト = bridge）。
         network: Option<crate::config::ContainerNetworkMode>,
