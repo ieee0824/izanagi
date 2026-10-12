@@ -34,6 +34,11 @@ pub(crate) async fn execute_command(
     collect_exec_output(&mut child, EXEC_TIMEOUT_SECS).await
 }
 
+/// Host-selected shared directory for containers; QEMU retains its existing defaults.
+pub(crate) fn execution_workdir() -> Option<String> {
+    std::env::var("IZANAGI_WORKDIR").ok()
+}
+
 fn spawn_exec(cmd: &[String], env: &HashMap<String, String>) -> Result<tokio::process::Child> {
     let Some((uid, gid, _)) = crate::credentials::lookup_user(EXEC_USER)? else {
         anyhow::bail!(
@@ -61,6 +66,9 @@ fn spawn_exec(cmd: &[String], env: &HashMap<String, String>) -> Result<tokio::pr
         .env("USER", EXEC_USER)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    if let Some(workdir) = execution_workdir() {
+        command.current_dir(workdir);
+    }
     configure_exec_credentials(&mut command, uid, gid);
     command.spawn().map_err(|e| sanitize_exec_error(&e))
 }

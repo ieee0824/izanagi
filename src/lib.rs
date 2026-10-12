@@ -1,3 +1,4 @@
+pub mod agent_session;
 pub mod apple_container_sandbox;
 pub mod behavior;
 pub mod behavior_classifier;

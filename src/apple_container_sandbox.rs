@@ -12,68 +12,45 @@ use tokio::process::Command;
 
 use crate::sandbox::{ExecOutput, Sandbox, SandboxConfig, SandboxStatus, ShareConfig};
 
-/// env-file の RAII ガード。Drop 時にファイルを確実に削除する。
-/// パニック時やエラーパスでのクリーンアップ漏れを防止する。
-struct EnvFileGuard {
-    path: Option<PathBuf>,
+/// The private directory is mounted read-only under guest root's home.
+/// Keep it alive until shutdown so later CLI/MCP connections can read the session key.
+struct SessionCredentials {
+    directory: tempfile::TempDir,
+    auth_key: zeroize::Zeroizing<Vec<u8>>,
 }
 
-impl EnvFileGuard {
-    fn new(path: PathBuf) -> Self {
-        Self { path: Some(path) }
-    }
+const GUEST_SECRET_DIR: &str = "/root/.izanagi-auth";
+const SECRET_FILENAME: &str = "shared-secret";
 
-    fn path(&self) -> Option<&PathBuf> {
-        self.path.as_ref()
-    }
-}
-
-impl Drop for EnvFileGuard {
-    fn drop(&mut self) {
-        if let Some(ref path) = self.path
-            && let Err(e) = std::fs::remove_file(path)
-        {
-            // ファイルが既に削除されている場合は無視
-            if e.kind() != std::io::ErrorKind::NotFound {
-                eprintln!("警告: env-file の削除に失敗: {}: {}", path.display(), e);
-            }
-        }
-    }
-}
-
-/// シークレットを一時ファイルに書き出し、そのパスを返す。
-/// Unix ではファイルは 0600 パーミッションでアトミックに作成される。
-/// 非 Unix ではデフォルトパーミッションで作成される（Windows 未サポート）。
-fn write_secret_env_file(secret: &str) -> anyhow::Result<EnvFileGuard> {
-    // シークレットに制御文字（改行等）が含まれると env-file インジェクションになるため拒否
-    if secret.chars().any(|c| c.is_control()) {
-        anyhow::bail!("シークレットに制御文字を含むことはできません");
-    }
-
-    let random_suffix: String = (0..8)
-        .map(|_| format!("{:02x}", rand::random::<u8>()))
-        .collect();
-    let path = std::env::temp_dir().join(format!("izanagi-envfile-{}.tmp", random_suffix));
-    let content = format!("IZANAGI_SHARED_SECRET={}\n", secret);
-
-    #[cfg(unix)]
-    {
-        use std::fs::OpenOptions;
+impl SessionCredentials {
+    fn new() -> anyhow::Result<Self> {
         use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&path)?;
-        file.write_all(content.as_bytes())?;
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(&path, &content)?;
+        // rand's thread RNG is cryptographically secure; generate a fresh 256-bit key.
+        let auth_key =
+            zeroize::Zeroizing::new(hex::encode(rand::random::<[u8; 32]>()).into_bytes());
+        let directory = tempfile::Builder::new()
+            .prefix("izanagi-session-")
+            .tempdir()?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
+            options.mode(0o600);
+        }
+        options
+            .open(directory.path().join(SECRET_FILENAME))?
+            .write_all(&auth_key)?;
+        Ok(Self {
+            directory,
+            auth_key,
+        })
     }
 
-    Ok(EnvFileGuard::new(path))
+    fn path(&self) -> PathBuf {
+        self.directory.path().join(SECRET_FILENAME)
+    }
 }
 
 /// `container` CLI のデフォルトバイナリ名。
@@ -136,14 +113,13 @@ pub fn image_exists_in_output(output: &str, image: &str) -> bool {
 
 /// `container run` コマンドの引数を構築する。
 ///
-/// `env_file` が指定された場合、`--env-file <path>` でシークレットを渡す。
-/// `-e` による直接渡しは行わない。
+/// `secret_dir` が指定された場合、root 専用ファイルを read-only でマウントする。
 pub fn build_run_args(
     container_name: &str,
     image: &str,
     host_port: u16,
     share: &ShareConfig,
-    env_file: Option<&str>,
+    secret_dir: Option<&str>,
     dns_proxy: Option<&str>,
     network: Option<crate::config::ContainerNetworkMode>,
 ) -> Vec<String> {
@@ -157,7 +133,11 @@ pub fn build_run_args(
 
     push_container_port(&mut args, host_port, network);
 
-    push_container_agent_env(&mut args, env_file);
+    push_container_agent_env(&mut args, secret_dir);
+    args.extend([
+        "-e".into(),
+        format!("IZANAGI_WORKDIR={}", share.mount_point.display()),
+    ]);
 
     push_container_share(&mut args, share);
 
@@ -185,7 +165,7 @@ pub fn build_run_args(
     args
 }
 
-fn push_container_agent_env(args: &mut Vec<String>, env_file: Option<&str>) {
+fn push_container_agent_env(args: &mut Vec<String>, secret_dir: Option<&str>) {
     // コンテナ環境には fw_cfg がないため、トークン認証をスキップする。
     // コマンド実行はホスト側で HMAC 認証済みのため、agent 側は全コマンドを許可する。
     // ポートは 127.0.0.1 にバインドされるため、外部からの接続は不可。
@@ -196,9 +176,14 @@ fn push_container_agent_env(args: &mut Vec<String>, env_file: Option<&str>) {
         "IZANAGI_ALLOW_ALL_COMMANDS=1".to_string(),
     ]);
 
-    // シークレットは --env-file 経由で渡す
-    if let Some(path) = env_file {
-        args.extend_from_slice(&["--env-file".to_string(), path.to_string()]);
+    // Only a file path enters the container environment; the key never does.
+    if let Some(path) = secret_dir {
+        args.extend([
+            "--volume".into(),
+            format!("{path}:{GUEST_SECRET_DIR}:ro"),
+            "-e".into(),
+            format!("IZANAGI_SECRET_FILE={GUEST_SECRET_DIR}/{SECRET_FILENAME}"),
+        ]);
     }
 }
 
@@ -300,6 +285,7 @@ pub struct AppleContainerSandbox {
     mount_point: Option<String>,
     /// コンテナランタイムのバイナリ名 ("container" or "docker")。
     container_binary: String,
+    credentials: Option<SessionCredentials>,
 }
 
 struct ContainerBootSettings {
@@ -341,28 +327,11 @@ impl AppleContainerSandbox {
         })
     }
 
-    fn prepare_env_file(&mut self) -> anyhow::Result<Option<EnvFileGuard>> {
-        // シークレットを load_shared_secret_from_env で取得し、env-file に書き出す
-        // EnvFileGuard により、成功・失敗・パニック問わず env-file は確実に削除される
-        let shared_secret = crate::protocol::load_shared_secret_from_env()?
-            .map(|bytes| String::from_utf8_lossy(&bytes).to_string());
-        let env_file_guard = if let Some(ref secret) = shared_secret {
-            Some(write_secret_env_file(secret).map_err(|e| {
-                self.status = SandboxStatus::Stopped;
-                anyhow::anyhow!("Failed to write env-file: {}", e)
-            })?)
-        } else {
-            None
-        };
-
-        Ok(env_file_guard)
-    }
-
     fn boot_args(
         &self,
         container_name: &str,
         boot: &ContainerBootSettings,
-        env_file_guard: &Option<EnvFileGuard>,
+        credentials: &SessionCredentials,
     ) -> Vec<String> {
         // 複数 host_paths 指定時は警告（build_run_args は純関数なので呼び出し元で警告）
         if boot.share.host_paths.len() > 1 {
@@ -372,16 +341,13 @@ impl AppleContainerSandbox {
         }
 
         // container run コマンドを実行
-        let env_file_str = env_file_guard
-            .as_ref()
-            .and_then(|g| g.path())
-            .and_then(|p| p.to_str());
+        let secret_dir = credentials.directory.path().to_string_lossy();
         build_run_args(
             container_name,
             &boot.image,
             self.host_port,
             &boot.share,
-            env_file_str,
+            Some(&secret_dir),
             boot.dns_proxy.as_deref(),
             boot.network,
         )
@@ -395,13 +361,11 @@ impl AppleContainerSandbox {
             .output()
             .await
             .map_err(|e| {
-                // env_file_guard の Drop で env-file は自動削除される
                 self.status = SandboxStatus::Stopped;
                 anyhow::anyhow!("Failed to start container: {}", e)
             })?;
 
         if !output.status.success() {
-            // env_file_guard の Drop で env-file は自動削除される
             self.status = SandboxStatus::Stopped;
             let stderr = String::from_utf8_lossy(&output.stderr);
             anyhow::bail!("container run failed: {}", stderr);
@@ -438,6 +402,7 @@ impl AppleContainerSandbox {
             image: None,
             mount_point: None,
             container_binary: binary.to_string(),
+            credentials: None,
         })
     }
 
@@ -448,7 +413,7 @@ impl AppleContainerSandbox {
             let mut client = crate::protocol_client::ProtocolClient::new(
                 reader,
                 writer,
-                crate::protocol::load_shared_secret_from_env()?,
+                Some(self.session_secret()?.to_vec()),
             );
             client.handshake_and_wait_ready(None).await?;
             crate::guest_dns::verify_client(&mut client, endpoint.parse()?).await
@@ -456,28 +421,58 @@ impl AppleContainerSandbox {
         .await?
     }
 
-    /// Agent の Ready を待つ。TCP 接続でヘルスチェックを行う。
-    async fn wait_for_ready(&self) -> anyhow::Result<()> {
-        let timeout = tokio::time::Duration::from_secs(START_TIMEOUT_SECS);
-        let addr = format!("127.0.0.1:{}", self.host_port);
+    fn session_secret(&self) -> anyhow::Result<&[u8]> {
+        self.credentials
+            .as_ref()
+            .map(|credentials| credentials.auth_key.as_slice())
+            .ok_or_else(|| anyhow::anyhow!("container session credentials missing"))
+    }
 
-        tokio::time::timeout(timeout, async {
+    async fn connect_agent(&self) -> anyhow::Result<crate::agent_session::AgentClient> {
+        crate::agent_session::connect(self.host_port, Some(self.session_secret()?.to_vec()), None)
+            .await
+    }
+
+    /// Require a successful HMAC handshake before reporting the sandbox ready.
+    async fn wait_for_ready(&self) -> anyhow::Result<()> {
+        tokio::time::timeout(std::time::Duration::from_secs(START_TIMEOUT_SECS), async {
             loop {
-                match tokio::net::TcpStream::connect(&addr).await {
-                    Ok(_) => return Ok(()),
-                    Err(_) => {
-                        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                    }
+                if self.connect_agent().await.is_ok() {
+                    return Ok(());
                 }
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
         })
         .await
         .map_err(|_| {
             anyhow::anyhow!(
-                "コンテナの Agent が Ready になるまでにタイムアウトしました ({}秒)",
+                "コンテナの Agent 認証がタイムアウトしました ({}秒)",
                 START_TIMEOUT_SECS
             )
         })?
+    }
+
+    async fn rollback_startup(&mut self) {
+        let _ = self.stop_container().await;
+        self.credentials = None;
+        self.status = SandboxStatus::Stopped;
+    }
+
+    async fn start_container(&mut self, boot: &ContainerBootSettings) -> anyhow::Result<()> {
+        self.host_port = find_available_port().await?;
+        let credentials = SessionCredentials::new()?;
+        let container_name = generate_container_name();
+        let args = self.boot_args(&container_name, boot, &credentials);
+        self.credentials = Some(credentials);
+        self.container_name = Some(container_name);
+        self.run_container(&args).await?;
+        self.image = Some(boot.image.clone());
+        self.mount_point = Some(boot.share.mount_point.to_string_lossy().to_string());
+        self.wait_for_ready().await?;
+        if let Some(endpoint) = &boot.dns_proxy {
+            self.verify_dns_relay(endpoint).await?;
+        }
+        Ok(())
     }
 }
 
@@ -501,48 +496,12 @@ impl Sandbox for AppleContainerSandbox {
 
         let boot = self.boot_settings(config).await?;
 
-        // 空きポートを取得
-        self.host_port = find_available_port().await?;
-
-        // コンテナ名を生成
-        let container_name = generate_container_name();
-
-        let env_file_guard = self.prepare_env_file()?;
-
-        let args = self.boot_args(&container_name, &boot, &env_file_guard);
-
-        self.run_container(&args).await?;
-
-        self.container_name = Some(container_name);
-        self.image = Some(boot.image);
-        self.mount_point = Some(boot.share.mount_point.to_string_lossy().to_string());
-        // env_file_guard の Drop でコンテナ起動成功後に env-file は自動削除される
-        drop(env_file_guard);
-
-        // Agent の Ready を待つ
-        match self.wait_for_ready().await {
-            Ok(()) => {
-                if let Some(endpoint) = &boot.dns_proxy
-                    && let Err(error) = self.verify_dns_relay(endpoint).await
-                {
-                    let _ = self.stop_container().await;
-                    self.status = SandboxStatus::Stopped;
-                    return Err(error);
-                }
-                // フォールバック防御: ALLOW_NO_TOKEN で起動しているため、
-                // build_run_args() で 127.0.0.1 バインドが設定されていることが前提。
-                // Config::validate() と build_run_args() の二重チェックにより、
-                // ポートが外部に公開される設定は拒否される。
-                self.status = SandboxStatus::Running;
-                Ok(())
-            }
-            Err(e) => {
-                // タイムアウト時はコンテナを停止
-                let _ = self.stop_container().await;
-                self.status = SandboxStatus::Stopped;
-                Err(e)
-            }
+        if let Err(error) = self.start_container(&boot).await {
+            self.rollback_startup().await;
+            return Err(error);
         }
+        self.status = SandboxStatus::Running;
+        Ok(())
     }
 
     async fn exec(
@@ -558,63 +517,19 @@ impl Sandbox for AppleContainerSandbox {
             anyhow::bail!("Command must not be empty");
         }
 
-        let container_name = self
-            .container_name
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("container name not set"))?;
-
-        let args = build_exec_args(
-            container_name,
-            cmd,
-            env,
-            self.mount_point.as_deref().unwrap_or("/workspace"),
-        );
-
-        let output = Command::new(&self.container_binary)
-            .args(&args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .await?;
-
-        let exit_code = output.status.code().unwrap_or(-1);
-
-        Ok(ExecOutput {
-            exit_code,
-            stdout: output.stdout,
-            stderr: output.stderr,
-        })
+        let mut client = self.connect_agent().await?;
+        crate::agent_session::execute(&mut client, cmd, env).await
     }
 
     async fn shell(&self) -> anyhow::Result<()> {
         if self.status != SandboxStatus::Running {
             anyhow::bail!("Sandbox is not running (current: {:?})", self.status);
         }
-
-        let container_name = self
-            .container_name
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("container name not set"))?;
-
-        let args = build_shell_args(
-            container_name,
-            self.mount_point.as_deref().unwrap_or("/workspace"),
-        );
-
-        let mut child = Command::new(&self.container_binary)
-            .args(&args)
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .spawn()?;
-
-        let status = child.wait().await?;
-
-        if !status.success() {
-            let code = status.code().unwrap_or(1);
+        let mut client = self.connect_agent().await?;
+        let code = crate::terminal_shell::interactive_shell(&mut client).await?;
+        if code != 0 {
             anyhow::bail!("shell exited with code {}", code);
         }
-
         Ok(())
     }
 
@@ -634,10 +549,24 @@ impl Sandbox for AppleContainerSandbox {
         self.status
     }
 
+    fn agent_host_port(&self) -> Option<u16> {
+        self.credentials.as_ref().map(|_| self.host_port)
+    }
+
+    fn agent_secret(&self) -> Option<&[u8]> {
+        self.credentials
+            .as_ref()
+            .map(|credentials| credentials.auth_key.as_slice())
+    }
+
     fn session_backend(&self) -> Option<crate::session::SessionBackend> {
         let container_name = self.container_name.as_ref()?;
         Some(crate::session::SessionBackend::AppleContainer {
             container_name: container_name.clone(),
+            auth: Some(crate::session::ContainerSessionAuth {
+                host_port: self.host_port,
+                secret_file: self.credentials.as_ref()?.path(),
+            }),
             image: self.image.clone().unwrap_or_default(),
             mount_point: self
                 .mount_point
@@ -702,6 +631,7 @@ impl AppleContainerSandbox {
             self.remove_container(name).await;
         }
         self.container_name = None;
+        self.credentials = None;
         Ok(())
     }
 }
@@ -724,6 +654,231 @@ mod tests {
             assert_eq!(sandbox.status, SandboxStatus::Stopped);
             assert!(sandbox.container_name.is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn failed_start_releases_session_key() {
+        let mut sandbox = AppleContainerSandbox {
+            container_binary: "/nonexistent/izanagi-container".into(),
+            ..Default::default()
+        };
+        let boot = ContainerBootSettings {
+            image: "fixture".into(),
+            share: ShareConfig {
+                host_paths: vec![],
+                mount_point: "/workspace".into(),
+                read_only: true,
+            },
+            dns_proxy: None,
+            network: None,
+        };
+        assert!(sandbox.start_container(&boot).await.is_err());
+        let path = sandbox.credentials.as_ref().unwrap().path();
+        // up's rollback must release the same credentials even when runtime spawn fails.
+        sandbox.rollback_startup().await;
+        assert!(!path.exists());
+        assert_eq!(sandbox.status, SandboxStatus::Stopped);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a disposable Linux agent image and running Apple Container/Docker"]
+    async fn real_container_session_credentials_and_agent_execution() {
+        let runtime =
+            std::env::var("IZANAGI_TEST_CONTAINER_RUNTIME").unwrap_or_else(|_| "container".into());
+        let image = std::env::var("IZANAGI_TEST_CONTAINER_IMAGE").expect("fixture image required");
+        let mut sandbox = AppleContainerSandbox::with_runtime(&runtime).unwrap();
+        let config = SandboxConfig::AppleContainer {
+            image,
+            share: ShareConfig {
+                host_paths: vec![],
+                mount_point: "/project".into(),
+                read_only: true,
+            },
+            dns_proxy: None,
+            network: None,
+        };
+        let mut previous = None;
+        for _ in 0..2 {
+            sandbox.up(&config).await.unwrap();
+            let path = sandbox.credentials.as_ref().unwrap().path();
+            let result = check_real_session(&sandbox, previous.as_deref()).await;
+            previous = Some(sandbox.session_secret().unwrap().to_vec());
+            let shutdown = sandbox.down().await;
+            result.unwrap();
+            shutdown.unwrap();
+            assert!(!path.exists());
+        }
+    }
+
+    async fn check_real_session(
+        sandbox: &AppleContainerSandbox,
+        previous: Option<&[u8]>,
+    ) -> anyhow::Result<()> {
+        let key = sandbox.session_secret()?;
+        anyhow::ensure!(previous != Some(key), "session key reused");
+        let host_key = crate::protocol::load_shared_secret_from_env()?;
+        anyhow::ensure!(
+            host_key.as_deref() != Some(key),
+            "host long-term key reused"
+        );
+        check_runtime_environment(sandbox).await?;
+        for wrong in [previous, host_key.as_deref(), None] {
+            let authentication = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                crate::agent_session::connect(sandbox.host_port, wrong.map(<[u8]>::to_vec), None),
+            )
+            .await;
+            anyhow::ensure!(
+                !matches!(authentication, Ok(Ok(_))),
+                "invalid key authenticated"
+            );
+        }
+        check_agent_exec(sandbox).await?;
+        let backend = persisted_container_backend(sandbox)?;
+        check_external_session(&backend).await?;
+        check_agent_shell(&backend).await
+    }
+
+    fn persisted_container_backend(
+        sandbox: &AppleContainerSandbox,
+    ) -> anyhow::Result<crate::session::SessionBackend> {
+        let directory = tempfile::tempdir()?;
+        let session = crate::session::Session {
+            backend: sandbox.session_backend().unwrap(),
+            pid: std::process::id(),
+            started_at: 0,
+        };
+        crate::session::save_session(directory.path(), &session)?;
+        let json = std::fs::read_to_string(crate::session::session_file_path(directory.path()))?;
+        anyhow::ensure!(
+            !json.contains(std::str::from_utf8(sandbox.session_secret()?)?),
+            "session JSON contains key"
+        );
+        Ok(crate::session::load_session(directory.path())?
+            .unwrap()
+            .backend)
+    }
+
+    // Shared guest assertions for both authenticated execution paths.
+    const GUEST_IDENTITY_CHECK: &str = r#"test -z "$IZANAGI_SHARED_SECRET" && test -z "$IZANAGI_SECRET_FILE" && test "$(pwd)" = /project && test "$(id -u)" = 1000 && test "$(id -G)" = 1000 && grep -q '^Groups:[[:space:]]*$' /proc/self/status"#;
+
+    async fn check_agent_exec(sandbox: &AppleContainerSandbox) -> anyhow::Result<()> {
+        let env = HashMap::from([
+            ("LD_PRELOAD".into(), "/nonexistent/injected.so".into()),
+            ("CANARY".into(), "fixture".into()),
+        ]);
+        let script = format!(
+            "{GUEST_IDENTITY_CHECK} && test -z \"$LD_PRELOAD\" && test \"$CANARY\" = fixture"
+        );
+        let output = sandbox
+            .exec(&["/bin/sh".into(), "-c".into(), script], &env)
+            .await?;
+        anyhow::ensure!(
+            output.exit_code == 0,
+            "agent exec credentials/environment/workdir failed"
+        );
+        Ok(())
+    }
+
+    async fn check_external_session(
+        backend: &crate::session::SessionBackend,
+    ) -> anyhow::Result<()> {
+        let mut client = backend.connect_agent().await?;
+        let output = crate::agent_session::execute(
+            &mut client,
+            &["/bin/echo".into(), "external-session".into()],
+            &HashMap::new(),
+        )
+        .await?;
+        anyhow::ensure!(
+            output.stdout == b"external-session\n",
+            "external session connection failed"
+        );
+        Ok(())
+    }
+
+    async fn check_runtime_environment(sandbox: &AppleContainerSandbox) -> anyhow::Result<()> {
+        let name = sandbox.container_name.as_deref().unwrap();
+        let output = Command::new(&sandbox.container_binary)
+            .args(["exec", "-u", "izanagi", name, "env"])
+            .output()
+            .await?;
+        anyhow::ensure!(output.status.success(), "runtime environment probe failed");
+        let environment = String::from_utf8_lossy(&output.stdout);
+        anyhow::ensure!(
+            !environment.contains("IZANAGI_SHARED_SECRET=")
+                && !environment.contains(std::str::from_utf8(sandbox.session_secret()?)?),
+            "runtime leaked key"
+        );
+        check_mounted_file(sandbox).await
+    }
+
+    async fn check_mounted_file(sandbox: &AppleContainerSandbox) -> anyhow::Result<()> {
+        let name = sandbox.container_name.as_deref().unwrap();
+        let file = format!("{GUEST_SECRET_DIR}/{SECRET_FILENAME}");
+        let output = Command::new(&sandbox.container_binary)
+            .args([
+                "exec",
+                "-u",
+                "izanagi",
+                name,
+                "/bin/sh",
+                "-c",
+                &format!("test ! -r {file}"),
+            ])
+            .output()
+            .await?;
+        anyhow::ensure!(output.status.success(), "unprivileged user can read secret");
+        let output = Command::new(&sandbox.container_binary)
+            .args([
+                "exec",
+                "-u",
+                "root",
+                name,
+                "/bin/sh",
+                "-c",
+                &format!("printf x >> {file}"),
+            ])
+            .output()
+            .await?;
+        anyhow::ensure!(!output.status.success(), "secret mount is writable");
+        anyhow::ensure!(
+            crate::protocol::load_shared_secret_from_file(
+                &sandbox.credentials.as_ref().unwrap().path()
+            )? == sandbox.session_secret()?,
+            "mounted key changed"
+        );
+        Ok(())
+    }
+
+    async fn check_agent_shell(backend: &crate::session::SessionBackend) -> anyhow::Result<()> {
+        use crate::protocol::Message;
+        let mut client = backend.connect_agent().await?;
+        client
+            .send_message(&Message::Shell { rows: 24, cols: 80 })
+            .await?;
+        client
+            .send_message(&Message::ShellData {
+                stream: 0,
+                data: format!("{GUEST_IDENTITY_CHECK}; exit $?\n").into_bytes(),
+            })
+            .await?;
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                match client.recv_message().await? {
+                    Some(Message::ShellData { .. }) => {}
+                    Some(Message::ShellClose { exit_code }) => {
+                        anyhow::ensure!(
+                            exit_code == 0,
+                            "agent shell environment/credentials/workdir failed"
+                        );
+                        return Ok(());
+                    }
+                    _ => anyhow::bail!("agent shell closed unexpectedly"),
+                }
+            }
+        })
+        .await?
     }
 
     // --- イメージ存在確認テスト (#149) ---
@@ -785,67 +940,58 @@ mod tests {
     }
 
     #[test]
-    fn build_run_args_with_env_file() {
+    fn session_key_is_private_unique_and_removed_on_drop() {
+        use std::os::unix::fs::PermissionsExt;
+        let first = SessionCredentials::new().unwrap();
+        let second = SessionCredentials::new().unwrap();
+        assert!(*first.auth_key != *second.auth_key);
+        assert_eq!(first.auth_key.len(), 64);
+        let path = first.path();
+        assert!(crate::protocol::load_shared_secret_from_file(&path).unwrap() == *first.auth_key);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(first.directory.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        drop(first);
+        assert!(!path.exists());
+        assert!(second.path().exists());
+    }
+
+    #[test]
+    fn run_mounts_secret_read_only_without_inline_environment() {
+        let credentials = SessionCredentials::new().unwrap();
         let share = ShareConfig {
             host_paths: vec![],
-            mount_point: PathBuf::from("/workspace"),
+            mount_point: "/workspace".into(),
             read_only: false,
         };
         let args = build_run_args(
-            "izanagi-test",
-            "izanagi-vm",
+            "test",
+            "image",
             9001,
             &share,
-            Some("/tmp/test-envfile.tmp"),
+            credentials.directory.path().to_str(),
             None,
             None,
         );
-
-        assert!(args.contains(&"--env-file".to_string()));
-        assert!(args.contains(&"/tmp/test-envfile.tmp".to_string()));
-        // シークレットは --env-file 経由で渡され、-e では直接渡さない
-        assert!(!args.contains(&"IZANAGI_SHARED_SECRET".to_string()));
-    }
-
-    #[test]
-    fn write_secret_env_file_creates_and_removes() {
-        let guard = write_secret_env_file("test-secret-value").unwrap();
-        let path = guard.path().unwrap().clone();
-        assert!(path.exists());
-        let content = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(content, "IZANAGI_SHARED_SECRET=test-secret-value\n");
-
-        // パーミッション確認 (unix)
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::metadata(&path).unwrap().permissions();
-            assert_eq!(perms.mode() & 0o777, 0o600);
-        }
-
-        // Drop でファイルが自動削除されることを検証
-        drop(guard);
-        assert!(!path.exists());
-    }
-
-    #[test]
-    fn write_secret_env_file_rejects_control_chars() {
-        // 改行によるインジェクション防止
-        assert!(write_secret_env_file("secret\nEVIL_VAR=hack").is_err());
-        // タブ
-        assert!(write_secret_env_file("secret\tvalue").is_err());
-        // null バイト
-        assert!(write_secret_env_file("secret\0value").is_err());
-    }
-
-    #[test]
-    fn env_file_guard_double_drop_safe() {
-        let guard = write_secret_env_file("test-double-drop").unwrap();
-        let path = guard.path().unwrap().clone();
-        // 手動でファイル削除
-        std::fs::remove_file(&path).unwrap();
-        // Drop でも panic しない (NotFound を無視)
-        drop(guard);
+        assert!(args.contains(&format!(
+            "{}:{GUEST_SECRET_DIR}:ro",
+            credentials.directory.path().display()
+        )));
+        assert!(args.contains(&format!(
+            "IZANAGI_SECRET_FILE={GUEST_SECRET_DIR}/{SECRET_FILENAME}"
+        )));
+        assert!(!args.iter().any(|arg| arg.contains("IZANAGI_SHARED_SECRET")
+            || arg.contains(std::str::from_utf8(&credentials.auth_key).unwrap())));
+        assert!(!args.contains(&"--env-file".into()));
     }
 
     #[test]
