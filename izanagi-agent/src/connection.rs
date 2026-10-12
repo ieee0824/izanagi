@@ -545,7 +545,10 @@ fn fork_shell(
     let argv: [*const libc::c_char; 2] = [argv0.as_ptr(), std::ptr::null()];
 
     // chdir 先を fork 前に確保
-    let workdir = std::ffi::CString::new("/workspace").expect("static string");
+    let workdir = std::ffi::CString::new(
+        crate::exec::execution_workdir().unwrap_or_else(|| "/workspace".into()),
+    )
+    .expect("environment paths cannot contain NUL");
 
     // PTY を確保
     let mut winsize = libc::winsize {

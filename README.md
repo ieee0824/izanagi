@@ -113,13 +113,15 @@ macOS では Apple Container、Linux では Landlock によるネイティブサ
 chmod +x image/build.sh
 ./image/build.sh /path/to/izanagi-agent
 
-# Docker / Apple Container でコンテナを起動
-container run --rm -d --name izanagi-sandbox \
-  -p 9001:9001 \
-  -e IZANAGI_SHARED_SECRET=your-secret \
-  -v .:/workspace \
-  izanagi-vm
+# Apple Container バックエンドで起動（macOS）
+./target/release/izanagi up --sandbox=apple-container
+# 別ターミナルから実行
+./target/release/izanagi exec -- echo hello
 ```
+
+Apple Container は起動ごとに専用の認証キーを生成し、root 専用ファイルを read-only でマウントします。
+ホストの長期キーは使いません。exec / shell / MCP は認証済み agent を通じて実行します。
+旧形式のコンテナセッションは再起動してください。
 
 ## インストール
 

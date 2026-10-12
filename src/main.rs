@@ -562,6 +562,13 @@ fn report_cli_config(cli: &Cli, config: &Config, config_path: &Path) {
 }
 
 fn validate_cli_auth(config: &Config) -> anyhow::Result<()> {
+    use izanagi::config::SandboxBackend;
+    if config.sandbox.backend == SandboxBackend::AppleContainer
+        || (cfg!(target_os = "macos") && config.sandbox.backend == SandboxBackend::Native)
+    {
+        // コンテナは起動ごとに専用キーを生成し、ホストの長期キーを使用しない。
+        return Ok(());
+    }
     // シークレット設定の検証:
     // 1. IZANAGI_SECRET_FILE が設定されているなら読み込み失敗はハードエラー（require_auth に関係なく）
     // 2. require_auth = true（デフォルト）ならシークレット未設定もエラー

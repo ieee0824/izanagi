@@ -143,3 +143,33 @@ For a local Linux root fixture, build the agent test executable with
 that executable with `privilege_tests::privileged_ --ignored --nocapture
 --test-threads=1`. The lookup uses `getpwnam_r` before fork; the child only performs
 credential syscalls, session/chdir setup, dumpability setup and exec.
+
+## Container session credentials (#68)
+
+Build the host and Linux agent from the same revision, then build the disposable
+`tests/fixtures/container-agent/Dockerfile` image with only the agent binary in
+its build context. It contains an unprivileged user and both default/custom
+working directories; it shares no host project or credentials.
+
+```sh
+cargo zigbuild --locked --manifest-path izanagi-agent/Cargo.toml --target aarch64-unknown-linux-gnu --release
+fixture=$(mktemp -d "$PWD/.izanagi-session.XXXXXX")
+cp izanagi-agent/target/aarch64-unknown-linux-gnu/release/izanagi-agent "$fixture/izanagi-agent"
+cp tests/fixtures/container-agent/Dockerfile "$fixture/Dockerfile"
+container build --platform linux/arm64 -t izanagi-session-test "$fixture"
+printf '%s' 'fixture-host-key-not-for-container' > "$fixture/host-key"
+chmod 0600 "$fixture/host-key"
+IZANAGI_SECRET_FILE="$fixture/host-key" IZANAGI_TEST_CONTAINER_IMAGE=izanagi-session-test \
+  cargo test --locked --lib real_container_session_credentials_and_agent_execution -- --ignored --nocapture
+container image delete izanagi-session-test
+rm -rf -- "$fixture"
+```
+
+The test uses production sandbox startup twice. It checks raw runtime `exec -u
+izanagi ... env` contains no inline key, the guest user cannot read the mounted
+key, the mount rejects root writes, shutdown deletes host files, and keys differ
+across sessions and from the fixture host key. Wrong/absent keys fail to
+authenticate. Authenticated Exec and Shell verify sanitized environments,
+unprivileged identities, no supplementary groups, and the custom working
+directory. A persisted-session connection reads its private key file. Linux CI
+runs the same regression using Docker; Apple Container must be verified on macOS.

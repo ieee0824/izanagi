@@ -114,6 +114,11 @@ pub trait Sandbox: Send {
         None
     }
 
+    /// 起動ごとに生成した agent 認証キー。未実装ならホスト設定を使用する。
+    fn agent_secret(&self) -> Option<&[u8]> {
+        None
+    }
+
     /// セッション情報のバックエンド固有データを返す。
     /// `up` コマンドで `session.json` に保存するために使用する。
     /// 起動中でない場合は `None` を返す。

@@ -85,6 +85,20 @@ jobs:
           chmod 0755 "$credential_fixture"
           sudo install -m 0755 "$agent_test" "$credential_fixture/agent-test"
           sudo "$credential_fixture/agent-test" privilege_tests::privileged_ --ignored --nocapture --test-threads=1
+      - name: Test container session authentication and execution
+        if: matrix.manifest == 'izanagi-agent/Cargo.toml'
+        shell: bash
+        run: |
+          cargo build --locked --manifest-path izanagi-agent/Cargo.toml
+          container_fixture=$(mktemp -d /tmp/izanagi-session.XXXXXX)
+          trap 'docker image rm -f izanagi-session-test; rm -rf -- "$container_fixture"' EXIT
+          cp izanagi-agent/target/debug/izanagi-agent "$container_fixture/izanagi-agent"
+          cp tests/fixtures/container-agent/Dockerfile "$container_fixture/Dockerfile"
+          docker build -t izanagi-session-test "$container_fixture"
+          printf '%s' 'fixture-host-key-not-for-container' > "$container_fixture/host-key"
+          chmod 0600 "$container_fixture/host-key"
+          IZANAGI_SECRET_FILE="$container_fixture/host-key" IZANAGI_TEST_CONTAINER_RUNTIME=docker IZANAGI_TEST_CONTAINER_IMAGE=izanagi-session-test \
+            cargo test --locked --lib real_container_session_credentials_and_agent_execution -- --ignored --nocapture
 
   agent-ebpf:
     name: Check agent eBPF feature
