@@ -127,6 +127,55 @@ Apple Container は起動ごとに専用の認証キーを生成し、root 専�
 
 ## インストール
 
+### 配布バイナリ
+
+[GitHub Releases](https://github.com/ieee0824/izanagi/releases) から OS・CPU に合う
+`izanagi-v<VERSION>-<TARGET>.tar.gz` と `SHA256SUMS` をダウンロードします。
+対応 target は macOS の `aarch64-apple-darwin` / `x86_64-apple-darwin`、
+Linux の `aarch64-unknown-linux-gnu` / `x86_64-unknown-linux-gnu` です。
+Linux 版は Ubuntu 24.04 でビルドし、glibc 2.39 以降を必要とします。
+macOS 版の動作確認環境は macOS 15 です。署名は ad-hoc で、Apple の公証は行いません。
+
+```bash
+# 例: macOS Apple Silicon、v0.1.0（公開済みのバージョンを指定）
+VERSION=0.1.0
+TARGET=aarch64-apple-darwin
+ARCHIVE="izanagi-v${VERSION}-${TARGET}.tar.gz"
+BASE="https://github.com/ieee0824/izanagi/releases/download/v${VERSION}"
+curl -fLO "$BASE/$ARCHIVE"
+curl -fLO "$BASE/SHA256SUMS"
+# 選択したアーカイブのみ検証（Linux では shasum の代わりに sha256sum も可）
+awk -v archive="$ARCHIVE" '$2 == archive' SHA256SUMS > "$ARCHIVE.sha256"
+test -s "$ARCHIVE.sha256" && shasum -a 256 -c "$ARCHIVE.sha256"
+```
+
+チェックサムが一致したら展開し、本体・両プロキシをまとめて配置します。
+
+```bash
+tar -xzf "$ARCHIVE"
+mkdir -p "$HOME/.izanagi/bin"
+cp "izanagi-v${VERSION}-${TARGET}/bin/"* "$HOME/.izanagi/bin/"
+export PATH="$HOME/.izanagi/bin:$PATH"
+izanagi --version
+izanagi init
+```
+
+Linux 版には `guest/izanagi-agent`（glibc 版、同じ CPU の guest 用）と
+`share/izanagi/izanagi-ebpf.o` も含みます。ホストの eBPF tracer を使う場合は
+オブジェクトを既定の場所 `/opt/izanagi/izanagi-ebpf.o` に配置します。
+
+```bash
+# Linux で eBPF を利用する場合
+sudo install -d -m 0755 /opt/izanagi
+sudo install -m 0644 "izanagi-v${VERSION}-${TARGET}/share/izanagi/izanagi-ebpf.o" /opt/izanagi/izanagi-ebpf.o
+```
+
+VM・コンテナイメージや QEMU / Apple Container などのランタイムは別途必要です。
+Alpine guest では配布の glibc agent を使わず、`make build-agent` で musl 版を作成します。
+リリース作成・手動ビルドの手順は [docs/releases.md](docs/releases.md) を参照してください。
+
+### ソースからインストール
+
 ```bash
 # ビルド + ~/.izanagi/bin にインストール
 make install
