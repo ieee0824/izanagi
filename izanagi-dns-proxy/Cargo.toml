@@ -1,6 +1,6 @@
 [package]
 name = "izanagi-dns-proxy"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 
 # allowed_hosts フィルタ付き DNS プロキシ。
