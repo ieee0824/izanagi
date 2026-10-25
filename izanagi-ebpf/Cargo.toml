@@ -1,6 +1,6 @@
 [package]
 name = "izanagi-ebpf"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2021"
 
 # eBPF プログラムは nightly + bpf-linker が必要。
