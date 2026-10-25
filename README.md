@@ -128,6 +128,17 @@ Apple Container は起動ごとに専用の認証キーを生成し、root 専�
 ホストの長期キーは使いません。exec / shell / MCP は認証済み agent を通じて実行します。
 旧形式のコンテナセッションは再起動してください。
 
+`image/build.sh` は `izanagi-vm:<VERSION>` と `izanagi-vm:latest` の両方を生成します。
+`latest` のベースOSはリリース間で変わる可能性があるため、派生イメージではバージョンタグを固定してください。
+現在のコンテナイメージは **Alpine Linux 3.23 (musl)** ベースです。Debian系イメージからの
+移行点は [コンテナイメージ移行ガイド](docs/container-image-migration.md) を参照してください。
+
+派生Dockerfileでは次のように固定します。
+
+```dockerfile
+FROM izanagi-vm:0.2.2
+```
+
 ## インストール
 
 ### 配布バイナリ
