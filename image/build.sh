@@ -4,18 +4,42 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-# コンテナランタイムを検出
-if command -v container &>/dev/null; then
-    RUNTIME="container"
-elif command -v docker &>/dev/null; then
-    RUNTIME="docker"
-else
-    echo "Error: container or docker command not found"
-    echo "Install Apple Container or Docker"
-    exit 1
-fi
+RUNTIME="${IZANAGI_CONTAINER_RUNTIME:-}"
+AGENT_BINARY=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --runtime)
+            [ "$#" -ge 2 ] || { echo "Error: --runtime requires a value"; exit 2; }
+            RUNTIME="$2"
+            shift 2
+            ;;
+        --runtime=*) RUNTIME="${1#*=}"; shift ;;
+        -h|--help)
+            echo "Usage: $0 [--runtime container|docker|podman] [agent-binary]"
+            exit 0
+            ;;
+        -*) echo "Error: unknown option: $1"; exit 2 ;;
+        *)
+            [ -z "$AGENT_BINARY" ] || { echo "Error: only one agent binary may be specified"; exit 2; }
+            AGENT_BINARY="$1"
+            shift
+            ;;
+    esac
+done
 
-AGENT_BINARY="${1:-}"
+if [ -z "$RUNTIME" ]; then
+    for candidate in container docker podman; do
+        if command -v "$candidate" &>/dev/null; then
+            RUNTIME="$candidate"
+            break
+        fi
+    done
+fi
+case "$RUNTIME" in
+    container|docker|podman) ;;
+    *) echo "Error: runtime must be container, docker, or podman"; exit 2 ;;
+esac
+command -v "$RUNTIME" &>/dev/null || { echo "Error: $RUNTIME command not found"; exit 1; }
 
 # 引数なしの場合はコンテナ内でビルド
 if [ -z "$AGENT_BINARY" ]; then
@@ -23,17 +47,10 @@ if [ -z "$AGENT_BINARY" ]; then
     $RUNTIME build -f "$SCRIPT_DIR/Dockerfile.build" -t izanagi-agent-builder "$PROJECT_ROOT"
 
     # ビルドしたバイナリを取り出す
-    CID=$($RUNTIME run --rm -d izanagi-agent-builder sleep 10 2>/dev/null || true)
-    if [ -n "$CID" ]; then
-        $RUNTIME cp "$CID:/izanagi-agent" "$SCRIPT_DIR/izanagi-agent"
-        $RUNTIME stop "$CID" 2>/dev/null || true
-    else
-        # scratch イメージからはコンテナ起動できないので、builder ステージから取る
-        $RUNTIME build -f "$SCRIPT_DIR/Dockerfile.build" --target builder -t izanagi-agent-builder "$PROJECT_ROOT"
-        CID=$($RUNTIME run --rm -d izanagi-agent-builder sleep 30)
-        $RUNTIME cp "$CID:/src/izanagi-agent/target/release/izanagi-agent" "$SCRIPT_DIR/izanagi-agent"
-        $RUNTIME stop "$CID" 2>/dev/null || true
-    fi
+    # scratch image has no default command; create only materializes its filesystem.
+    CID=$($RUNTIME create izanagi-agent-builder /izanagi-agent)
+    $RUNTIME cp "$CID:/izanagi-agent" "$SCRIPT_DIR/izanagi-agent"
+    $RUNTIME rm "$CID" >/dev/null
     chmod +x "$SCRIPT_DIR/izanagi-agent"
     echo "agent ビルド完了"
 else

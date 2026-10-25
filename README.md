@@ -111,9 +111,12 @@ macOS では Apple Container、Linux では Landlock によるネイティブサ
 より強い隔離が必要な場合:
 
 ```bash
-# CI から izanagi-agent の musl バイナリをダウンロードして
+# agent をコンテナ内でビルドしてイメージを作成
 chmod +x image/build.sh
-./image/build.sh /path/to/izanagi-agent
+./image/build.sh
+
+# Docker / Podman を明示する場合
+./image/build.sh --runtime docker
 
 # Apple Container バックエンドで起動（macOS）
 ./target/release/izanagi up --sandbox=apple-container
@@ -653,7 +656,7 @@ make qemu-image-alpine
 ```bash
 # agent を musl クロスビルドしてからイメージビルド
 make build-agent
-./image/build.sh izanagi-agent/target/aarch64-unknown-linux-musl/release/izanagi-agent
+./image/build.sh --runtime container izanagi-agent/target/aarch64-unknown-linux-musl/release/izanagi-agent
 ```
 
 ## デモ: サプライチェーン攻撃の検知
