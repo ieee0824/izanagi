@@ -88,9 +88,35 @@ pub enum ContainerNetworkMode {
     None,
 }
 
+/// Apple Container 互換バックエンドで使用するコンテナランタイム。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ContainerRuntime {
+    /// Apple Container の `container` CLI。
+    #[default]
+    Container,
+    /// Docker CLI。
+    Docker,
+    /// Podman CLI。
+    Podman,
+}
+
+impl ContainerRuntime {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Container => "container",
+            Self::Docker => "docker",
+            Self::Podman => "podman",
+        }
+    }
+}
+
 /// `[sandbox.apple_container]` セクション。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppleContainerSection {
+    /// コンテナランタイム。未指定時は Apple Container の `container`。
+    #[serde(default)]
+    pub runtime: ContainerRuntime,
     /// コンテナイメージ名。デフォルトは `"izanagi-vm"`。
     #[serde(default = "default_apple_container_image")]
     pub image: String,
@@ -105,6 +131,7 @@ fn default_apple_container_image() -> String {
 impl Default for AppleContainerSection {
     fn default() -> Self {
         Self {
+            runtime: ContainerRuntime::default(),
             image: default_apple_container_image(),
             network: None,
         }

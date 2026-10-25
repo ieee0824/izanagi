@@ -5,7 +5,7 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 use crate::apple_container_sandbox::AppleContainerSandbox;
-use crate::config::{Config, SandboxBackend, TracerBackend};
+use crate::config::{Config, ContainerRuntime, SandboxBackend, TracerBackend};
 use crate::detector::{Alert, Detector};
 use crate::dtrace_tracer::DTraceTracer;
 use crate::ebpf_tracer::EbpfTracer;
@@ -41,7 +41,7 @@ fn select_sandbox_for_platform(
         SandboxBackend::Qemu => Ok(Box::new(QemuSandbox::new())),
         SandboxBackend::Native => {
             if is_macos {
-                Ok(Box::new(AppleContainerSandbox::new()))
+                apple_container_sandbox(config)
             } else if is_linux {
                 Ok(Box::new(LandlockSandbox::new()))
             } else {
@@ -52,9 +52,21 @@ fn select_sandbox_for_platform(
             if !is_macos {
                 bail!("apple-container サンドボックスは macOS でのみ利用可能です")
             }
-            Ok(Box::new(AppleContainerSandbox::new()))
+            apple_container_sandbox(config)
         }
     }
+}
+
+fn apple_container_sandbox(config: &Config) -> anyhow::Result<Box<dyn Sandbox>> {
+    let runtime = config
+        .sandbox
+        .apple_container
+        .as_ref()
+        .map(|section| section.runtime)
+        .unwrap_or(ContainerRuntime::Container);
+    Ok(Box::new(AppleContainerSandbox::with_runtime(
+        runtime.as_str(),
+    )?))
 }
 
 /// Config の `sandbox.tracer` からプラットフォームに応じた Tracer 実装を選択する。

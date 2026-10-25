@@ -10,6 +10,7 @@ use std::process::Stdio;
 
 use tokio::process::Command;
 
+use crate::config::ContainerRuntime;
 use crate::sandbox::{ExecOutput, Sandbox, SandboxConfig, SandboxStatus, ShareConfig};
 
 /// The private directory is mounted read-only under guest root's home.
@@ -77,14 +78,15 @@ async fn check_image_exists_with(image: &str, binary: &str) -> anyhow::Result<()
         .await
         .map_err(|e| {
             anyhow::anyhow!(
-                "container コマンドの実行に失敗しました。Apple Container がインストールされているか確認してください: {}",
-                e
+                "コンテナランタイム `{}` を実行できません。インストール状況と PATH を確認してください: {}",
+                binary,
+                e,
             )
         })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("container image list の実行に失敗しました: {}", stderr);
+        anyhow::bail!("`{} image list` の実行に失敗しました: {}", binary, stderr);
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -283,8 +285,9 @@ pub struct AppleContainerSandbox {
     host_port: u16,
     image: Option<String>,
     mount_point: Option<String>,
-    /// コンテナランタイムのバイナリ名 ("container" or "docker")。
+    /// コンテナランタイムのバイナリ名 ("container", "docker", or "podman")。
     container_binary: String,
+    container_runtime: ContainerRuntime,
     credentials: Option<SessionCredentials>,
 }
 
@@ -386,15 +389,17 @@ impl AppleContainerSandbox {
     /// それ以外はエラーを返す（設定ミスの黙殺を防止）。
     pub(crate) fn with_runtime(binary: &str) -> anyhow::Result<Self> {
         // 許可リストで制限し、任意バイナリの実行を防止
-        match binary {
-            "container" | "docker" | "podman" => {}
+        let container_runtime = match binary {
+            "container" => ContainerRuntime::Container,
+            "docker" => ContainerRuntime::Docker,
+            "podman" => ContainerRuntime::Podman,
             _ => {
                 anyhow::bail!(
                     "unknown container runtime '{}'. Allowed values: container, docker, podman",
                     binary
                 );
             }
-        }
+        };
         Ok(Self {
             status: SandboxStatus::Stopped,
             container_name: None,
@@ -402,6 +407,7 @@ impl AppleContainerSandbox {
             image: None,
             mount_point: None,
             container_binary: binary.to_string(),
+            container_runtime,
             credentials: None,
         })
     }
@@ -572,6 +578,7 @@ impl Sandbox for AppleContainerSandbox {
                 .mount_point
                 .clone()
                 .unwrap_or_else(|| "/workspace".to_string()),
+            runtime: self.container_runtime,
         })
     }
 }
@@ -641,6 +648,29 @@ mod tests {
     use super::*;
     use crate::sandbox::ShareConfig;
     use std::path::PathBuf;
+
+    #[test]
+    fn supported_container_runtimes_are_accepted_and_unknown_values_rejected() {
+        for runtime in ["container", "docker", "podman"] {
+            let sandbox = AppleContainerSandbox::with_runtime(runtime).unwrap();
+            assert_eq!(sandbox.container_binary, runtime);
+        }
+        let error = AppleContainerSandbox::with_runtime("containerd")
+            .err()
+            .expect("unsupported runtime must fail");
+        assert!(error.to_string().contains("Allowed values"));
+    }
+
+    #[tokio::test]
+    async fn missing_runtime_error_names_selected_executable() {
+        let binary = "/nonexistent/izanagi-container-runtime";
+        let error = check_image_exists_with("fixture", binary)
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains(binary));
+        assert!(message.contains("PATH"));
+    }
 
     #[tokio::test]
     async fn container_spawn_and_unsuccessful_exit_restore_stopped_state() {
