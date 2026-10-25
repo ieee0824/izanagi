@@ -34,6 +34,7 @@ pub fn cmd_init(explicit_path: Option<&PathBuf>) -> Result<u8> {
 
     let backend = prompt_backend()?;
     let qemu_section = prompt_qemu(backend)?;
+    let container_runtime = prompt_container_runtime(backend)?;
     let tracer = prompt_tracer(backend)?;
     let require_auth = Confirm::new()
         .with_prompt("HMAC 認証を必須にしますか？ (シークレット設定が必要)")
@@ -50,6 +51,7 @@ pub fn cmd_init(explicit_path: Option<&PathBuf>) -> Result<u8> {
     let toml = generate_toml(
         backend,
         qemu_section.as_ref(),
+        container_runtime,
         tracer,
         require_auth,
         &share_paths,
@@ -62,6 +64,19 @@ pub fn cmd_init(explicit_path: Option<&PathBuf>) -> Result<u8> {
     write_private_config(&output, &toml)?;
     println!("\n{} を生成しました。", output.display());
     Ok(0)
+}
+
+fn prompt_container_runtime(backend: &str) -> Result<Option<&'static str>> {
+    if backend != "apple-container" && !(backend == "native" && cfg!(target_os = "macos")) {
+        return Ok(None);
+    }
+    let runtimes = &["container", "docker", "podman"];
+    let index = Select::new()
+        .with_prompt("Container runtime")
+        .items(runtimes)
+        .default(0)
+        .interact()?;
+    Ok(Some(runtimes[index]))
 }
 
 fn prompt_backend() -> Result<&'static str> {
@@ -323,6 +338,7 @@ struct MitmConfig {
 fn generate_toml(
     backend: &str,
     qemu: Option<&(u32, String, String)>,
+    container_runtime: Option<&str>,
     tracer: &str,
     require_auth: bool,
     share_paths: &str,
@@ -333,7 +349,14 @@ fn generate_toml(
     mitm: Option<&MitmConfig>,
 ) -> String {
     let mut out = String::new();
-    append_sandbox(&mut out, backend, qemu, tracer, require_auth);
+    append_sandbox(
+        &mut out,
+        backend,
+        qemu,
+        container_runtime,
+        tracer,
+        require_auth,
+    );
     if qemu.is_some() {
         out.push_str(&format!("restrict_network = {}\n", mitm.is_none()));
     }
@@ -354,6 +377,7 @@ fn append_sandbox(
     out: &mut String,
     backend: &str,
     qemu: Option<&(u32, String, String)>,
+    container_runtime: Option<&str>,
     tracer: &str,
     require_auth: bool,
 ) {
@@ -369,6 +393,11 @@ fn append_sandbox(
         out.push_str(&format!("cpus = {cpus}\n"));
         out.push_str(&format!("memory = {}\n", escape_toml_string(memory)));
         out.push_str(&format!("image = {}\n", escape_toml_string(image)));
+    }
+    if let Some(runtime) = container_runtime {
+        out.push_str("\n[sandbox.apple_container]\n");
+        out.push_str(&format!("runtime = {}\n", escape_toml_string(runtime)));
+        out.push_str("image = \"izanagi-vm\"\n");
     }
 }
 
@@ -487,6 +516,7 @@ mod tests {
             let text = generate_toml(
                 "qemu",
                 Some(&(2, "4G".into(), "default".into())),
+                None,
                 "vm-agent",
                 true,
                 ".",
@@ -518,6 +548,7 @@ mod tests {
         let toml = generate_toml(
             "native",
             None,
+            None,
             "auto",
             false,
             ".",
@@ -544,6 +575,7 @@ mod tests {
         let toml = generate_toml(
             "qemu",
             Some(&(4, "8G".into(), "custom.qcow2".into())),
+            None,
             "vm-agent",
             true,
             "src, tests",
@@ -563,11 +595,33 @@ mod tests {
     }
 
     #[test]
+    fn generate_toml_with_container_runtime() {
+        let toml = generate_toml(
+            "apple-container",
+            None,
+            Some("podman"),
+            "none",
+            true,
+            ".",
+            "/workspace",
+            &["file".into()],
+            &[],
+            &[],
+            None,
+        );
+        let config = izanagi::config::Config::from_toml(&toml).unwrap();
+        let section = config.sandbox.apple_container.unwrap();
+        assert_eq!(section.runtime, izanagi::config::ContainerRuntime::Podman);
+        assert_eq!(section.image, "izanagi-vm");
+    }
+
+    #[test]
     fn generate_toml_escapes_injection() {
         // ダブルクォート、バックスラッシュ、改行を含む入力でも
         // 有効な TOML が生成されることを確認
         let toml = generate_toml(
             "native",
+            None,
             None,
             "auto",
             false,
@@ -615,6 +669,7 @@ mod tests {
         let toml = generate_toml(
             "native",
             None,
+            None,
             "auto",
             false,
             ".",
@@ -634,6 +689,7 @@ mod tests {
         let toml = generate_toml(
             "qemu",
             Some(&(4, "8G".into(), "default".into())),
+            None,
             "vm-agent",
             true,
             "src, tests",

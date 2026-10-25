@@ -350,9 +350,14 @@ enabled = false                # 有効化する際は下記「サンドボッ�
 listen = "127.0.0.1:15353"       # QEMU 用のホスト listen
 
 # [sandbox.apple_container]
+# runtime = "container"           # container | docker | podman
 # image = "izanagi-vm"
 # network = "none"               # ネットワーク完全遮断（現在未サポート）
 ```
+
+macOS の Apple Container 互換バックエンドでは `runtime` に `container`、`docker`、
+`podman` を指定できる。未指定時は従来どおり `container` を使用する。
+`backend = "native"` が macOS で Apple Container バックエンドへ解決される場合にも、この設定が適用される。
 
 ## バックエンド自動選択
 

@@ -156,3 +156,38 @@ fn container_config_does_not_require_or_read_host_long_term_key() {
         assert!(output.status.success());
     }
 }
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "requires Docker and a disposable Linux agent image"]
+async fn docker_runtime_starts_through_normal_config_loading() {
+    let image = std::env::var("IZANAGI_TEST_CONTAINER_IMAGE")
+        .expect("IZANAGI_TEST_CONTAINER_IMAGE is required");
+    let toml = format!(
+        r#"
+[sandbox]
+backend = "apple-container"
+tracer = "none"
+
+[sandbox.apple_container]
+runtime = "docker"
+image = {image:?}
+
+[share]
+paths = []
+mount_point = "/workspace"
+
+[monitor]
+syscalls = []
+
+[detect]
+suspicious_paths = []
+allowed_hosts = []
+"#
+    );
+    let config = Config::from_toml(&toml).unwrap();
+    let sandbox_config = config.to_sandbox_config().unwrap();
+    let mut sandbox = izanagi::engine::select_sandbox(&config).unwrap();
+    sandbox.up(&sandbox_config).await.unwrap();
+    sandbox.down().await.unwrap();
+}

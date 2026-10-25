@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
+use crate::config::ContainerRuntime;
+
 /// セッションファイル名。
 const SESSION_FILE: &str = "session.json";
 
@@ -35,6 +37,9 @@ pub enum SessionBackend {
         image: String,
         /// 共有マウントポイント。
         mount_point: String,
+        /// 起動に使用したコンテナランタイム。
+        #[serde(default)]
+        runtime: ContainerRuntime,
         /// 起動プロセスが所有する、使い捨て認証ファイルへの参照。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         auth: Option<ContainerSessionAuth>,
@@ -183,6 +188,11 @@ mod tests {
     #[tokio::test]
     async fn legacy_container_session_requires_restart_instead_of_runtime_exec() {
         let backend: SessionBackend = serde_json::from_str(r#"{"type":"apple-container","container_name":"old","image":"image","mount_point":"/workspace"}"#).unwrap();
+        assert!(matches!(
+            &backend,
+            SessionBackend::AppleContainer { runtime, .. }
+                if *runtime == ContainerRuntime::Container
+        ));
         let error = match backend.connect_agent().await {
             Ok(_) => panic!("legacy session unexpectedly authenticated"),
             Err(error) => error,
@@ -200,6 +210,7 @@ mod tests {
                 container_name: "izanagi-abc123".to_string(),
                 image: "izanagi-vm".to_string(),
                 mount_point: "/workspace".to_string(),
+                runtime: ContainerRuntime::Docker,
                 auth: None,
             },
             pid: 12345,

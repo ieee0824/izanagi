@@ -5,6 +5,11 @@ backend = "native"
 tracer = "auto"
 require_auth = true
 
+# macOS container backend options (`native` or `apple-container`).
+# [sandbox.apple_container]
+# runtime = "container"           # container | docker | podman
+# image = "izanagi-vm"
+
 [share]
 paths = ["."]
 mount_point = "/workspace"

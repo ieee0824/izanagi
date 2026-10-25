@@ -757,6 +757,36 @@ fn parse_apple_container_network_absent() {
     assert!(ac.network.is_none());
 }
 
+#[test]
+fn parse_apple_container_runtime() {
+    for (value, expected) in [
+        ("container", ContainerRuntime::Container),
+        ("docker", ContainerRuntime::Docker),
+        ("podman", ContainerRuntime::Podman),
+    ] {
+        let toml =
+            apple_container_toml(&format!("[sandbox.apple_container]\nruntime = \"{value}\""));
+        let config = Config::from_toml(&toml).unwrap();
+        assert_eq!(config.sandbox.apple_container.unwrap().runtime, expected);
+    }
+}
+
+#[test]
+fn apple_container_runtime_defaults_to_container() {
+    let config = Config::from_toml(&apple_container_toml("")).unwrap();
+    assert_eq!(
+        config.sandbox.apple_container.unwrap_or_default().runtime,
+        ContainerRuntime::Container
+    );
+}
+
+#[test]
+fn parse_apple_container_runtime_invalid() {
+    let toml = apple_container_toml("[sandbox.apple_container]\nruntime = \"containerd\"");
+    let error = Config::from_toml(&toml).unwrap_err();
+    assert!(error.to_string().contains("unknown variant"));
+}
+
 // --- #166: AppleContainer to_sandbox_config テスト ---
 
 /// SandboxConfig から AppleContainer のフィールドを取り出すヘルパー。
