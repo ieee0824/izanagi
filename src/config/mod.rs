@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
@@ -67,6 +68,20 @@ pub struct SandboxSection {
     pub qemu: Option<QemuSection>,
     /// `[sandbox.apple_container]` サブセクション。Apple Container バックエンド使用時のオプション。
     pub apple_container: Option<AppleContainerSection>,
+    /// Commands and interactive shells receive only these explicitly configured values.
+    #[serde(default)]
+    pub environment: EnvironmentSection,
+}
+
+/// Policy-controlled environment exposed to sandbox commands.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct EnvironmentSection {
+    /// Names copied from the sandbox image/guest agent environment.
+    #[serde(default)]
+    pub inherit: Vec<String>,
+    /// Literal non-secret values supplied by the project configuration.
+    #[serde(default)]
+    pub set: HashMap<String, String>,
 }
 
 /// `[sandbox.qemu]` セクション。
@@ -126,6 +141,49 @@ pub struct AppleContainerSection {
 
 fn default_apple_container_image() -> String {
     "izanagi-vm".to_string()
+}
+
+fn validate_environment_name(name: &str) -> anyhow::Result<()> {
+    let mut chars = name.chars();
+    let valid_start = chars
+        .next()
+        .is_some_and(|c| c == '_' || c.is_ascii_alphabetic());
+    let valid_rest = chars.all(|c| c == '_' || c.is_ascii_alphanumeric());
+    if !valid_start || !valid_rest {
+        bail!("invalid sandbox environment variable name: {name}");
+    }
+    if environment_name_is_denied(name) {
+        bail!("sandbox environment variable is reserved or unsafe: {name}");
+    }
+    Ok(())
+}
+
+fn environment_name_is_denied(name: &str) -> bool {
+    const DENIED: &[&str] = &[
+        "HOME",
+        "USER",
+        "LD_PRELOAD",
+        "LD_LIBRARY_PATH",
+        "DYLD_INSERT_LIBRARIES",
+        "DYLD_FORCE_FLAT_NAMESPACE",
+        "LD_AUDIT",
+        "LD_DEBUG",
+        "ENV",
+        "BASH_ENV",
+        "PYTHONSTARTUP",
+        "PYTHONPATH",
+        "NODE_OPTIONS",
+        "NODE_PATH",
+        "PERL5OPT",
+        "PERL5LIB",
+        "RUBYOPT",
+        "RUBYLIB",
+        "CLASSPATH",
+        "JAVA_TOOL_OPTIONS",
+        "_JAVA_OPTIONS",
+        "DOTNET_STARTUP_HOOKS",
+    ];
+    name.starts_with("IZANAGI_") || DENIED.contains(&name)
 }
 
 impl Default for AppleContainerSection {
@@ -220,6 +278,7 @@ impl Default for SandboxSection {
             require_auth: None,
             qemu: None,
             apple_container: None,
+            environment: EnvironmentSection::default(),
         }
     }
 }
@@ -345,6 +404,7 @@ impl Config {
     /// プラットフォーム判定を引数として受け取るバリデーション。テストで各プラットフォームの挙動を検証可能。
     fn validate_for_platform(&self, is_linux: bool, is_macos: bool) -> anyhow::Result<Vec<String>> {
         self.validate_behavior_backend()?;
+        self.validate_environment()?;
         // プラットフォームに応じたバックエンド利用可能性チェック
         if self.sandbox.backend == SandboxBackend::Native && !is_linux && !is_macos {
             bail!(
@@ -392,6 +452,24 @@ impl Config {
         }
 
         Ok(warnings)
+    }
+
+    fn validate_environment(&self) -> anyhow::Result<()> {
+        let environment = &self.sandbox.environment;
+        let mut inherited = HashSet::new();
+        for name in &environment.inherit {
+            validate_environment_name(name)?;
+            if !inherited.insert(name) {
+                bail!("sandbox.environment.inherit contains duplicate name: {name}");
+            }
+            if environment.set.contains_key(name) {
+                bail!("sandbox environment variable {name} cannot be both inherited and set");
+            }
+        }
+        for name in environment.set.keys() {
+            validate_environment_name(name)?;
+        }
+        Ok(())
     }
 
     fn validate_behavior_backend(&self) -> anyhow::Result<()> {

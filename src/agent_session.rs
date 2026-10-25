@@ -23,17 +23,49 @@ pub async fn connect(
     Ok(client)
 }
 
-pub async fn execute(
-    client: &mut AgentClient,
+pub async fn execute<R, W>(
+    client: &mut ProtocolClient<R, W>,
     cmd: &[String],
     env: &HashMap<String, String>,
-) -> anyhow::Result<ExecOutput> {
+) -> anyhow::Result<ExecOutput>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
     client
         .send_message(&Message::Exec {
             cmd: cmd.to_vec(),
             env: env.clone(),
         })
         .await?;
+    receive_exec_result(client).await
+}
+
+pub async fn execute_with_environment<R, W>(
+    client: &mut ProtocolClient<R, W>,
+    cmd: &[String],
+    env: &HashMap<String, String>,
+    inherit: &[String],
+) -> anyhow::Result<ExecOutput>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    client
+        .send_message(&Message::ExecWithEnvironment {
+            cmd: cmd.to_vec(),
+            env: env.clone(),
+            inherit: inherit.to_vec(),
+        })
+        .await?;
+    receive_exec_result(client).await
+}
+
+async fn receive_exec_result<R, W>(client: &mut ProtocolClient<R, W>) -> anyhow::Result<ExecOutput>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
     match client.recv_message().await? {
         Some(Message::ExecResult {
             exit_code,

@@ -694,12 +694,28 @@ impl QemuSandbox {
         cmd: &[String],
         env: &HashMap<String, String>,
     ) -> anyhow::Result<ExecOutput> {
-        // Exec メッセージを作成
         let exec_msg = Message::Exec {
             cmd: cmd.to_vec(),
             env: env.clone(),
         };
+        self.send_exec_message(exec_msg).await
+    }
 
+    async fn send_command_with_environment(
+        &self,
+        cmd: &[String],
+        env: &HashMap<String, String>,
+        inherit: &[String],
+    ) -> anyhow::Result<ExecOutput> {
+        let exec_msg = Message::ExecWithEnvironment {
+            cmd: cmd.to_vec(),
+            env: env.clone(),
+            inherit: inherit.to_vec(),
+        };
+        self.send_exec_message(exec_msg).await
+    }
+
+    async fn send_exec_message(&self, exec_msg: Message) -> anyhow::Result<ExecOutput> {
         // conn_mutex ロック内で送受信のみ行い、pcap 記録はロック外で実行
         let result = self.exchange_exec(&exec_msg).await?;
 
@@ -943,6 +959,21 @@ impl Sandbox for QemuSandbox {
         self.send_command(cmd, env).await
     }
 
+    async fn exec_with_environment(
+        &self,
+        cmd: &[String],
+        env: &HashMap<String, String>,
+        inherit: &[String],
+    ) -> anyhow::Result<ExecOutput> {
+        if self.status != SandboxStatus::Running {
+            anyhow::bail!("Sandbox is not running (current: {:?})", self.status);
+        }
+        if cmd.is_empty() {
+            anyhow::bail!("Command must not be empty");
+        }
+        self.send_command_with_environment(cmd, env, inherit).await
+    }
+
     async fn shell(&self) -> anyhow::Result<()> {
         if self.status != SandboxStatus::Running {
             anyhow::bail!("Sandbox is not running (current: {:?})", self.status);
@@ -959,6 +990,35 @@ impl Sandbox for QemuSandbox {
         }
 
         match crate::terminal_shell::interactive_shell(&mut conn.client).await {
+            Ok(0) => Ok(()),
+            Ok(code) => anyhow::bail!("shell exited with code {code}"),
+            Err(error) => {
+                conn.broken = true;
+                Err(error)
+            }
+        }
+    }
+
+    async fn shell_with_environment(
+        &self,
+        env: &HashMap<String, String>,
+        inherit: &[String],
+    ) -> anyhow::Result<()> {
+        if self.status != SandboxStatus::Running {
+            anyhow::bail!("Sandbox is not running (current: {:?})", self.status);
+        }
+        let conn_mutex = self
+            .connection
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no persistent connection available"))?;
+        let mut conn = conn_mutex.lock().await;
+        match crate::terminal_shell::interactive_shell_with_environment(
+            &mut conn.client,
+            env,
+            inherit,
+        )
+        .await
+        {
             Ok(0) => Ok(()),
             Ok(code) => anyhow::bail!("shell exited with code {code}"),
             Err(error) => {

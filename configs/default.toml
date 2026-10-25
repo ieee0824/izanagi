@@ -5,6 +5,14 @@ backend = "native"
 tracer = "auto"
 require_auth = true
 
+# Variables from the guest/container image are inherited only when named.
+[sandbox.environment]
+inherit = [] # e.g. ["PATH", "CARGO_HOME", "RUSTUP_HOME"]
+
+# Literal project values are shared by exec and shell. Do not put secrets here.
+[sandbox.environment.set]
+# RUST_BACKTRACE = "1"
+
 # macOS container backend options (`native` or `apple-container`).
 # [sandbox.apple_container]
 # runtime = "container"           # container | docker | podman

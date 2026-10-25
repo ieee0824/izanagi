@@ -1,14 +1,14 @@
 use izanagi::config::Config;
 use izanagi::session::{self, Session};
 
-use super::{acquire_instance_lock, izanagi_dir, start_engine, stop_engine};
+use super::{acquire_instance_lock, build_sandbox_env, izanagi_dir, start_engine, stop_engine};
 
 pub async fn cmd_shell(config: &Config) -> anyhow::Result<u8> {
     // up 中のセッションがあればそこに接続
     if let Some(sess) = session::load_session(&izanagi_dir())?
         && session::is_session_alive(&sess)
     {
-        return shell_on_session(&sess).await;
+        return shell_on_session(config, &sess).await;
     }
 
     // セッションがなければ単発起動
@@ -16,7 +16,13 @@ pub async fn cmd_shell(config: &Config) -> anyhow::Result<u8> {
 
     let (engine, log_storage) = start_engine(config, None).await?;
 
-    let shell_result = engine.shell().await;
+    let policy = &config.sandbox.environment;
+    let shell_result = if policy.set.is_empty() && policy.inherit.is_empty() {
+        engine.shell().await
+    } else {
+        let (env, inherit) = build_sandbox_env(Some(config));
+        engine.shell_with_environment(&env, &inherit).await
+    };
 
     stop_engine(engine, &log_storage).await;
 
@@ -36,9 +42,16 @@ pub async fn cmd_shell(config: &Config) -> anyhow::Result<u8> {
 }
 
 /// up 中のセッションに接続してシェルを起動する。
-async fn shell_on_session(sess: &Session) -> anyhow::Result<u8> {
+async fn shell_on_session(config: &Config, sess: &Session) -> anyhow::Result<u8> {
     let mut client = sess.backend.connect_agent().await?;
-    let code = izanagi::terminal_shell::interactive_shell(&mut client).await?;
+    let policy = &config.sandbox.environment;
+    let code = if policy.set.is_empty() && policy.inherit.is_empty() {
+        izanagi::terminal_shell::interactive_shell(&mut client).await?
+    } else {
+        let (env, inherit) = build_sandbox_env(Some(config));
+        izanagi::terminal_shell::interactive_shell_with_environment(&mut client, &env, &inherit)
+            .await?
+    };
     Ok(code.try_into().unwrap_or(1))
 }
 
@@ -52,7 +65,8 @@ async fn qemu_interactive_shell(host_port: u16, token_hash: Option<&str>) -> any
         pid: 0,
         started_at: 0,
     };
-    shell_on_session(&sess).await
+    let config = Config::default();
+    shell_on_session(&config, &sess).await
 }
 
 #[cfg(test)]

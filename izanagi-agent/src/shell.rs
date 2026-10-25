@@ -277,7 +277,9 @@ fn nonblocking_master(
     if flags < 0 || unsafe { libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
         return Err(std::io::Error::last_os_error());
     }
-    tokio::io::unix::AsyncFd::new(master)
+    // SAFETY: `master` exclusively owns this stable file descriptor for the
+    // lifetime of AsyncFd and is not replaced through `get_mut`.
+    unsafe { tokio::io::unix::AsyncFd::register(master) }.map_err(std::io::Error::from)
 }
 
 #[cfg(all(test, target_os = "linux"))]

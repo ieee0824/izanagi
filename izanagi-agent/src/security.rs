@@ -28,15 +28,41 @@ pub(crate) const DENIED_ENV_VARS: &[&str] = &[
     "DOTNET_STARTUP_HOOKS",
 ];
 
+pub(crate) fn is_denied_env_var(key: &str) -> bool {
+    key.starts_with("IZANAGI_") || DENIED_ENV_VARS.contains(&key)
+}
+
 /// 環境変数から危険なエントリを除外する。
 pub(crate) fn sanitize_env(env: &HashMap<String, String>) -> HashMap<String, String> {
     let mut sanitized = env.clone();
-    for key in DENIED_ENV_VARS {
-        if sanitized.remove(*key).is_some() {
+    sanitized.retain(|key, _| {
+        let allowed = !is_denied_env_var(key);
+        if !allowed {
             eprintln!("WARNING: rejected dangerous env var: {}", key);
         }
-    }
+        allowed
+    });
     sanitized
+}
+
+/// Resolve only explicitly allowed variables from the image/agent environment.
+/// Configured values take precedence, and internal or injection-capable names are never exposed.
+pub(crate) fn resolve_environment(
+    env: &HashMap<String, String>,
+    inherit: &[String],
+) -> HashMap<String, String> {
+    let mut resolved = HashMap::new();
+    for key in inherit {
+        if is_denied_env_var(key) {
+            eprintln!("WARNING: rejected dangerous inherited env var: {}", key);
+            continue;
+        }
+        if let Ok(value) = std::env::var(key) {
+            resolved.insert(key.clone(), value);
+        }
+    }
+    resolved.extend(sanitize_env(env));
+    resolved
 }
 
 /// クライアントに返すエラーメッセージの共通プレフィクス。
@@ -179,6 +205,32 @@ mod tests {
         let env = std::collections::HashMap::new();
         let sanitized = sanitize_env(&env);
         assert!(sanitized.is_empty());
+    }
+
+    #[test]
+    fn sanitize_env_removes_internal_agent_variables() {
+        let env = HashMap::from([
+            ("IZANAGI_SHARED_SECRET".into(), "secret".into()),
+            ("SAFE_VAR".into(), "safe".into()),
+        ]);
+        let sanitized = sanitize_env(&env);
+        assert!(!sanitized.contains_key("IZANAGI_SHARED_SECRET"));
+        assert_eq!(sanitized.get("SAFE_VAR").map(String::as_str), Some("safe"));
+    }
+
+    #[test]
+    fn configured_values_override_inherited_values() {
+        let inherited_path = std::env::var("PATH").expect("test process must have PATH");
+        let resolved = resolve_environment(
+            &HashMap::from([("PATH".into(), "/configured/bin".into())]),
+            &["PATH".into(), "IZANAGI_SHARED_SECRET".into()],
+        );
+        assert_ne!(inherited_path, "");
+        assert_eq!(
+            resolved.get("PATH").map(String::as_str),
+            Some("/configured/bin")
+        );
+        assert!(!resolved.contains_key("IZANAGI_SHARED_SECRET"));
     }
 
     #[test]

@@ -2,6 +2,46 @@ use super::*;
 use serial_test::serial;
 
 #[test]
+fn parses_and_validates_sandbox_environment_policy() {
+    let mut config = Config::default();
+    config.sandbox.environment.inherit = vec!["PATH".into(), "CARGO_HOME".into()];
+    config
+        .sandbox
+        .environment
+        .set
+        .insert("RUST_BACKTRACE".into(), "1".into());
+    assert!(config.validate().is_ok());
+
+    let encoded = toml::to_string(&config).unwrap();
+    let decoded = Config::from_toml(&encoded).unwrap();
+    assert_eq!(decoded.sandbox.environment.inherit, ["PATH", "CARGO_HOME"]);
+    assert_eq!(
+        decoded.sandbox.environment.set.get("RUST_BACKTRACE"),
+        Some(&"1".to_string())
+    );
+}
+
+#[test]
+fn rejects_unsafe_duplicate_or_ambiguous_environment_policy() {
+    for name in ["LD_PRELOAD", "IZANAGI_SHARED_SECRET", "HOME", "bad-name"] {
+        let mut config = Config::default();
+        config.sandbox.environment.inherit = vec![name.into()];
+        assert!(config.validate().is_err(), "{name} must be rejected");
+    }
+
+    let mut config = Config::default();
+    config.sandbox.environment.inherit = vec!["PATH".into(), "PATH".into()];
+    assert!(config.validate().is_err());
+    config.sandbox.environment.inherit = vec!["PATH".into()];
+    config
+        .sandbox
+        .environment
+        .set
+        .insert("PATH".into(), "/bin".into());
+    assert!(config.validate().is_err());
+}
+
+#[test]
 fn parse_readme_example() {
     let toml_str = r#"
 [sandbox]

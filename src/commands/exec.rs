@@ -14,7 +14,7 @@ pub async fn cmd_exec(config: &Config, cmd: &[String]) -> anyhow::Result<u8> {
     if let Some(sess) = session::load_session(&izanagi_dir())?
         && session::is_session_alive(&sess)
     {
-        return exec_on_session(&sess, cmd).await;
+        return exec_on_session(config, &sess, cmd).await;
     }
 
     // セッションがなければ単発起動
@@ -23,10 +23,16 @@ pub async fn cmd_exec(config: &Config, cmd: &[String]) -> anyhow::Result<u8> {
     let (engine, log_storage) = start_engine(config, None).await?;
 
     let exec_result = {
-        let env = build_sandbox_env();
+        let (env, inherit) = build_sandbox_env(Some(config));
 
         tokio::select! {
-            result = engine.exec(cmd, &env) => {
+            result = async {
+                if inherit.is_empty() {
+                    engine.exec(cmd, &env).await
+                } else {
+                    engine.exec_with_environment(cmd, &env, &inherit).await
+                }
+            } => {
                 match result {
                     Ok(output) => {
                         if !output.stdout.is_empty() {
@@ -53,10 +59,18 @@ pub async fn cmd_exec(config: &Config, cmd: &[String]) -> anyhow::Result<u8> {
 }
 
 /// up 中のセッションに接続してコマンドを実行する。
-pub(crate) async fn exec_on_session(sess: &Session, cmd: &[String]) -> anyhow::Result<u8> {
-    let env = build_sandbox_env();
+pub(crate) async fn exec_on_session(
+    config: &Config,
+    sess: &Session,
+    cmd: &[String],
+) -> anyhow::Result<u8> {
+    let (env, inherit) = build_sandbox_env(Some(config));
 
-    let output = exec_on_session_raw(sess, cmd, &env).await?;
+    let output = if inherit.is_empty() {
+        exec_on_session_raw(sess, cmd, &env).await?
+    } else {
+        exec_on_session_raw_with_environment(sess, cmd, &env, &inherit).await?
+    };
     if !output.stdout.is_empty() {
         print!("{}", String::from_utf8_lossy(&output.stdout));
     }
@@ -74,4 +88,14 @@ pub(crate) async fn exec_on_session_raw(
 ) -> anyhow::Result<izanagi::sandbox::ExecOutput> {
     let mut client = sess.backend.connect_agent().await?;
     izanagi::agent_session::execute(&mut client, cmd, env).await
+}
+
+pub(crate) async fn exec_on_session_raw_with_environment(
+    sess: &Session,
+    cmd: &[String],
+    env: &HashMap<String, String>,
+    inherit: &[String],
+) -> anyhow::Result<izanagi::sandbox::ExecOutput> {
+    let mut client = sess.backend.connect_agent().await?;
+    izanagi::agent_session::execute_with_environment(&mut client, cmd, env, inherit).await
 }

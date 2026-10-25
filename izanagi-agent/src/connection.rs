@@ -4,8 +4,8 @@ use izanagi::protocol::{self, Message, MessageReader};
 use izanagi::tracer::Tracer;
 
 use crate::crypto::{constant_time_eq, sha256_hex};
-use crate::exec::{EXEC_USER, execute_command};
-use crate::security::sanitize_anyhow_error;
+use crate::exec::{EXEC_USER, execute_command_with_environment};
+use crate::security::{resolve_environment, sanitize_anyhow_error};
 use crate::shell::{ShellChild, relay_shell};
 
 const HELLO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
@@ -184,7 +184,12 @@ where
             }
             Message::Exec { cmd, env } => {
                 if self.authorize("Exec").await? {
-                    self.exec(cmd, env).await?;
+                    self.exec(cmd, env, Vec::new()).await?;
+                }
+            }
+            Message::ExecWithEnvironment { cmd, env, inherit } => {
+                if self.authorize("Exec").await? {
+                    self.exec(cmd, env, inherit).await?;
                 }
             }
             Message::Start(filter) => self.trace(filter, None).await?,
@@ -202,8 +207,36 @@ where
                         self.secret,
                         &mut self.send_seq,
                         &mut self.recv_seq,
-                        rows,
-                        cols,
+                        ShellRequest {
+                            rows,
+                            cols,
+                            env: &Default::default(),
+                            inherit: &[],
+                        },
+                    )
+                    .await?;
+                }
+            }
+            Message::ShellWithEnvironment {
+                rows,
+                cols,
+                env,
+                inherit,
+            } => {
+                if self.authorize("Shell").await? {
+                    eprintln!("received Shell with environment ({}x{})", cols, rows);
+                    handle_shell(
+                        &mut self.reader,
+                        &mut self.writer,
+                        self.secret,
+                        &mut self.send_seq,
+                        &mut self.recv_seq,
+                        ShellRequest {
+                            rows,
+                            cols,
+                            env: &env,
+                            inherit: &inherit,
+                        },
                     )
                     .await?;
                 }
@@ -221,6 +254,7 @@ where
         &mut self,
         cmd: Vec<String>,
         mut env: std::collections::HashMap<String, String>,
+        inherit: Vec<String>,
     ) -> anyhow::Result<()> {
         eprintln!("received Exec");
         if let Some(proxy) = crate::sidecar::proxy_environment() {
@@ -231,7 +265,7 @@ where
                 env.insert(key.into(), String::new());
             }
         }
-        match execute_command(&cmd, &env).await {
+        match execute_command_with_environment(&cmd, &env, &inherit).await {
             Ok((exit_code, stdout, stderr)) => {
                 self.send(&Message::ExecResult {
                     exit_code,
@@ -451,20 +485,26 @@ impl TraceStreams {
 }
 
 /// 対話シェルを PTY 経由で実行し、ホストと stdin/stdout をストリーミングする。
+struct ShellRequest<'a> {
+    rows: u16,
+    cols: u16,
+    env: &'a std::collections::HashMap<String, String>,
+    inherit: &'a [String],
+}
+
 async fn handle_shell<R, W>(
     reader: &mut MessageReader<R>,
     writer: &mut W,
     secret: Option<&[u8]>,
     send_seq: &mut u64,
     recv_seq: &mut u64,
-    rows: u16,
-    cols: u16,
+    request: ShellRequest<'_>,
 ) -> anyhow::Result<()>
 where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
 {
-    match prepare_shell(rows, cols)? {
+    match prepare_shell(request.rows, request.cols, request.env, request.inherit)? {
         ShellLaunch::Ready(master, child) => {
             relay_shell(reader, writer, secret, send_seq, recv_seq, master, child).await
         }
@@ -480,7 +520,12 @@ enum ShellLaunch {
     Rejected(String),
 }
 
-fn prepare_shell(rows: u16, cols: u16) -> anyhow::Result<ShellLaunch> {
+fn prepare_shell(
+    rows: u16,
+    cols: u16,
+    env: &std::collections::HashMap<String, String>,
+    inherit: &[String],
+) -> anyhow::Result<ShellLaunch> {
     use std::os::unix::io::FromRawFd;
     // All user lookup, environment validation and allocation happen before fork.
     let Some((uid, gid, home_dir)) = crate::credentials::lookup_user(EXEC_USER)? else {
@@ -489,7 +534,7 @@ fn prepare_shell(rows: u16, cols: u16) -> anyhow::Result<ShellLaunch> {
             EXEC_USER
         )));
     };
-    let env_vars = shell_environment(&home_dir)?;
+    let env_vars = shell_environment(&home_dir, env, inherit)?;
     let (pid, master_fd) = fork_shell(uid, gid, &env_vars, rows, cols);
     if pid < 0 {
         return Ok(ShellLaunch::Rejected(format!(
@@ -503,27 +548,34 @@ fn prepare_shell(rows: u16, cols: u16) -> anyhow::Result<ShellLaunch> {
     Ok(ShellLaunch::Ready(master, child))
 }
 
-fn shell_environment(home_dir: &str) -> anyhow::Result<Vec<std::ffi::CString>> {
+fn shell_environment(
+    home_dir: &str,
+    env: &std::collections::HashMap<String, String>,
+    inherit: &[String],
+) -> anyhow::Result<Vec<std::ffi::CString>> {
     // Reject interior NUL; do not silently drop unsafe environment values.
-    let mut shell_env = vec![
-        format!("HOME={}", home_dir),
-        format!("USER={}", EXEC_USER),
-        "TERM=xterm-256color".to_string(),
-        "PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin".to_string(),
-    ];
+    let mut resolved = resolve_environment(env, inherit);
+    resolved
+        .entry("TERM".into())
+        .or_insert_with(|| "xterm-256color".into());
+    resolved
+        .entry("PATH".into())
+        .or_insert_with(|| "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin".into());
+    resolved.insert("HOME".into(), home_dir.into());
+    resolved.insert("USER".into(), EXEC_USER.into());
     if let Some(proxy) = crate::sidecar::proxy_environment() {
         for key in ["http_proxy", "HTTP_PROXY"] {
-            shell_env.push(format!("{key}={proxy}"));
+            resolved.insert(key.into(), proxy.clone());
         }
         for key in ["no_proxy", "NO_PROXY"] {
-            shell_env.push(format!("{key}="));
+            resolved.insert(key.into(), String::new());
         }
     }
-    shell_env
-        .iter()
-        .map(|s| {
-            std::ffi::CString::new(s.as_str()).map_err(|_| {
-                anyhow::anyhow!("environment variable contains interior NUL byte: {}", s)
+    resolved
+        .into_iter()
+        .map(|(key, value)| {
+            std::ffi::CString::new(format!("{key}={value}")).map_err(|_| {
+                anyhow::anyhow!("environment variable contains interior NUL byte: {key}")
             })
         })
         .collect::<anyhow::Result<Vec<std::ffi::CString>>>()
@@ -641,6 +693,24 @@ pub(crate) async fn recv_message<R: tokio::io::AsyncRead + Unpin>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn shell_environment_applies_configured_values_and_protects_identity() {
+        let env = std::collections::HashMap::from([
+            ("RUST_BACKTRACE".into(), "1".into()),
+            ("HOME".into(), "/attacker".into()),
+            ("IZANAGI_SHARED_SECRET".into(), "secret".into()),
+        ]);
+        let values = super::shell_environment("/home/izanagi", &env, &[]).unwrap();
+        let values = values
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect::<Vec<_>>();
+        assert!(values.contains(&"RUST_BACKTRACE=1"));
+        assert!(values.contains(&"HOME=/home/izanagi"));
+        assert!(values.contains(&"USER=izanagi"));
+        assert!(!values.iter().any(|value| value.contains("secret")));
+    }
+
     #[tokio::test]
     async fn hello_failures_reject_before_ready() {
         for (host_auth, token, expected, error) in [

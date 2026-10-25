@@ -598,12 +598,46 @@ impl Sandbox for AppleContainerSandbox {
         crate::agent_session::execute(&mut client, cmd, env).await
     }
 
+    async fn exec_with_environment(
+        &self,
+        cmd: &[String],
+        env: &HashMap<String, String>,
+        inherit: &[String],
+    ) -> anyhow::Result<ExecOutput> {
+        if self.status != SandboxStatus::Running {
+            anyhow::bail!("Sandbox is not running (current: {:?})", self.status);
+        }
+        if cmd.is_empty() {
+            anyhow::bail!("Command must not be empty");
+        }
+        let mut client = self.connect_agent().await?;
+        crate::agent_session::execute_with_environment(&mut client, cmd, env, inherit).await
+    }
+
     async fn shell(&self) -> anyhow::Result<()> {
         if self.status != SandboxStatus::Running {
             anyhow::bail!("Sandbox is not running (current: {:?})", self.status);
         }
         let mut client = self.connect_agent().await?;
         let code = crate::terminal_shell::interactive_shell(&mut client).await?;
+        if code != 0 {
+            anyhow::bail!("shell exited with code {}", code);
+        }
+        Ok(())
+    }
+
+    async fn shell_with_environment(
+        &self,
+        env: &HashMap<String, String>,
+        inherit: &[String],
+    ) -> anyhow::Result<()> {
+        if self.status != SandboxStatus::Running {
+            anyhow::bail!("Sandbox is not running (current: {:?})", self.status);
+        }
+        let mut client = self.connect_agent().await?;
+        let code =
+            crate::terminal_shell::interactive_shell_with_environment(&mut client, env, inherit)
+                .await?;
         if code != 0 {
             anyhow::bail!("shell exited with code {}", code);
         }
