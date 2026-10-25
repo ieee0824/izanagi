@@ -468,11 +468,11 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "izanagi-common"
-version = "0.2.4"
+version = "0.2.5"
 
 [[package]]
 name = "izanagi-http-capture"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "anyhow",
  "chrono",
@@ -492,7 +492,7 @@ dependencies = [
 
 [[package]]
 name = "izanagi-telemetry"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "hex",
  "libc",
