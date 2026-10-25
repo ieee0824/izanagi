@@ -100,11 +100,46 @@ where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
 {
+    interactive_shell_inner(client, None).await
+}
+
+pub async fn interactive_shell_with_environment<R, W>(
+    client: &mut ProtocolClient<R, W>,
+    env: &std::collections::HashMap<String, String>,
+    inherit: &[String],
+) -> anyhow::Result<i32>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    interactive_shell_inner(client, Some((env, inherit))).await
+}
+
+async fn interactive_shell_inner<R, W>(
+    client: &mut ProtocolClient<R, W>,
+    environment: Option<(&std::collections::HashMap<String, String>, &[String])>,
+) -> anyhow::Result<i32>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
     let terminal = Terminal::open()?;
     let mut sigwinch =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())?;
     let (rows, cols) = terminal_size();
-    client.send_message(&Message::Shell { rows, cols }).await?;
+    match environment {
+        Some((env, inherit)) => {
+            client
+                .send_message(&Message::ShellWithEnvironment {
+                    rows,
+                    cols,
+                    env: env.clone(),
+                    inherit: inherit.to_vec(),
+                })
+                .await?;
+        }
+        None => client.send_message(&Message::Shell { rows, cols }).await?,
+    }
     let mut bytes = [0; 1024];
     loop {
         tokio::select! {

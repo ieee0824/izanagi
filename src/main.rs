@@ -413,8 +413,10 @@ async fn stop_engine(mut engine: Engine, log_storage: &LogStorage) {
 }
 
 /// サンドボックス内コマンド実行用の基本環境変数を構築する。
-fn build_sandbox_env() -> HashMap<String, String> {
-    let mut env = HashMap::new();
+fn build_sandbox_env(config: Option<&Config>) -> (HashMap<String, String>, Vec<String>) {
+    let mut env = config
+        .map(|config| config.sandbox.environment.set.clone())
+        .unwrap_or_default();
     env.insert(
         "PATH".to_string(),
         "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin".to_string(),
@@ -422,7 +424,10 @@ fn build_sandbox_env() -> HashMap<String, String> {
     if let Ok(term) = std::env::var("TERM") {
         env.insert("TERM".to_string(), term);
     }
-    env
+    let inherit = config
+        .map(|config| config.sandbox.environment.inherit.clone())
+        .unwrap_or_default();
+    (env, inherit)
 }
 
 // ---------------------------------------------------------------------------

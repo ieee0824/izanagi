@@ -368,6 +368,31 @@ impl Engine {
         }
     }
 
+    pub async fn exec_with_environment(
+        &self,
+        cmd: &[String],
+        env: &std::collections::HashMap<String, String>,
+        inherit: &[String],
+    ) -> anyhow::Result<crate::sandbox::ExecOutput> {
+        tokio::select! {
+            biased;
+            error = self.wait_for_monitoring_failure() => Err(error),
+            result = self.sandbox.exec_with_environment(cmd, env, inherit) => result,
+        }
+    }
+
+    pub async fn shell_with_environment(
+        &self,
+        env: &std::collections::HashMap<String, String>,
+        inherit: &[String],
+    ) -> anyhow::Result<()> {
+        tokio::select! {
+            biased;
+            error = self.wait_for_monitoring_failure() => Err(error),
+            result = self.sandbox.shell_with_environment(env, inherit) => result,
+        }
+    }
+
     /// 内部の Sandbox への参照を返す。
     /// 設定・セッション情報の取得用。実行は監視状態を確認する Engine::exec / shell を使う。
     pub fn sandbox(&self) -> &dyn Sandbox {

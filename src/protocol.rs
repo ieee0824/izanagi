@@ -140,6 +140,21 @@ pub enum Message {
     DnsStatus {
         endpoint: Option<String>,
     },
+    /// host → agent: command execution with an explicit guest-environment allowlist.
+    /// Appended to preserve existing postcard discriminants.
+    ExecWithEnvironment {
+        cmd: Vec<String>,
+        env: HashMap<String, String>,
+        inherit: Vec<String>,
+    },
+    /// host → agent: shell with configured values and guest-environment allowlist.
+    /// Appended to preserve existing postcard discriminants.
+    ShellWithEnvironment {
+        rows: u16,
+        cols: u16,
+        env: HashMap<String, String>,
+        inherit: Vec<String>,
+    },
 }
 
 impl Message {
@@ -152,9 +167,9 @@ impl Message {
             Self::Ready => MessageType::Ready,
             Self::Error(_) => MessageType::Error,
             Self::Hello { .. } => MessageType::Hello,
-            Self::Exec { .. } => MessageType::Exec,
+            Self::Exec { .. } | Self::ExecWithEnvironment { .. } => MessageType::Exec,
             Self::ExecResult { .. } => MessageType::ExecResult,
-            Self::Shell { .. } => MessageType::Shell,
+            Self::Shell { .. } | Self::ShellWithEnvironment { .. } => MessageType::Shell,
             Self::ShellData { .. } => MessageType::ShellData,
             Self::ShellClose { .. } => MessageType::ShellClose,
             Self::ShellResize { .. } => MessageType::ShellResize,
@@ -637,6 +652,17 @@ mod tests {
                 stderr: vec![128],
             },
             Message::Shell { rows: 24, cols: 80 },
+            Message::ExecWithEnvironment {
+                cmd: vec!["env".into()],
+                env: HashMap::from([("RUST_BACKTRACE".into(), "1".into())]),
+                inherit: vec!["PATH".into(), "CARGO_HOME".into()],
+            },
+            Message::ShellWithEnvironment {
+                rows: 24,
+                cols: 80,
+                env: HashMap::from([("RUST_BACKTRACE".into(), "1".into())]),
+                inherit: vec!["PATH".into()],
+            },
             Message::ShellData {
                 stream: 2,
                 data: vec![0, 255, 128],

@@ -330,6 +330,14 @@ backend = "native"              # native | apple-container | qemu
 tracer = "auto"                 # auto | ebpf | dtrace | vm-agent | none
 require_auth = true             # HMAC 認証を必須にする (デフォルト true)
 
+# guest/container image から明示的に引き継ぐ変数
+[sandbox.environment]
+inherit = ["PATH", "CARGO_HOME", "RUSTUP_HOME"]
+
+# exec と shell の両方へ渡す非機密の固定値
+[sandbox.environment.set]
+RUST_BACKTRACE = "1"
+
 [sandbox.qemu]
 cpus = 2
 memory = "4G"
@@ -372,6 +380,12 @@ listen = "127.0.0.1:15353"       # QEMU 用のホスト listen
 macOS の Apple Container 互換バックエンドでは `runtime` に `container`、`docker`、
 `podman` を指定できる。未指定時は従来どおり `container` を使用する。
 `backend = "native"` が macOS で Apple Container バックエンドへ解決される場合にも、この設定が適用される。
+
+`sandbox.environment.inherit` はallowlistであり、イメージ内の環境変数を既定では一切引き継がない。
+`PATH` やツールチェーンのホームを指定すると、派生イメージの値を `izanagi exec` と
+`izanagi shell` の両方で利用できる。`sandbox.environment.set` は設定ファイルに値が残るため、
+トークンや認証情報には使用しない。ライブラリ・ランタイム注入に使える変数、`HOME`、`USER`、
+および認証情報を含み得る `IZANAGI_*` は、設定されていても拒否される。
 
 ## バックエンド自動選択
 

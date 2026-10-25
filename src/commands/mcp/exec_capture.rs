@@ -14,7 +14,7 @@ pub(super) async fn exec_on_session_capture(
     sess: &session::Session,
     cmd: &[String],
 ) -> anyhow::Result<ExecOutput> {
-    let env = super::build_sandbox_env();
+    let (env, _) = super::build_sandbox_env(None);
     let output = tokio::time::timeout(
         EXEC_TIMEOUT,
         crate::commands::exec::exec_on_session_raw(sess, cmd, &env),

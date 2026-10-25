@@ -74,7 +74,7 @@ pub struct ExecOutput {
 /// `exec` / `shell` は `Running` 状態でのみ呼び出せる。
 /// それ以外の状態で呼んだ場合は `Err` を返す。
 #[async_trait::async_trait]
-pub trait Sandbox: Send {
+pub trait Sandbox: Send + Sync {
     /// 隔離環境を起動する。`Running` になるまで待つ。
     async fn up(&mut self, config: &SandboxConfig) -> anyhow::Result<()>;
 
@@ -88,12 +88,36 @@ pub trait Sandbox: Send {
         env: &HashMap<String, String>,
     ) -> anyhow::Result<ExecOutput>;
 
+    /// Execute with selected variables inherited from the sandbox environment.
+    async fn exec_with_environment(
+        &self,
+        cmd: &[String],
+        env: &HashMap<String, String>,
+        inherit: &[String],
+    ) -> anyhow::Result<ExecOutput> {
+        let mut resolved = inherit
+            .iter()
+            .filter_map(|key| std::env::var(key).ok().map(|value| (key.clone(), value)))
+            .collect::<HashMap<_, _>>();
+        resolved.extend(env.clone());
+        self.exec(cmd, &resolved).await
+    }
+
     /// 隔離環境内でインタラクティブシェルを起動する。
     /// シェル終了まで制御を渡す。
     ///
     /// # Errors
     /// 状態が `Running` でない場合は `Err` を返す。
     async fn shell(&self) -> anyhow::Result<()>;
+
+    /// Start an interactive shell with the configured environment policy.
+    async fn shell_with_environment(
+        &self,
+        _env: &HashMap<String, String>,
+        _inherit: &[String],
+    ) -> anyhow::Result<()> {
+        self.shell().await
+    }
 
     /// 隔離環境を停止する。`Stopped` になるまで待つ。
     async fn down(&mut self) -> anyhow::Result<()>;

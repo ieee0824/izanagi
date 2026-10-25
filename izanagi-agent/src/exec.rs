@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use anyhow::Result;
 use tokio::io::AsyncReadExt;
 
-use crate::security::{EXEC_ERROR_PREFIX, sanitize_env, sanitize_exec_error, shell_escape};
+use crate::security::{EXEC_ERROR_PREFIX, resolve_environment, sanitize_exec_error, shell_escape};
 
 /// 非特権ユーザー名。コマンド実行はこのユーザーで行う。
 pub(crate) const EXEC_USER: &str = "izanagi";
@@ -16,9 +16,10 @@ use izanagi::exec_output::{MAX_OUTPUT_SIZE, truncate_output};
 /// VM 内でコマンドを非特権ユーザーとして実行する。
 /// agent 自体は root で動作するが（eBPF に必要）、
 /// ユーザーから依頼されたコマンドは `EXEC_USER` に降格して実行する。
-pub(crate) async fn execute_command(
+pub(crate) async fn execute_command_with_environment(
     cmd: &[String],
     env: &HashMap<String, String>,
+    inherit: &[String],
 ) -> Result<(i32, Vec<u8>, Vec<u8>)> {
     if cmd.is_empty() {
         anyhow::bail!("{}: not found", EXEC_ERROR_PREFIX);
@@ -28,7 +29,9 @@ pub(crate) async fn execute_command(
     check_command_allowlist(&cmd[0])?;
 
     // 危険な環境変数を除外
-    let env = sanitize_env(env);
+    let mut env = resolve_environment(env, inherit);
+    env.entry("PATH".into())
+        .or_insert_with(|| "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin".into());
 
     let mut child = spawn_exec(cmd, &env)?;
     collect_exec_output(&mut child, EXEC_TIMEOUT_SECS).await
@@ -61,7 +64,6 @@ fn spawn_exec(cmd: &[String], env: &HashMap<String, String>) -> Result<tokio::pr
         .args(["-c", &cmd_str])
         .env_clear()
         .envs(env)
-        .env("PATH", "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")
         .env("HOME", format!("/home/{}", EXEC_USER))
         .env("USER", EXEC_USER)
         .stdout(std::process::Stdio::piped())
@@ -371,7 +373,7 @@ mod tests {
 
     #[tokio::test]
     async fn execute_command_empty_cmd_fails() {
-        let result = execute_command(&[], &Default::default()).await;
+        let result = execute_command_with_environment(&[], &Default::default(), &[]).await;
         assert!(result.is_err());
     }
 }

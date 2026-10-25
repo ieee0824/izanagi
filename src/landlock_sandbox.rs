@@ -397,52 +397,20 @@ mod inner {
         }
 
         async fn shell(&self) -> anyhow::Result<()> {
-            if self.status != SandboxStatus::Running {
-                anyhow::bail!("Sandbox is not running (current: {:?})", self.status);
-            }
+            run_shell(self, HashMap::new()).await
+        }
 
-            let share = self
-                .share
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("ShareConfig not set"))?;
-            let abi = self
-                .abi
-                .ok_or_else(|| anyhow::anyhow!("ABI not detected"))?;
-
-            let share_clone = share.clone();
-
-            let status = tokio::task::spawn_blocking(move || {
-                use std::process::{Command, Stdio};
-
-                // ルールセット構築は fork 前に完了（heap allocation を伴う）
-                let mut ruleset =
-                    Some(build_ruleset(&share_clone, abi).map_err(std::io::Error::other)?);
-
-                // Safety: pre_exec 内では restrict_self() のみ呼ぶ（async-signal-safe）
-                // apply_ruleset は std::io::Result を返し、ヒープアロケーションを行わない
-                unsafe {
-                    Command::new("/bin/bash")
-                        .env_clear()
-                        .env("HOME", std::env::var("HOME").unwrap_or_default())
-                        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
-                        .env("TERM", std::env::var("TERM").unwrap_or_default())
-                        .stdin(Stdio::inherit())
-                        .stdout(Stdio::inherit())
-                        .stderr(Stdio::inherit())
-                        .pre_exec(move || match ruleset.take() {
-                            Some(ruleset) => apply_ruleset(ruleset),
-                            None => Err(std::io::Error::from_raw_os_error(libc::EINVAL)),
-                        })
-                        .status()
-                }
-            })
-            .await??;
-
-            if !status.success() {
-                anyhow::bail!("Shell exited with status: {}", status);
-            }
-
-            Ok(())
+        async fn shell_with_environment(
+            &self,
+            env: &HashMap<String, String>,
+            inherit: &[String],
+        ) -> anyhow::Result<()> {
+            let mut resolved = inherit
+                .iter()
+                .filter_map(|key| std::env::var(key).ok().map(|value| (key.clone(), value)))
+                .collect::<HashMap<_, _>>();
+            resolved.extend(env.clone());
+            run_shell(self, resolved).await
         }
 
         async fn down(&mut self) -> anyhow::Result<()> {
@@ -461,6 +429,50 @@ mod inner {
         fn status(&self) -> SandboxStatus {
             self.status
         }
+    }
+
+    async fn run_shell(
+        sandbox: &LandlockSandbox,
+        mut env: HashMap<String, String>,
+    ) -> anyhow::Result<()> {
+        if sandbox.status != SandboxStatus::Running {
+            anyhow::bail!("Sandbox is not running (current: {:?})", sandbox.status);
+        }
+        let share = sandbox
+            .share
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("ShareConfig not set"))?;
+        let abi = sandbox
+            .abi
+            .ok_or_else(|| anyhow::anyhow!("ABI not detected"))?;
+        env.insert("HOME".into(), std::env::var("HOME").unwrap_or_default());
+        env.entry("PATH".into())
+            .or_insert_with(|| "/usr/bin:/bin:/usr/sbin:/sbin".into());
+        env.entry("TERM".into())
+            .or_insert_with(|| std::env::var("TERM").unwrap_or_default());
+        let share = share.clone();
+        let status = tokio::task::spawn_blocking(move || {
+            use std::process::{Command, Stdio};
+            let mut ruleset = Some(build_ruleset(&share, abi).map_err(std::io::Error::other)?);
+            unsafe {
+                Command::new("/bin/bash")
+                    .env_clear()
+                    .envs(env)
+                    .stdin(Stdio::inherit())
+                    .stdout(Stdio::inherit())
+                    .stderr(Stdio::inherit())
+                    .pre_exec(move || match ruleset.take() {
+                        Some(ruleset) => apply_ruleset(ruleset),
+                        None => Err(std::io::Error::from_raw_os_error(libc::EINVAL)),
+                    })
+                    .status()
+            }
+        })
+        .await??;
+        if !status.success() {
+            anyhow::bail!("Shell exited with status: {}", status);
+        }
+        Ok(())
     }
     #[cfg(test)]
     mod read_only_tests {
