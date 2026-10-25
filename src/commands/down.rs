@@ -130,7 +130,7 @@ pub async fn cmd_down() -> anyhow::Result<u8> {
     // プロセスの終了を待つ (最大10秒)
     for _ in 0..20 {
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-        if let ProcessStatus::NotRunning = check_process_alive(pid) {
+        if target_has_stopped(pid) {
             session::remove_session(&izanagi_dir());
             remove_pid_file();
             remove_lock_file();
@@ -139,4 +139,14 @@ pub async fn cmd_down() -> anyhow::Result<u8> {
         }
     }
     anyhow::bail!("PID {} が10秒以内に停止しませんでした", pid);
+}
+
+/// `kill(pid, 0)` considers an unreaped zombie alive. The instance lock is a
+/// stronger lifecycle signal: once cleanup completes, it is released (or its
+/// pathname is removed) even if the parent has not reaped the process yet.
+fn target_has_stopped(pid: u32) -> bool {
+    if matches!(check_process_alive(pid), ProcessStatus::NotRunning) {
+        return true;
+    }
+    matches!(try_instance_lock(), Ok(Some(_)) | Ok(None))
 }

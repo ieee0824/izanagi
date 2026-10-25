@@ -24,14 +24,29 @@ const GUEST_SECRET_DIR: &str = "/root/.izanagi-auth";
 const SECRET_FILENAME: &str = "shared-secret";
 
 impl SessionCredentials {
-    fn new() -> anyhow::Result<Self> {
+    fn new(runtime: ContainerRuntime) -> anyhow::Result<Self> {
+        let shared_base = match runtime {
+            ContainerRuntime::Container => None,
+            ContainerRuntime::Docker | ContainerRuntime::Podman => {
+                let path = crate::config::izanagi_home()?.join("runtime");
+                create_private_directory(&path)?;
+                Some(path)
+            }
+        };
+        Self::new_in(shared_base.as_deref())
+    }
+
+    fn new_in(base: Option<&std::path::Path>) -> anyhow::Result<Self> {
         use std::io::Write;
         // rand's thread RNG is cryptographically secure; generate a fresh 256-bit key.
         let auth_key =
             zeroize::Zeroizing::new(hex::encode(rand::random::<[u8; 32]>()).into_bytes());
-        let directory = tempfile::Builder::new()
-            .prefix("izanagi-session-")
-            .tempdir()?;
+        let mut builder = tempfile::Builder::new();
+        builder.prefix("izanagi-session-");
+        let directory = match base {
+            Some(base) => builder.tempdir_in(base)?,
+            None => builder.tempdir()?,
+        };
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -52,6 +67,21 @@ impl SessionCredentials {
     fn path(&self) -> PathBuf {
         self.directory.path().join(SECRET_FILENAME)
     }
+}
+
+fn create_private_directory(path: &std::path::Path) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(path)?;
+    Ok(())
 }
 
 /// `container` CLI のデフォルトバイナリ名。
@@ -107,9 +137,15 @@ async fn check_image_exists_with(image: &str, binary: &str) -> anyhow::Result<()
 ///
 /// 出力の各行にイメージ名が含まれるかを確認する。
 pub fn image_exists_in_output(output: &str, image: &str) -> bool {
+    let implicit_latest =
+        (!image.contains(':') && !image.contains('@')).then(|| format!("{image}:latest"));
     output.lines().any(|line| {
-        // 行をフィールドに分割し、最初のフィールド(またはいずれかのフィールド)がイメージ名に一致するか確認
-        line.split_whitespace().any(|field| field == image)
+        line.split_whitespace().any(|field| {
+            field == image
+                || implicit_latest
+                    .as_deref()
+                    .is_some_and(|latest| field == latest)
+        })
     })
 }
 
@@ -446,6 +482,9 @@ impl AppleContainerSandbox {
                 if self.connect_agent().await.is_ok() {
                     return Ok(());
                 }
+                if let Some(error) = self.early_container_exit().await {
+                    return Err(error);
+                }
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
         })
@@ -458,6 +497,38 @@ impl AppleContainerSandbox {
         })?
     }
 
+    async fn early_container_exit(&self) -> Option<anyhow::Error> {
+        if self.container_runtime == ContainerRuntime::Container {
+            return None;
+        }
+        let name = self.container_name.as_deref()?;
+        let inspect = Command::new(&self.container_binary)
+            .args(["inspect", "--format", "{{.State.Running}}", name])
+            .output()
+            .await
+            .ok()?;
+        if inspect.status.success() && String::from_utf8_lossy(&inspect.stdout).trim() == "true" {
+            return None;
+        }
+        let logs = Command::new(&self.container_binary)
+            .args(["logs", name])
+            .output()
+            .await
+            .ok();
+        let detail = logs
+            .as_ref()
+            .map(|output| {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                format!("{stderr}{stdout}").trim().to_string()
+            })
+            .filter(|detail| !detail.is_empty())
+            .unwrap_or_else(|| "コンテナログを取得できませんでした".into());
+        Some(anyhow::anyhow!(
+            "コンテナが Agent の起動前に終了しました: {detail}"
+        ))
+    }
+
     async fn rollback_startup(&mut self) {
         let _ = self.stop_container().await;
         self.credentials = None;
@@ -466,7 +537,7 @@ impl AppleContainerSandbox {
 
     async fn start_container(&mut self, boot: &ContainerBootSettings) -> anyhow::Result<()> {
         self.host_port = find_available_port().await?;
-        let credentials = SessionCredentials::new()?;
+        let credentials = SessionCredentials::new(self.container_runtime)?;
         let container_name = generate_container_name();
         let args = self.boot_args(&container_name, boot, &credentials);
         self.credentials = Some(credentials);
@@ -633,9 +704,8 @@ impl AppleContainerSandbox {
                 {
                     eprintln!("警告: container stop failed: {}", stderr);
                 }
+                self.remove_container(name).await;
             }
-
-            self.remove_container(name).await;
         }
         self.container_name = None;
         self.credentials = None;
@@ -941,6 +1011,15 @@ mod tests {
         assert!(!image_exists_in_output(output, "izanagi-vm"));
     }
 
+    #[test]
+    fn image_exists_in_output_accepts_implicit_latest_tag() {
+        let output = "REPOSITORY:TAG       IMAGE ID\n\
+                      temiya-dev:latest   abc123\n";
+        assert!(image_exists_in_output(output, "temiya-dev"));
+        assert!(image_exists_in_output(output, "temiya-dev:latest"));
+        assert!(!image_exists_in_output(output, "temiya"));
+    }
+
     // --- コマンドライン生成テスト (#150, #151) ---
 
     #[test]
@@ -972,8 +1051,8 @@ mod tests {
     #[test]
     fn session_key_is_private_unique_and_removed_on_drop() {
         use std::os::unix::fs::PermissionsExt;
-        let first = SessionCredentials::new().unwrap();
-        let second = SessionCredentials::new().unwrap();
+        let first = SessionCredentials::new_in(None).unwrap();
+        let second = SessionCredentials::new_in(None).unwrap();
         assert!(*first.auth_key != *second.auth_key);
         assert_eq!(first.auth_key.len(), 64);
         let path = first.path();
@@ -997,7 +1076,7 @@ mod tests {
 
     #[test]
     fn run_mounts_secret_read_only_without_inline_environment() {
-        let credentials = SessionCredentials::new().unwrap();
+        let credentials = SessionCredentials::new_in(None).unwrap();
         let share = ShareConfig {
             host_paths: vec![],
             mount_point: "/workspace".into(),

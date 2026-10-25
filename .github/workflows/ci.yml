@@ -151,6 +151,17 @@ jobs:
             sh /checks/tests/image-security.sh /checks/packer
           '
 
+  image-build-definition:
+    name: Validate image build definition
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Validate build script and referenced Dockerfiles
+        run: |
+          bash -n image/build.sh
+          test -f image/Dockerfile.build
+          image/build.sh --help
+
   quality:
     name: Format and Clippy
     runs-on: ubuntu-latest
