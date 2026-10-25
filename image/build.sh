@@ -3,6 +3,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$PROJECT_ROOT/Cargo.toml" | head -n 1)"
+[ -n "$VERSION" ] || { echo "Error: package version not found in Cargo.toml"; exit 1; }
 
 RUNTIME="${IZANAGI_CONTAINER_RUNTIME:-}"
 AGENT_BINARY=""
@@ -69,9 +71,13 @@ cleanup() {
 trap cleanup EXIT
 
 echo "=== VM イメージをビルド ==="
-$RUNTIME build -t izanagi-vm "$SCRIPT_DIR"
+# Always retain an immutable project-version tag. Rebuild the cached final
+# stage once more for the convenience `latest` tag so every supported runtime
+# follows the same code path without relying on runtime-specific tag commands.
+$RUNTIME build -t "izanagi-vm:$VERSION" "$SCRIPT_DIR"
+$RUNTIME build -t izanagi-vm:latest "$SCRIPT_DIR"
 
 echo ""
-echo "Done! Image: izanagi-vm"
-echo "Run with: $RUNTIME run --rm -it -p 9001:9001 izanagi-vm"
+echo "Done! Images: izanagi-vm:$VERSION, izanagi-vm:latest"
+echo "Run with: $RUNTIME run --rm -it -p 9001:9001 izanagi-vm:$VERSION"
 echo "Completed at: $(date '+%Y-%m-%d %H:%M:%S')"
