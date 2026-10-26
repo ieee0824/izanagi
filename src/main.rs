@@ -417,16 +417,21 @@ fn build_sandbox_env(config: Option<&Config>) -> (HashMap<String, String>, Vec<S
     let mut env = config
         .map(|config| config.sandbox.environment.set.clone())
         .unwrap_or_default();
-    env.insert(
-        "PATH".to_string(),
-        "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin".to_string(),
-    );
-    if let Ok(term) = std::env::var("TERM") {
-        env.insert("TERM".to_string(), term);
-    }
     let inherit = config
         .map(|config| config.sandbox.environment.inherit.clone())
         .unwrap_or_default();
+    if !env.contains_key("PATH") && !inherit.iter().any(|name| name == "PATH") {
+        env.insert(
+            "PATH".to_string(),
+            "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin".to_string(),
+        );
+    }
+    if !env.contains_key("TERM")
+        && !inherit.iter().any(|name| name == "TERM")
+        && let Ok(term) = std::env::var("TERM")
+    {
+        env.insert("TERM".to_string(), term);
+    }
     (env, inherit)
 }
 
@@ -593,6 +598,41 @@ fn validate_cli_auth(config: &Config) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn sandbox_environment_uses_default_path_only_without_policy() {
+        let (env, inherit) = build_sandbox_env(None);
+        assert_eq!(
+            env.get("PATH").map(String::as_str),
+            Some("/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")
+        );
+        assert!(inherit.is_empty());
+    }
+
+    #[test]
+    fn sandbox_environment_does_not_override_inherited_path() {
+        let mut config = Config::default();
+        config.sandbox.environment.inherit.push("PATH".into());
+        let (env, inherit) = build_sandbox_env(Some(&config));
+        assert!(!env.contains_key("PATH"));
+        assert_eq!(inherit, ["PATH"]);
+    }
+
+    #[test]
+    fn sandbox_environment_preserves_configured_path() {
+        let mut config = Config::default();
+        config
+            .sandbox
+            .environment
+            .set
+            .insert("PATH".into(), "/toolchain/bin:/usr/bin".into());
+        let (env, inherit) = build_sandbox_env(Some(&config));
+        assert_eq!(
+            env.get("PATH").map(String::as_str),
+            Some("/toolchain/bin:/usr/bin")
+        );
+        assert!(inherit.is_empty());
+    }
 
     #[tokio::test]
     async fn config_path_command_skips_missing_configuration_loading() {
