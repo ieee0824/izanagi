@@ -160,6 +160,7 @@ jobs:
         run: |
           bash -n image/build.sh
           bash tests/image-build-tags.sh
+          bash tests/image-build-runtime.sh
           test -f image/Dockerfile.build
           image/build.sh --help
 

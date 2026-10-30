@@ -43,16 +43,31 @@ case "$RUNTIME" in
 esac
 command -v "$RUNTIME" &>/dev/null || { echo "Error: $RUNTIME command not found"; exit 1; }
 
+CID=""
+BUILD_DIR=""
+cleanup() {
+    if [ -n "$CID" ]; then "$RUNTIME" rm "$CID" >/dev/null || true; fi
+    if [ -n "$BUILD_DIR" ]; then rm -rf -- "$BUILD_DIR"; fi
+    rm -f "$SCRIPT_DIR/izanagi-agent"
+}
+trap cleanup EXIT
+
 # 引数なしの場合はコンテナ内でビルド
 if [ -z "$AGENT_BINARY" ]; then
     echo "=== agent をコンテナ内でビルド ==="
-    $RUNTIME build -f "$SCRIPT_DIR/Dockerfile.build" -t izanagi-agent-builder "$PROJECT_ROOT"
-
-    # ビルドしたバイナリを取り出す
-    # scratch image has no default command; create only materializes its filesystem.
-    CID=$($RUNTIME create izanagi-agent-builder /izanagi-agent)
-    $RUNTIME cp "$CID:/izanagi-agent" "$SCRIPT_DIR/izanagi-agent"
-    $RUNTIME rm "$CID" >/dev/null
+    if [ "$RUNTIME" = container ]; then
+        BUILD_DIR="$(mktemp -d)"
+        "$RUNTIME" build -f "$SCRIPT_DIR/Dockerfile.build" --output "type=local,dest=$BUILD_DIR" "$PROJECT_ROOT"
+        AGENT_OUTPUT="$(find "$BUILD_DIR" -type f -name izanagi-agent -print)"
+        [ -n "$AGENT_OUTPUT" ] && [ -f "$AGENT_OUTPUT" ] || { echo "Error: expected one agent binary in build output"; exit 1; }
+        cp "$AGENT_OUTPUT" "$SCRIPT_DIR/izanagi-agent"
+    else
+        "$RUNTIME" build -f "$SCRIPT_DIR/Dockerfile.build" -t izanagi-agent-builder "$PROJECT_ROOT"
+        CID=$("$RUNTIME" create izanagi-agent-builder /izanagi-agent)
+        "$RUNTIME" cp "$CID:/izanagi-agent" "$SCRIPT_DIR/izanagi-agent"
+        "$RUNTIME" rm "$CID" >/dev/null
+        CID=""
+    fi
     chmod +x "$SCRIPT_DIR/izanagi-agent"
     echo "agent ビルド完了"
 else
@@ -63,12 +78,6 @@ else
     cp "$AGENT_BINARY" "$SCRIPT_DIR/izanagi-agent"
     chmod +x "$SCRIPT_DIR/izanagi-agent"
 fi
-
-# 終了時に agent バイナリを削除
-cleanup() {
-    rm -f "$SCRIPT_DIR/izanagi-agent"
-}
-trap cleanup EXIT
 
 echo "=== VM イメージをビルド ==="
 # Always retain an immutable project-version tag. Rebuild the cached final
