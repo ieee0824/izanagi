@@ -137,15 +137,21 @@ async fn check_image_exists_with(image: &str, binary: &str) -> anyhow::Result<()
 ///
 /// 出力の各行にイメージ名が含まれるかを確認する。
 pub fn image_exists_in_output(output: &str, image: &str) -> bool {
-    let implicit_latest =
-        (!image.contains(':') && !image.contains('@')).then(|| format!("{image}:latest"));
+    let last = image.rsplit('/').next().unwrap_or(image);
+    let requested = if !last.contains(':') && !image.contains('@') {
+        format!("{image}:latest")
+    } else {
+        image.to_owned()
+    };
     output.lines().any(|line| {
-        line.split_whitespace().any(|field| {
-            field == image
-                || implicit_latest
-                    .as_deref()
-                    .is_some_and(|latest| field == latest)
-        })
+        let mut fields = line.split_whitespace();
+        let Some(name) = fields.next() else {
+            return false;
+        };
+        name == requested
+            || fields
+                .next()
+                .is_some_and(|tag| format!("{name}:{tag}") == requested)
     })
 }
 
@@ -1052,6 +1058,16 @@ mod tests {
         assert!(image_exists_in_output(output, "temiya-dev"));
         assert!(image_exists_in_output(output, "temiya-dev:latest"));
         assert!(!image_exists_in_output(output, "temiya"));
+    }
+
+    #[test]
+    fn image_exists_in_output_matches_name_and_tag() {
+        let output = "NAME TAG IMAGE ID\nregistry:5000/app stable abc\nregistry:5000/app latest def\nother stable ghi\n";
+        assert!(image_exists_in_output(output, "registry:5000/app:stable"));
+        assert!(image_exists_in_output(output, "registry:5000/app"));
+        assert!(!image_exists_in_output(output, "other"));
+        assert!(!image_exists_in_output(output, "registry:5000/app:missing"));
+        assert!(!image_exists_in_output(output, "abc"));
     }
 
     // --- コマンドライン生成テスト (#150, #151) ---

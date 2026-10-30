@@ -5,7 +5,7 @@ FROM debian:trixie-slim@sha256:26f98ccd92fd0a44d6928ce8ff8f4921b4d2f535bfa07555e
 # 基本パッケージ + Homebrew の依存
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-       bash curl ca-certificates \
+       bash curl ca-certificates tini \
        git build-essential procps file \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
@@ -45,4 +45,4 @@ RUN chmod +x /entrypoint.sh
 
 EXPOSE 9001
 
-ENTRYPOINT ["/entrypoint.sh"]
+ENTRYPOINT ["/usr/bin/tini", "--", "/entrypoint.sh"]
