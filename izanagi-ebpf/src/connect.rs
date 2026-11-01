@@ -102,16 +102,16 @@ pub(super) fn enter(ctx: &TracePointContext) -> u32 {
 
 pub(super) fn exit(ctx: &TracePointContext) -> u32 {
     let id = aya_ebpf::helpers::bpf_get_current_pid_tgid();
-    let attempt = unsafe { CONNECT_ATTEMPTS.get(&id).copied() };
-    cleanup(id);
     let result = match unsafe { ctx.read_at::<i64>(16) } {
         Ok(value) => value,
         Err(_) => {
+            cleanup(id);
             lost();
             return 1;
         }
     };
     let Some(mut entry) = EVENTS.reserve::<RawSyscallEvent>(0) else {
+        cleanup(id);
         lost();
         return 1;
     };
@@ -121,12 +121,16 @@ pub(super) fn exit(ctx: &TracePointContext) -> u32 {
         (*event).syscall_id = SyscallId::Connect as u32;
         (*event).category = SyscallCategoryId::Network as u8;
         (*event).result = result;
-        if let Some(attempt) = attempt {
-            populate(event, &attempt);
+        // Consume the map value only on the non-null branch, before deleting it.
+        // Carrying Option<Attempt> across helpers can spill undefined payload
+        // registers on the None path, which the kernel verifier rejects.
+        if let Some(attempt) = CONNECT_ATTEMPTS.get(&id) {
+            populate(event, attempt);
         } else {
             (*event).flags |= FLAG_STATE_MISSING;
         }
     }
+    cleanup(id);
     entry.submit(0);
     0
 }
