@@ -229,7 +229,9 @@ fn convert_raw_event(
     if raw.abi_version != izanagi_common::RAW_ABI_VERSION
         || !matches!(
             raw.kind,
-            izanagi_common::KIND_ENTER | izanagi_common::KIND_OPEN_EXIT
+            izanagi_common::KIND_ENTER
+                | izanagi_common::KIND_OPEN_EXIT
+                | izanagi_common::KIND_CONNECT_EXIT
         )
     {
         return None;
@@ -259,6 +261,12 @@ fn convert_raw_event(
         args.push(crate::event::SyscallArg::Int(raw.arg2 as i64));
     }
 
+    if syscall == Syscall::Connect
+        && let Some(address) = connect_address(raw)
+    {
+        args.push(crate::event::SyscallArg::Addr(address));
+    }
+
     Some(SyscallEvent {
         timestamp,
         pid: raw.pid,
@@ -268,6 +276,33 @@ fn convert_raw_event(
         args,
         result: legacy_result(raw),
     })
+}
+
+#[cfg(all(target_os = "linux", feature = "ebpf"))]
+fn connect_address(raw: &izanagi_common::RawSyscallEvent) -> Option<std::net::SocketAddr> {
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6};
+    if raw.flags & izanagi_common::FLAG_CONNECT_ADDRESS == 0 {
+        return None;
+    }
+    match raw.family {
+        2 => Some(SocketAddr::from((
+            Ipv4Addr::new(
+                raw.destination_address[0],
+                raw.destination_address[1],
+                raw.destination_address[2],
+                raw.destination_address[3],
+            ),
+            raw.destination_port,
+        ))),
+        // arg2 is the IPv6 scope ID for connect events (never a user pointer).
+        10 => Some(SocketAddr::V6(SocketAddrV6::new(
+            Ipv6Addr::from(raw.destination_address),
+            raw.destination_port,
+            0,
+            raw.arg2 as u32,
+        ))),
+        _ => None,
+    }
 }
 
 #[cfg(all(target_os = "linux", feature = "ebpf"))]
@@ -284,7 +319,10 @@ fn legacy_process_name(raw: &izanagi_common::RawSyscallEvent) -> Arc<str> {
 #[cfg(all(target_os = "linux", feature = "ebpf"))]
 fn legacy_result(raw: &izanagi_common::RawSyscallEvent) -> crate::event::SyscallResult {
     use crate::event::SyscallResult;
-    if raw.kind == izanagi_common::KIND_OPEN_EXIT {
+    if matches!(
+        raw.kind,
+        izanagi_common::KIND_OPEN_EXIT | izanagi_common::KIND_CONNECT_EXIT
+    ) {
         if raw.result < 0 {
             SyscallResult::Err((-raw.result).min(i32::MAX as i64) as i32)
         } else {
@@ -451,6 +489,51 @@ mod tests {
             let path_len = path.len().min(PATH_BUF_SIZE);
             event.path_buf[..path_len].copy_from_slice(&path[..path_len]);
             event
+        }
+
+        #[test]
+        fn connect_ipv4_entry_and_outcome_preserve_destination_and_errno() {
+            use izanagi_common::*;
+            let mut raw = make_raw_event(SyscallId::Connect as u32, b"curl", b"");
+            raw.flags = FLAG_CONNECT_ADDRESS;
+            raw.family = 2;
+            raw.destination_address[..4].copy_from_slice(&[127, 0, 0, 1]);
+            raw.destination_port = 4567;
+            let entry = convert_raw_event(&raw, Duration::ZERO).unwrap();
+            assert_eq!(entry.result, crate::event::SyscallResult::Unknown);
+            use crate::detector::Rule;
+            let deny = crate::rules::NetworkAllowlistRule::new(&[]);
+            assert!(deny.check(&entry).is_some());
+            let allow = crate::rules::NetworkAllowlistRule::new(&["127.0.0.1".into()]);
+            assert!(allow.check(&entry).is_none());
+            assert!(matches!(entry.args[0], crate::event::SyscallArg::Addr(addr)
+                if addr.to_string() == "127.0.0.1:4567"));
+            for (result, expected) in [
+                (0, crate::event::SyscallResult::Ok(0)),
+                (-111, crate::event::SyscallResult::Err(111)),
+                (-115, crate::event::SyscallResult::Err(115)),
+            ] {
+                raw.kind = KIND_CONNECT_EXIT;
+                raw.result = result;
+                let outcome = convert_raw_event(&raw, Duration::ZERO).unwrap();
+                assert_eq!(outcome.result, expected);
+                assert_eq!(outcome.args, entry.args);
+            }
+        }
+
+        #[test]
+        fn connect_ipv6_scope_and_missing_address_are_not_fabricated() {
+            use izanagi_common::*;
+            let mut raw = make_raw_event(SyscallId::Connect as u32, b"curl", b"");
+            raw.family = 10;
+            raw.destination_address[15] = 1;
+            raw.destination_port = 4566;
+            assert!(connect_address(&raw).is_none());
+            raw.flags = FLAG_CONNECT_ADDRESS;
+            raw.arg2 = 3;
+            assert_eq!(connect_address(&raw).unwrap().to_string(), "[::1%3]:4566");
+            raw.family = 1; // Unix-domain sockets are not IP addresses.
+            assert!(connect_address(&raw).is_none());
         }
 
         #[test]

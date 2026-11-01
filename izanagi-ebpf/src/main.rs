@@ -19,6 +19,7 @@ use aya_ebpf::{
 };
 use izanagi_common::*;
 use izanagi_common::{RawSyscallEvent, SyscallCategoryId, SyscallId};
+mod connect;
 mod writer;
 
 /// ring buffer マップ。ユーザー空間とイベントデータを共有する。
@@ -207,10 +208,12 @@ pub fn sys_enter_access(ctx: TracePointContext) -> u32 {
 
 #[tracepoint]
 pub fn sys_enter_connect(ctx: TracePointContext) -> u32 {
-    match emit_event(&ctx, SyscallId::Connect, SyscallCategoryId::Network) {
-        Ok(()) => 0,
-        Err(_) => 1,
-    }
+    connect::enter(&ctx)
+}
+
+#[tracepoint]
+pub fn sys_exit_connect(ctx: TracePointContext) -> u32 {
+    connect::exit(&ctx)
 }
 
 #[tracepoint]
@@ -378,6 +381,7 @@ pub fn sched_process_exit(_ctx: TracePointContext) -> u32 {
         let _ = PROCESS_GENERATIONS.remove(&tid);
     }
     let _ = OPEN_ATTEMPTS.remove(&id);
+    connect::cleanup(id);
     0
 }
 

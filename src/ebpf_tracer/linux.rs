@@ -74,6 +74,7 @@ const SYSCALL_PROBES: &[(&str, &str, &str)] = &[
 ];
 
 pub(super) fn attach_required(bpf: &mut Ebpf, behavior: bool) -> anyhow::Result<()> {
+    attach_connect(bpf)?;
     if behavior {
         for map in [
             "EVENTS",
@@ -104,6 +105,34 @@ pub(super) fn attach_required(bpf: &mut Ebpf, behavior: bool) -> anyhow::Result<
         program.attach("syscalls", "sys_exit_openat")?;
     }
 
+    Ok(())
+}
+
+fn attach_connect(bpf: &mut Ebpf) -> anyhow::Result<()> {
+    // Connect outcomes are required in both normal and behavior modes.
+    for (program, name, fields) in [
+        (
+            "sys_enter_connect",
+            "sys_enter_connect",
+            &[("fd", 16, 8), ("uservaddr", 24, 8), ("addrlen", 32, 8)][..],
+        ),
+        (
+            "sys_exit_connect",
+            "sys_exit_connect",
+            &[("ret", 16, 8)][..],
+        ),
+    ]
+    .into_iter()
+    .rev()
+    {
+        super::abi::validate_tracepoint("syscalls", name, fields)?;
+        let probe: &mut TracePoint = bpf
+            .program_mut(program)
+            .ok_or_else(|| anyhow::anyhow!("required connect probe missing: {program}"))?
+            .try_into()?;
+        probe.load()?;
+        probe.attach("syscalls", name)?;
+    }
     Ok(())
 }
 
@@ -150,7 +179,7 @@ fn attach_optional(
     category: &str,
     tp_name: &str,
 ) -> anyhow::Result<bool> {
-    if behavior && prog_name == "sys_enter_openat" {
+    if prog_name == "sys_enter_connect" || (behavior && prog_name == "sys_enter_openat") {
         return Ok(false);
     }
     let program: &mut TracePoint = match bpf.program_mut(prog_name) {
