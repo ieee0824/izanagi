@@ -85,7 +85,7 @@ pub struct RawSyscallEvent {
     pub arg0: u64,
     /// syscall の第 2 引数。
     pub arg1: u64,
-    /// syscall の第 3 引数。
+    /// syscall の第 3 引数。ABI v3 の connect では IPv6 scope ID。
     pub arg2: u64,
     /// プロセス名 (comm)。最大 16 バイト (カーネル TASK_COMM_LEN)。
     pub comm: [u8; 16],
@@ -129,7 +129,7 @@ pub const PATH_BUF_SIZE: usize = 256;
 pub const RAW_EVENT_SIZE: usize = core::mem::size_of::<RawSyscallEvent>();
 
 /// Raw ABI is deliberately independent from the authenticated wire version.
-pub const RAW_ABI_VERSION: u32 = 2;
+pub const RAW_ABI_VERSION: u32 = 3;
 pub const ABI_SECTION: &str = ".izanagi_abi";
 pub const ABI_MAGIC: [u8; 8] = *b"IZANABI!";
 pub const KIND_ENTER: u32 = 0;
@@ -139,6 +139,10 @@ pub const KIND_EXEC: u32 = 3;
 pub const KIND_EXIT: u32 = 4;
 pub const KIND_SOCKET: u32 = 5;
 pub const KIND_SOCKET_WRITE: u32 = 6;
+/// Connect syscall return; attempt_ns links to the entry snapshot.
+pub const KIND_CONNECT_EXIT: u32 = 7;
+/// Connect destination fields contain a validated IPv4/IPv6 sockaddr snapshot.
+pub const FLAG_CONNECT_ADDRESS: u16 = 8;
 pub const FLAG_PATH_FAILED: u16 = 1;
 pub const FLAG_PATH_TRUNCATED: u16 = 2;
 pub const FLAG_STATE_MISSING: u16 = 4;
