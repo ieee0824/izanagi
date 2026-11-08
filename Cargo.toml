@@ -34,7 +34,7 @@ tempfile = "3"
 izanagi-telemetry = { path = "izanagi-telemetry" }
 
 # eBPF (Linux only, feature-gated)
-aya = { version = "0.14", optional = true }
+aya = { version = "0.16", optional = true }
 bytes = { version = "1", optional = true }
 izanagi-common = { path = "izanagi-common", features = ["user"], optional = true }
 # Landlock (Linux only, feature-gated)
