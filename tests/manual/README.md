@@ -1,5 +1,18 @@
 # 行動分析の実 VM スモーク
 
+## Sensor witness preliminary experiment (#136)
+
+`sensor_witness.py` temporarily changes the live eBPF `SOCKET_LAYOUT` validity
+field as root and compares before/modified/restored TCP writes. Run it only in a
+disposable Linux VM, using a reverse-forwarded HTTP receiver outside that VM.
+Compile `sensor_witness_client.c`, and copy
+`sensor_witness_collector.rs` to `examples/` before building the collector
+with the root `landlock,ebpf` features. The script refuses artifact reuse,
+discovers only the map created by its collector, records the original map value,
+and restores it in `finally`. A successful run is not sufficient evidence:
+retain `results.json`, `events.jsonl`, `maps.json`, the independent receiver
+log, and explicitly reject runs containing an `ObservationGap`.
+
 `behavior_vm.py` は実際の QEMU/Linux agent・eBPF・guest HTTP sidecar を使い、負荷付きの HTTP 転送、credential-role open 成功/ENOENT、相関と観測不足、canary の非保存、shell の proxy 環境/resize/exit/端末復元を確認する。API は呼ばず、分類器は mock に固定する。通常の unit test には含めない。
 
 ## 準備
@@ -54,6 +67,34 @@ Python 3.11 以上、macOS の PTY と QEMU HVF を使用する。停止した f
 `observed-events-second.jsonl`、`results-second.json`、`writer-negative-results.json`、`resources.json`、`shell-results.json`、`up-second.log` を保存する。host は 0.5 秒間隔の RSS と `ps` の lifetime `%cpu`、guest は実行前後の RSS/CPU、HTTP は各系列 2 requests の round-trip 時間を記録する。これらを profiler の瞬時 CPU、推論時間、一般性能と呼ばない。overlay/collector/host/fixture の SHA256 と source commit は実行前に別途記録する。
 
 Linux collector は成功した `tcp_sendmsg_locked` の送信範囲と実 socket namespace を取得する。kernel BTF の layout・関数 signature 検証と writer probe の装着が開始条件。raw ABI v2 の agent/object を使う。試験は正例 4 requests が `ConfirmedWriter` で mock 分類されることを確認する。続いて fork/dup と SCM_RIGHTS により同じ HTTP リクエストの header/body を別プロセスで送り、転送は完了しても複数 writer として棄権することを確認する。欠落や unsupported な転送を成功した writer proof に昇格させない。通常 install/build や広い攻撃集合の精度は、この小さな試験から推定しない。
+
+### Sensor witness preliminary experiments (#136)
+
+Run only on a disposable Linux host/guest with passwordless sudo. Build the
+`sensor_witness_collector` example and eBPF object first. Each command requires a
+new private artifact directory; the Python harnesses refuse reuse.
+
+```sh
+cc -O2 -Wall -Wextra -Werror tests/manual/sensor_witness_client.c -o target/debug/sensor-witness-client
+cc -O2 -Wall -Wextra -Werror tests/manual/sensor_map_client.c -o target/debug/sensor-map-client
+cc -O2 -Wall -Wextra -Werror tests/manual/sensor_overflow_client.c -o target/debug/sensor-overflow-client
+sudo tests/manual/qemu_witness_baseline.sh ARTIFACT_PARENT COLLECTOR EBPF_OBJECT
+sudo tests/manual/qemu_normal_workload.sh ARTIFACT_PARENT COLLECTOR EBPF_OBJECT VERIFIED_NODE_TAR_XZ
+sudo python3 tests/manual/sensor_map_tamper.py --directory NEW_DIRECTORY \
+  --collector COLLECTOR --object EBPF_OBJECT --client target/debug/sensor-map-client
+sudo python3 tests/manual/sensor_overflow.py --directory NEW_DIRECTORY \
+  --collector COLLECTOR --object EBPF_OBJECT --client target/debug/sensor-overflow-client \
+  --witness-client target/debug/sensor-witness-client
+```
+
+`qemu_witness_baseline.sh` passes a random fw_cfg secret without logging it,
+requires guest root to read the sysfs entry, matches four pre-stop HTTP flows, then
+requires a dummy-credential URL request to remain in the NIC and host logs after
+the collector has stopped. It needs the running kernel's `qemu_fw_cfg` module and
+`zstd` when that module is compressed. `qemu_normal_workload.sh` runs a real npm
+install/build/test and compares all guest TCP SYN tuples with `SocketConnect`.
+The map and overflow harnesses POST only `izanagi-dummy-136`; never substitute real
+credentials. See `docs/sensor-witness-preliminary.md` for interpretation limits.
 
 
 ### Read-only workspace shares (#63)
