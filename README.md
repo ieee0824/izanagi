@@ -748,7 +748,7 @@ GitHub Actions で Linux (ubuntu-latest) と macOS (macos-latest) の CI を実�
 - **dependency-review / RustSec**: PRで追加される脆弱な依存関係と既存のRust依存関係を検査
 - **CodeQL / Gitleaks**: Rustコードの脆弱性とコミット内のシークレットを検査
 - **Dependabot**: Cargo依存関係とGitHub Actionsを週次更新
-- Rust バージョンは `1.93.1` に固定
+- Rust バージョンは `1.98.1` に固定
 
 ## ライセンス
 

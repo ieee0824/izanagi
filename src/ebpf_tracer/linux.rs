@@ -142,7 +142,7 @@ fn attach_writers(bpf: &mut Ebpf) -> anyhow::Result<()> {
         bpf.map_mut("SOCKET_LAYOUT")
             .ok_or_else(|| anyhow::anyhow!("required socket layout map missing"))?,
     )?;
-    layout.set(0, offsets, 0)?;
+    layout.set(0, &offsets, 0)?;
     for name in ["SOCKET_STREAMS", "SEND_ATTEMPTS", "UNPROVEN_STREAMS"] {
         anyhow::ensure!(
             bpf.map(name).is_some(),
