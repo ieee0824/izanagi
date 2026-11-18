@@ -19,8 +19,16 @@ def maps():
 
 
 def update(identity, value):
-    subprocess.run(["bpftool", "map", "update", "id", str(identity), "key", "hex",
-                    "00", "00", "00", "00", "value", "hex", *value], check=True)
+    return subprocess.run(
+        ["bpftool", "map", "update", "id", str(identity), "key", "hex",
+         "00", "00", "00", "00", "value", "hex", *value],
+        text=True, capture_output=True)
+
+
+def lookup(identity):
+    return json.loads(subprocess.check_output([
+        "bpftool", "-j", "map", "lookup", "id", str(identity),
+        "key", "hex", "00", "00", "00", "00"]))
 
 
 def request(client, port, phase):
@@ -56,18 +64,20 @@ def main():
             candidates = [m for m in new_maps if m["name"] == "SOCKET_LAYOUT"]
             assert len(candidates) == 1, "layout map must be newly created and unique"
             identity = candidates[0]["id"]
-            dump = json.loads(subprocess.check_output([
-                "bpftool", "-j", "map", "lookup", "id", str(identity),
-                "key", "hex", "00", "00", "00", "00"]))
+            dump = lookup(identity)
             (directory / "layout-original.json").write_text(json.dumps(dump, indent=2))
             original = dump["value"]
             assert len(original) == 16
             assert struct.unpack("<4I", bytes(int(v, 16) for v in original))[3] == 1
-            for phase in ["before", "modified", "restored"]:
-                if phase == "modified":
-                    update(identity, original[:12] + ["00"] * 4)
-                elif phase == "restored":
-                    update(identity, original)
+            for phase in ["before", "after-denied-update"]:
+                if phase == "after-denied-update":
+                    denied = update(identity, original[:12] + ["00"] * 4)
+                    result["update"] = {
+                        "returncode": denied.returncode,
+                        "stderr": denied.stderr.strip(),
+                    }
+                    assert denied.returncode != 0, "frozen map update unexpectedly succeeded"
+                    assert lookup(identity)["value"] == original, "frozen map changed"
                 start = time.monotonic_ns()
                 record = request(args.client.resolve(), args.port, phase)
                 time.sleep(1)
@@ -76,19 +86,23 @@ def main():
                 assert collector.poll() is None, "collector exited"
             result["complete"] = True
         finally:
+            stop.touch()
             try:
-                if identity is not None and original is not None:
-                    update(identity, original)
-                    result["layout_restored"] = True
-            finally:
-                stop.touch()
-                try:
-                    collector.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    collector.kill()
-                    collector.wait()
-                result["collector_exit"] = collector.returncode
-                (directory / "results.json").write_text(json.dumps(result, indent=2))
+                collector.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                collector.kill()
+                collector.wait()
+            result["collector_exit"] = collector.returncode
+            events = [json.loads(line) for line in
+                      (directory / "events.jsonl").read_text().splitlines()]
+            write_ports = {
+                event["payload"]["SocketWrite"]["tuple"]["client"].rsplit(":", 1)[-1]
+                for event in events if "SocketWrite" in event["payload"]
+            }
+            result["witnessed_write_ports"] = sorted(write_ports)
+            assert all(str(phase["local_port"]) in write_ports
+                       for phase in result["phases"]), "socket write evidence missing"
+            (directory / "results.json").write_text(json.dumps(result, indent=2))
         assert collector.returncode == 0
 
 

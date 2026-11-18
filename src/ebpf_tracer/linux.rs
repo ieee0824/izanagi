@@ -3,11 +3,15 @@ use super::{boot_time_offset, convert_raw_event, monotonic_ns, observation, read
 use crate::event::SyscallEvent;
 use aya::{
     Ebpf,
-    maps::{Array, MapData, PerCpuArray, RingBuf},
+    maps::{Array, Map, MapData, PerCpuArray, RingBuf},
     programs::{KProbe, TracePoint},
 };
 use izanagi_telemetry::schema::{QualityIssue, TelemetryEnvelope, TelemetryPayload};
-use std::{sync::Arc, time::Duration};
+use std::{
+    os::fd::{AsFd, AsRawFd},
+    sync::Arc,
+    time::Duration,
+};
 use tokio::sync::mpsc;
 
 type RequiredProbe = (
@@ -17,6 +21,7 @@ type RequiredProbe = (
     &'static [(&'static str, usize, usize)],
 );
 type Observation = Option<(observation::Collector, mpsc::Sender<TelemetryEnvelope>)>;
+type SocketLayout = (Array<MapData, [u32; 4]>, [u32; 4]);
 const REQUIRED: &[RequiredProbe] = &[
     (
         "sys_enter_openat",
@@ -73,7 +78,10 @@ const SYSCALL_PROBES: &[(&str, &str, &str)] = &[
     ("sys_enter_fork", "syscalls", "sys_enter_fork"),
 ];
 
-pub(super) fn attach_required(bpf: &mut Ebpf, behavior: bool) -> anyhow::Result<()> {
+pub(super) fn attach_required(bpf: &mut Ebpf, behavior: bool) -> anyhow::Result<Option<[u32; 4]>> {
+    let offsets = behavior
+        .then(|| initialize_socket_layout(bpf))
+        .transpose()?;
     attach_connect(bpf)?;
     if behavior {
         for map in [
@@ -105,7 +113,7 @@ pub(super) fn attach_required(bpf: &mut Ebpf, behavior: bool) -> anyhow::Result<
         program.attach("syscalls", "sys_exit_openat")?;
     }
 
-    Ok(())
+    Ok(offsets)
 }
 
 fn attach_connect(bpf: &mut Ebpf) -> anyhow::Result<()> {
@@ -136,13 +144,25 @@ fn attach_connect(bpf: &mut Ebpf) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn attach_writers(bpf: &mut Ebpf) -> anyhow::Result<()> {
+fn initialize_socket_layout(bpf: &mut Ebpf) -> anyhow::Result<[u32; 4]> {
     let offsets = super::kernel_layout::load()?;
-    let mut layout: Array<_, [u32; 4]> = Array::try_from(
-        bpf.map_mut("SOCKET_LAYOUT")
-            .ok_or_else(|| anyhow::anyhow!("required socket layout map missing"))?,
-    )?;
-    layout.set(0, &offsets, 0)?;
+    let layout = bpf
+        .map_mut("SOCKET_LAYOUT")
+        .ok_or_else(|| anyhow::anyhow!("required socket layout map missing"))?;
+    Array::<_, [u32; 4]>::try_from(&mut *layout)?.set(0, &offsets, 0)?;
+    let Map::Array(layout) = layout else {
+        anyhow::bail!("required socket layout array missing");
+    };
+    freeze_map(layout)?;
+    let layout = bpf
+        .map("SOCKET_LAYOUT")
+        .expect("socket layout was initialized");
+    let observed = Array::<_, [u32; 4]>::try_from(layout)?.get(&0, 0)?;
+    anyhow::ensure!(observed == offsets, "socket layout verification failed");
+    Ok(offsets)
+}
+
+fn attach_writers(bpf: &mut Ebpf) -> anyhow::Result<()> {
     for name in ["SOCKET_STREAMS", "SEND_ATTEMPTS", "UNPROVEN_STREAMS"] {
         anyhow::ensure!(
             bpf.map(name).is_some(),
@@ -157,6 +177,19 @@ fn attach_writers(bpf: &mut Ebpf) -> anyhow::Result<()> {
             .try_into()?;
         program.load()?;
         program.attach("tcp_sendmsg_locked", 0)?;
+    }
+    Ok(())
+}
+
+fn freeze_map(map: &MapData) -> anyhow::Result<()> {
+    // Linux UAPI: BPF_MAP_FREEZE uses only the map_fd field of union bpf_attr.
+    const BPF_MAP_FREEZE: libc::c_uint = 22;
+    let map_fd = map.fd().as_fd().as_raw_fd() as u32;
+    // SAFETY: map_fd remains open and the attribute points to its initialized u32.
+    let result = unsafe { libc::syscall(libc::SYS_bpf, BPF_MAP_FREEZE, &map_fd, size_of::<u32>()) };
+    if result < 0 {
+        return Err(anyhow::Error::new(std::io::Error::last_os_error())
+            .context("failed to freeze socket layout map"));
     }
     Ok(())
 }
@@ -214,9 +247,23 @@ pub(super) struct KernelInput {
     ring: RingBuf<MapData>,
     drops: PerCpuArray<MapData, u64>,
     boot_offset: Duration,
+    socket_layout: Option<SocketLayout>,
 }
 impl KernelInput {
-    pub(super) fn take(bpf: &mut Ebpf) -> anyhow::Result<Self> {
+    pub(super) fn take(bpf: &mut Ebpf, offsets: Option<[u32; 4]>) -> anyhow::Result<Self> {
+        let socket_layout = if let Some(expected) = offsets {
+            let map = bpf
+                .take_map("SOCKET_LAYOUT")
+                .ok_or_else(|| anyhow::anyhow!("required socket layout map missing"))?;
+            let layout = Array::try_from(map)?;
+            anyhow::ensure!(
+                layout.get(&0, 0)? == expected,
+                "socket layout verification failed"
+            );
+            Some((layout, expected))
+        } else {
+            None
+        };
         let events_map = bpf
             .take_map("EVENTS")
             .ok_or_else(|| anyhow::anyhow!("eBPF map 'EVENTS' not found"))?;
@@ -230,6 +277,7 @@ impl KernelInput {
             ring,
             drops,
             boot_offset,
+            socket_layout,
         })
     }
 
@@ -245,12 +293,14 @@ impl KernelInput {
             kernel_losses: 0,
         };
         let mut checked = tokio::time::Instant::now();
+        let mut layout_failure_reported = false;
         forwarder.initial_health(unavailable);
         let mut backoff_ms = 1;
         // Polling remains adaptive (1-10ms) until aya supplies a stable AsyncRingBuf.
         loop {
             let mut got_event = false;
-            while let Some(item) = self.ring.next() {
+            for _ in 0..256 {
+                let Some(item) = self.ring.next() else { break };
                 got_event = true;
                 if !forwarder.forward(&item, self.boot_offset, &tx).await {
                     return;
@@ -259,6 +309,12 @@ impl KernelInput {
             if checked.elapsed() >= Duration::from_millis(100) {
                 checked = tokio::time::Instant::now();
                 forwarder.check_losses(&self.drops);
+                if let Some((layout, expected)) = &self.socket_layout
+                    && !layout_failure_reported
+                    && !layout.get(&0, 0).is_ok_and(|value| value == *expected)
+                {
+                    layout_failure_reported = forwarder.report_layout_failure();
+                }
             }
             if tx.is_closed() {
                 return;
@@ -279,6 +335,20 @@ struct Forwarder {
     kernel_losses: u64,
 }
 impl Forwarder {
+    fn report_layout_failure(&mut self) -> bool {
+        let Some((collector, tx)) = self.observation.as_mut() else {
+            return true;
+        };
+        let event = collector.envelope(
+            monotonic_ns(),
+            None,
+            None,
+            TelemetryPayload::CollectorHealth { healthy: false },
+            vec![QualityIssue::InvalidEvent],
+        );
+        tx.try_send(event).is_ok()
+    }
+
     fn initial_health(&mut self, unavailable: u64) {
         if let Some((collector, tx)) = self.observation.as_mut() {
             let event = collector.envelope(

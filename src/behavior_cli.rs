@@ -10,7 +10,7 @@ use anyhow::{Result, bail};
 use clap::{Args, Subcommand, ValueEnum};
 use izanagi_telemetry::{
     AuditPayload, AuditRecord, AuditStore, EvidenceAvailability, FeatureMode, FeatureSnapshot,
-    StoreConfig, ThreatClass, deterministic_rule,
+    HostWitnessFlow, StoreConfig, TelemetryEnvelope, ThreatClass, deterministic_rule,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -66,6 +66,16 @@ pub struct ProviderOptions {
 
 #[derive(Debug, Subcommand)]
 pub enum BehaviorAction {
+    /// Compare an independently observed TCP flow against a stopped session.
+    AuditWitness {
+        #[arg(long)]
+        session: String,
+        #[arg(long)]
+        directory: Option<PathBuf>,
+        /// Host-produced JSON with flow endpoints and aligned guest clock bounds.
+        #[arg(long)]
+        flow: PathBuf,
+    },
     /// immutable JSONL の記録イベント時刻で相関・分類を再生
     Replay {
         #[arg(long)]
@@ -135,8 +145,101 @@ pub async fn run(action: BehaviorAction, default_audit_root: &Path) -> Result<u8
         BehaviorAction::Show { session, directory } => {
             show_command(&session, directory, default_audit_root)?
         }
+        BehaviorAction::AuditWitness {
+            session,
+            directory,
+            flow,
+        } => audit_witness(&session, directory, &flow, default_audit_root)?,
     }
     Ok(0)
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WitnessInput {
+    number: u64,
+    client: std::net::SocketAddr,
+    remote: std::net::SocketAddr,
+    outbound_bytes: u64,
+    guest_boot_id: String,
+    guest_start_ns: u64,
+    guest_end_ns: u64,
+}
+
+fn audit_witness(
+    session: &str,
+    directory: Option<PathBuf>,
+    path: &Path,
+    default_audit_root: &Path,
+) -> Result<()> {
+    let input = read_witness_input(path)?;
+    let mut store = open_session_store(session, directory, default_audit_root)?;
+    let records = store.read_records()?;
+    let events = witness_events(&records, &input);
+    let flow = HostWitnessFlow {
+        number: input.number,
+        client: input.client,
+        remote: input.remote,
+        outbound_bytes: input.outbound_bytes,
+    };
+    let mismatch = flow.compare(session, &events);
+    let previous = records.iter().find_map(|record| match &record.payload {
+        AuditPayload::HostWitnessMismatch(value) if value.flow_number == input.number => {
+            Some(value)
+        }
+        _ => None,
+    });
+    if let Some(previous) = previous {
+        anyhow::ensure!(
+            Some(previous) == mismatch.as_ref(),
+            "host witness flow number was already audited with a different result"
+        );
+    }
+    if previous.is_none()
+        && let Some(record) = &mismatch
+    {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs();
+        store.append_host_witness_mismatch(record.clone(), now)?;
+    }
+    println!("{}", serde_json::to_string(&mismatch)?);
+    Ok(())
+}
+
+fn read_witness_input(path: &Path) -> Result<WitnessInput> {
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?
+        .take(4097)
+        .read_to_end(&mut bytes)?;
+    anyhow::ensure!(bytes.len() <= 4096, "host witness input exceeds 4096 bytes");
+    let input: WitnessInput = serde_json::from_slice(&bytes)?;
+    anyhow::ensure!(
+        input.number > 0
+            && input.outbound_bytes > 0
+            && !input.guest_boot_id.is_empty()
+            && input.guest_start_ns < input.guest_end_ns,
+        "invalid host witness flow bounds"
+    );
+    Ok(input)
+}
+
+fn witness_events(records: &[AuditRecord], input: &WitnessInput) -> Vec<TelemetryEnvelope> {
+    let clock_domain = format!("linux-monotonic:{}", input.guest_boot_id);
+    records
+        .iter()
+        .filter_map(|record| match record.payload {
+            AuditPayload::Event(ref event)
+                if event.guest_boot_id == input.guest_boot_id
+                    && event.clock_domain == clock_domain
+                    && (input.guest_start_ns..=input.guest_end_ns)
+                        .contains(&event.observed_monotonic_ns) =>
+            {
+                Some(event.clone())
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 async fn replay_command(
@@ -216,6 +319,7 @@ fn audit_session_id(record: &AuditRecord) -> &str {
         AuditPayload::Event(event) => &event.session_id,
         AuditPayload::Assessment { snapshot, .. } => &snapshot.session_id,
         AuditPayload::Classification(classification) => &classification.session_id,
+        AuditPayload::HostWitnessMismatch(mismatch) => &mismatch.session_id,
     }
 }
 
@@ -244,6 +348,7 @@ fn retained_evidence(records: &[AuditRecord], session: &str) -> Result<BTreeSet<
             }
             AuditPayload::Assessment { snapshot, .. } => &snapshot.session_id,
             AuditPayload::Classification(classification) => &classification.session_id,
+            AuditPayload::HostWitnessMismatch(mismatch) => &mismatch.session_id,
         };
         if id != session {
             bail!("audit directory does not match requested session");

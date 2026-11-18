@@ -348,11 +348,11 @@ impl Tracer for EbpfTracer {
             .lock()
             .expect("observation lock poisoned")
             .is_some();
-        linux::attach_required(&mut bpf, behavior)?;
+        let socket_layout = linux::attach_required(&mut bpf, behavior)?;
         let unavailable = linux::attach_syscalls(&mut bpf, behavior)?;
         let (tx, rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
         // Finish all fallible map/clock setup before publishing the loaded object.
-        let input = linux::KernelInput::take(&mut bpf)?;
+        let input = linux::KernelInput::take(&mut bpf, socket_layout)?;
         let observation = self
             .observation
             .lock()
