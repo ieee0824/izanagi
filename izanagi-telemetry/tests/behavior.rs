@@ -193,6 +193,18 @@ fn complete_stream_range_proves_writer_without_promoting_connector() {
 }
 
 #[test]
+fn completed_http_without_writer_evidence_remains_visible_and_unattributed() {
+    let mut events = writer_fixture();
+    events.retain(|event| !matches!(event.payload, TelemetryPayload::SocketWrite { .. }));
+
+    let snapshot = replay(events, CorrelationConfig::default());
+    assert_eq!(snapshot.transfer_outcome, TransferOutcome::Completed);
+    assert_eq!(snapshot.upstream_bytes_written, Some(8));
+    assert_ne!(snapshot.binding, ProcessBinding::ConfirmedWriter);
+    assert!(!snapshot.projection(FeatureMode::Correlated).eligible());
+}
+
+#[test]
 fn incomplete_mixed_or_mismatched_stream_writers_remain_ineligible() {
     for mode in [
         "gap",

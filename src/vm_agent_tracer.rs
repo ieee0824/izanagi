@@ -719,6 +719,78 @@ mod tests {
         host_handle.await.unwrap();
     }
 
+    #[tokio::test]
+    async fn compromised_shared_secret_accepts_fabricated_telemetry() {
+        let key = b"fixture-compromised-shared-secret".to_vec();
+        let fabricated: izanagi_telemetry::TelemetryEnvelope = serde_json::from_str(
+            include_str!("../tests/fixtures/behavior/normal.jsonl")
+                .lines()
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        let expected = fabricated.clone();
+        let (host, peer) = tokio::io::duplex(16 * 1024);
+        let (events_tx, _events_rx) = mpsc::channel(1);
+        let (telemetry_tx, mut telemetry_rx) = mpsc::channel(1);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+
+        let peer_key = key.clone();
+        let attacker = tokio::spawn(async move {
+            let (reader, writer) = tokio::io::split(peer);
+            let mut client =
+                crate::protocol_client::ProtocolClient::new(reader, writer, Some(peer_key));
+            assert!(matches!(
+                client.recv_message().await.unwrap(),
+                Some(Message::Hello {
+                    authenticated: true,
+                    ..
+                })
+            ));
+            client
+                .send_message(&Message::Hello {
+                    authenticated: true,
+                    token: None,
+                })
+                .await
+                .unwrap();
+            client.send_message(&Message::Ready).await.unwrap();
+            assert!(matches!(
+                client.recv_message().await.unwrap(),
+                Some(Message::Start(_))
+            ));
+            client.send_message(&Message::TraceStarted).await.unwrap();
+            client
+                .send_message(&Message::Telemetry(Box::new(fabricated)))
+                .await
+                .unwrap();
+            assert!(matches!(
+                client.recv_message().await.unwrap(),
+                Some(Message::Stop)
+            ));
+        });
+
+        let filter = TraceFilter {
+            categories: vec![],
+            pids: None,
+        };
+        let host_task = tokio::spawn(async move {
+            let mut client = VmAgentTracer::prepare(host, &filter, Some(key), None).await?;
+            let mut shutdown_rx = shutdown_rx;
+            VmAgentTracer::receive_events(
+                &mut client,
+                events_tx,
+                &mut shutdown_rx,
+                Some(telemetry_tx),
+            )
+            .await
+        });
+        assert_eq!(telemetry_rx.recv().await.unwrap(), expected);
+        shutdown_tx.send(()).unwrap();
+        attacker.await.unwrap();
+        host_task.await.unwrap().unwrap();
+    }
+
     /// set_token で設定したトークンが Hello メッセージに含まれることを確認。
     #[tokio::test]
     async fn run_on_stream_sends_token_in_hello() {
