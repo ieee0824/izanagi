@@ -1,6 +1,57 @@
 use izanagi_telemetry::*;
 use std::collections::BTreeMap;
 
+#[test]
+fn witness_distinguishes_gaps_missing_identity_and_reused_tuples() {
+    let tuple = tuple();
+    let flow = HostWitnessFlow {
+        number: 1,
+        client: tuple.client,
+        remote: tuple.local,
+        outbound_bytes: 42,
+    };
+    let connector = event(
+        "kernel",
+        1,
+        10,
+        Some(process(42, 1)),
+        TelemetryPayload::SocketConnect {
+            socket: socket(1),
+            tuple: tuple.clone(),
+            binding: ProcessBinding::Connector,
+        },
+    );
+    let write = |seq, generation, start, end, identity| {
+        event(
+            "kernel",
+            seq,
+            11,
+            identity,
+            TelemetryPayload::SocketWrite {
+                socket: socket(generation),
+                tuple: tuple.clone(),
+                stream_start: start,
+                stream_end: end,
+            },
+        )
+    };
+    let mut events = vec![connector, write(2, 1, 0, 20, Some(process(42, 1)))];
+    events.push(write(3, 1, 21, 42, Some(process(42, 1))));
+    let mismatch = flow.compare("session", &events).unwrap();
+    assert!(!mismatch.missing_connect && mismatch.missing_write);
+
+    events[2] = write(3, 1, 20, 42, None);
+    let mismatch = flow.compare("session", &events).unwrap();
+    assert!(!mismatch.missing_write && mismatch.missing_process);
+
+    events[2] = write(3, 1, 20, 42, Some(process(42, 1)));
+    assert!(flow.compare("session", &events).is_none());
+
+    events.push(write(4, 2, 0, 42, Some(process(42, 1))));
+    let mismatch = flow.compare("session", &events).unwrap();
+    assert!(mismatch.missing_connect && mismatch.missing_write);
+}
+
 fn process(pid: u32, start: u64) -> ProcessKey {
     ProcessKey {
         session_id: "session".into(),

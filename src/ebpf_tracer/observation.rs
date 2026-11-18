@@ -1,7 +1,7 @@
 //! Conversion keeps missing identity and actual syscall outcomes explicit.
 use izanagi_common::*;
 use izanagi_telemetry::schema::*;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 pub(crate) struct Collector {
@@ -10,7 +10,7 @@ pub(crate) struct Collector {
     source: String,
     pid_namespace: u64,
     sequence: u64,
-    seen: BTreeSet<ProcessKey>,
+    seen: BTreeMap<u32, ProcessKey>,
     sockets: BTreeMap<(u64, u64), u64>,
     socket_sequence: u64,
 }
@@ -35,7 +35,7 @@ impl Collector {
             source: format!("ebpf-{:032x}", rand::random::<u128>()),
             pid_namespace: initial,
             sequence: 0,
-            seen: BTreeSet::new(),
+            seen: BTreeMap::new(),
             sockets: BTreeMap::new(),
             socket_sequence: 0,
         })
@@ -49,7 +49,7 @@ impl Collector {
             source: "c".into(),
             pid_namespace: 1,
             sequence: 0,
-            seen: BTreeSet::new(),
+            seen: BTreeMap::new(),
             sockets: BTreeMap::new(),
             socket_sequence: 0,
         }
@@ -111,6 +111,11 @@ impl Collector {
         let process = self.key(raw.tgid, raw.process_start_ns);
         self.record_process_identity(raw, &process, &mut result);
         let mut issues = Vec::new();
+        if process.is_none() && self.seen.contains_key(&raw.tgid) {
+            // A previously observed identity disappeared. Keep the event
+            // unattributed even when an earlier generation is known.
+            issues.push(QualityIssue::InvalidEvent);
+        }
         let payload = match raw.kind {
             KIND_ENTER if raw.syscall_id == SyscallId::OpenAt as u32 => {
                 self.open_attempt(raw, &mut issues)
@@ -120,9 +125,7 @@ impl Collector {
                 exec_generation: raw.exec_generation,
             },
             KIND_EXIT => {
-                if let Some(key) = &process {
-                    self.seen.remove(key);
-                }
+                self.seen.remove(&raw.tgid);
                 TelemetryPayload::ProcessExit
             }
             KIND_SOCKET | KIND_SOCKET_WRITE => {
@@ -147,7 +150,7 @@ impl Collector {
         // The first TGID-bearing event confirms that sched_process_fork's child
         // was a process, rather than a thread. Preexisting processes remain None.
         if let Some(key) = process.as_ref()
-            && !self.seen.contains(key)
+            && self.seen.get(&key.tgid) != Some(key)
         {
             if self.seen.len() >= 4096 {
                 self.seen.clear();
@@ -162,7 +165,7 @@ impl Collector {
                     vec![QualityIssue::StateEvicted],
                 ));
             }
-            self.seen.insert(key.clone());
+            self.seen.insert(key.tgid, key.clone());
             result.push(self.envelope(
                 raw.process_start_ns,
                 process.clone(),
@@ -392,6 +395,19 @@ mod tests {
             TelemetryPayload::FileAccessAttempt { .. }
         ));
     }
+    #[test]
+    fn missing_identity_after_an_attributed_event_is_flagged() {
+        let mut collector = collector();
+        let mut entry = raw();
+        entry.process_start_ns = 10;
+        assert!(collector.convert(&entry).last().unwrap().process.is_some());
+        entry.process_start_ns = 0;
+        let events = collector.convert(&entry);
+        let event = events.last().unwrap();
+        assert!(event.process.is_none());
+        assert!(event.quality.issues.contains(&QualityIssue::InvalidEvent));
+    }
+
     #[test]
     fn actual_open_outcomes_share_attempt_id_and_pid_reuse_is_distinct() {
         let mut c = collector();

@@ -36,6 +36,30 @@ pub enum AuditPayload {
         rule_class: ThreatClass,
     },
     Classification(ClassificationAudit),
+    HostWitnessMismatch(HostWitnessMismatch),
+}
+
+/// Local audit evidence from an observer outside the guest trust boundary.
+/// Flow numbers are scoped to the audit session and contain no packet data.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostWitnessMismatch {
+    pub session_id: String,
+    pub flow_number: u64,
+    pub missing_connect: bool,
+    pub missing_write: bool,
+    pub missing_process: bool,
+}
+
+impl HostWitnessMismatch {
+    fn validate(&self) -> Result<(), TelemetryError> {
+        if self.flow_number == 0
+            || !(self.missing_connect || self.missing_write || self.missing_process)
+        {
+            return Err(TelemetryError::MalformedRecord);
+        }
+        Ok(())
+    }
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -68,6 +92,7 @@ impl AuditRecord {
                 }
             }
             AuditPayload::Classification(record) => record.validate()?,
+            AuditPayload::HostWitnessMismatch(record) => record.validate()?,
         }
         Ok(())
     }
@@ -299,6 +324,7 @@ impl AuditStore {
                 AuditPayload::Event(e) => e.session_id,
                 AuditPayload::Assessment { snapshot, .. } => snapshot.session_id,
                 AuditPayload::Classification(record) => record.session_id,
+                AuditPayload::HostWitnessMismatch(record) => record.session_id,
             };
             store.check_session(&session)?;
         }
@@ -342,6 +368,16 @@ impl AuditStore {
         record.validate()?;
         self.check_session(&record.session_id)?;
         self.append(AuditPayload::Classification(record.clone()), now_unix_secs)
+    }
+
+    pub fn append_host_witness_mismatch(
+        &mut self,
+        record: HostWitnessMismatch,
+        now_unix_secs: u64,
+    ) -> Result<StoreWrite, TelemetryError> {
+        record.validate()?;
+        self.check_session(&record.session_id)?;
+        self.append(AuditPayload::HostWitnessMismatch(record), now_unix_secs)
     }
 
     pub fn read_records(&self) -> Result<Vec<AuditRecord>, TelemetryError> {

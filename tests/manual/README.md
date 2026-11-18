@@ -2,14 +2,14 @@
 
 ## Sensor witness preliminary experiment (#136)
 
-`sensor_witness.py` temporarily changes the live eBPF `SOCKET_LAYOUT` validity
-field as root and compares before/modified/restored TCP writes. Run it only in a
+`sensor_witness.py` attempts to change the live eBPF `SOCKET_LAYOUT` validity
+field as root and requires the frozen map to reject the update. Run it only in a
 disposable Linux VM, using a reverse-forwarded HTTP receiver outside that VM.
 Compile `sensor_witness_client.c`, and copy
 `sensor_witness_collector.rs` to `examples/` before building the collector
 with the root `landlock,ebpf` features. The script refuses artifact reuse,
-discovers only the map created by its collector, records the original map value,
-and restores it in `finally`. A successful run is not sufficient evidence:
+discovers only the map created by its collector and records the original map value.
+A successful run is not sufficient evidence:
 retain `results.json`, `events.jsonl`, `maps.json`, the independent receiver
 log, and explicitly reject runs containing an `ObservationGap`.
 

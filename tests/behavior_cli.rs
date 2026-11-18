@@ -28,6 +28,73 @@ fn temporary() -> PathBuf {
 }
 
 #[test]
+fn audit_witness_persists_missing_guest_evidence_for_a_host_flow() {
+    let dir = temporary();
+    let flow = dir.join("flow.json");
+    std::fs::write(
+        &flow,
+        serde_json::to_vec(&json!({
+            "number": 1,
+            "client": "192.0.2.1:12345",
+            "remote": "192.0.2.2:443",
+            "outbound_bytes": 42,
+            "guest_boot_id": "boot",
+            "guest_start_ns": 100,
+            "guest_end_ns": 200
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let audited = command()
+        .args([
+            "behavior",
+            "audit-witness",
+            "--session",
+            "session",
+            "--directory",
+        ])
+        .arg(&dir)
+        .arg("--flow")
+        .arg(&flow)
+        .output()
+        .unwrap();
+    assert!(
+        audited.status.success(),
+        "{}",
+        String::from_utf8_lossy(&audited.stderr)
+    );
+    let retried = command()
+        .args([
+            "behavior",
+            "audit-witness",
+            "--session",
+            "session",
+            "--directory",
+        ])
+        .arg(&dir)
+        .arg("--flow")
+        .arg(&flow)
+        .output()
+        .unwrap();
+    assert!(retried.status.success());
+    assert_eq!(audited.stdout, retried.stdout);
+    let shown = command()
+        .args(["behavior", "show", "--session", "session", "--directory"])
+        .arg(&dir)
+        .output()
+        .unwrap();
+    assert!(shown.status.success());
+    let stored: Value = serde_json::from_slice(&shown.stdout).unwrap();
+    let mismatch = &stored["record"]["payload"]["HostWitnessMismatch"];
+    for field in ["missing_connect", "missing_write", "missing_process"] {
+        assert_eq!(mismatch[field], true);
+    }
+    let store = AuditStore::new(&dir, StoreConfig::default()).unwrap();
+    assert_eq!(store.read_records().unwrap().len(), 1);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn replay_and_evaluation_work_without_vm_config_or_sandbox_credentials() {
     let input = fixtures().join("access-post.jsonl");
     let original = std::fs::read(&input).unwrap();

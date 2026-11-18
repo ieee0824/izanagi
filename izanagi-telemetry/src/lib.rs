@@ -9,6 +9,8 @@ pub use correlation::*;
 pub use privacy::*;
 pub use schema::*;
 pub use store::*;
+mod witness;
+pub use witness::*;
 
 pub const SCHEMA_VERSION: u16 = 1;
 pub const FEATURE_VERSION: u16 = 1;

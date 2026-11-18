@@ -2,6 +2,29 @@ use izanagi_telemetry::*;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+#[test]
+fn host_witness_mismatch_survives_reopening_as_a_distinct_audit_record() {
+    let dir = Temp::new();
+    let mut store = AuditStore::new(&dir.0, StoreConfig::default()).unwrap();
+    let mismatch = HostWitnessMismatch {
+        session_id: "session".into(),
+        flow_number: 1,
+        missing_connect: false,
+        missing_write: true,
+        missing_process: true,
+    };
+    store
+        .append_host_witness_mismatch(mismatch.clone(), 1)
+        .unwrap();
+    drop(store);
+    let store = AuditStore::new(&dir.0, StoreConfig::default()).unwrap();
+    assert_eq!(
+        store.read_records().unwrap()[0].payload,
+        AuditPayload::HostWitnessMismatch(mismatch)
+    );
+}
+
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
 struct Temp(PathBuf);

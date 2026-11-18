@@ -257,11 +257,25 @@ izanagi behavior evaluate --manifest tests/fixtures/behavior/manifest.json --out
 # 保存した session の分類・観測欠損・根拠参照を表示
 izanagi behavior show --session SESSION_ID --directory /path/to/session-audit
 
+# 停止済み session を guest 外で採取した TCP フローと照合
+izanagi behavior audit-witness --session SESSION_ID --directory /path/to/session-audit --flow host-flow.json
+
 # 指定 session の行動監査レコードを削除
 izanagi behavior clear --session SESSION_ID --directory /path/to/session-audit
 ```
 
 `replay` は生の共通イベント JSONL と保存済み audit JSONL の Event records を受け付けます。記録イベント時刻で相関するため、古い fixture も再生できます。`show` は参照先が失われた根拠を `evidence_expired` と表示します。出力先を指定した場合は新しいファイルを権限 0600 で作成し、既存ファイルを上書きしません。
+
+`audit-witness` の入力は、ホスト側で確定した単一の TCP 接続を表す JSON です。
+`number` はセッション内のフロー番号、`client` と `remote` は guest 側から見た
+IP アドレスとポート、`outbound_bytes` は再送を除く送信ストリーム先頭からの連続バイト数です。
+`guest_boot_id`、`guest_start_ns`、`guest_end_ns` は、ホスト観測を対応付けた guest の
+起動 ID と単調時計上の接続範囲を指定します。接続の再利用や NAT 変換に曖昧さがある場合は、
+ホスト側で対応を確定してから実行してください。欠落項目は同じセッションに
+`HostWitnessMismatch` として保存されます。ゲスト root を脅威とする場合、入力の信頼性は
+ゲスト外の NIC やプロキシに依存します。ゲストが所有するマップと共有 HMAC 鍵は同じ信頼境界にあります。
+`tools/witness-flow-from-pcap.sh PCAP TCP_STREAM BOOT_ID START_NS END_NS FLOW_NUMBER`
+は、完全な TCP handshake を含む pcap の単一ストリームから入力 JSON を生成します。
 
 既定の `mock` は処理経路を検証するための決定論的分類器です。実 Jev の品質測定ではありません。`--classifier recorded --recorded-responses responses.json` は projection digest をキーとする記録応答を再検証し、通信せずに再生します。
 
