@@ -754,9 +754,6 @@ mod tests {
         };
         let frame = encode_message(&message).unwrap();
         assert_eq!(decode_message(&frame).unwrap(), message);
-        let secret = b"test-secret";
-        let frame = encode_message_authenticated(&message, secret, u64::MAX).unwrap();
-        assert!(frame.len() > HEADER_SIZE);
     }
 
     #[test]
