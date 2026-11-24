@@ -70,7 +70,7 @@ impl CaptureLogger {
     }
 
     pub fn log_http(&self, capture: &HttpCapture) {
-        let ts = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S%.3f");
+        let ts = jiff::Timestamp::now().strftime("%Y-%m-%d %H:%M:%S%.3f");
         let body_str = sanitize_for_log(&capture.body_preview);
         let proto = if let Some(ref sni) = capture.tls_sni {
             format!("HTTPS sni={}", sanitize_str(sni))
@@ -96,7 +96,7 @@ impl CaptureLogger {
     }
 
     pub fn log_tls(&self, capture: &TlsCapture) {
-        let ts = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S%.3f");
+        let ts = jiff::Timestamp::now().strftime("%Y-%m-%d %H:%M:%S%.3f");
         let sni = capture.sni.as_deref().unwrap_or("<no SNI>");
         let line = format!(
             "[{}] TLS_SNI src={} sni={}",

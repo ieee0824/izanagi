@@ -1,6 +1,5 @@
 use std::time::SystemTime;
 
-use chrono::{DateTime, Local};
 use colored::Colorize;
 
 use crate::detector::{Alert, AlertLevel};
@@ -92,8 +91,13 @@ pub fn format_level_plain(level: AlertLevel) -> &'static str {
 }
 
 fn format_timestamp(ts: SystemTime) -> String {
-    let datetime: DateTime<Local> = ts.into();
-    datetime.format("%Y-%m-%d %H:%M:%S%.3f").to_string()
+    match jiff::Timestamp::try_from(ts) {
+        Ok(timestamp) => timestamp
+            .to_zoned_datetime(jiff::tz::TimeZone::system())
+            .strftime("%Y-%m-%d %H:%M:%S%.3f")
+            .to_string(),
+        Err(_) => "????-??-?? ??:??:??.???".to_string(),
+    }
 }
 
 /// 制御文字（改行、タブ、ANSI エスケープシーケンス等）をエスケープする。
@@ -140,6 +144,17 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::path::PathBuf;
     use std::sync::Arc;
+
+    #[test]
+    fn format_timestamp_keeps_millisecond_layout() {
+        let ts = SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(1_700_000_000_123);
+        let text = format_timestamp(ts);
+        // YYYY-MM-DD HH:MM:SS.mmm（ローカル時刻）
+        assert_eq!(text.len(), 23, "{text}");
+        assert_eq!(&text[19..], ".123", "{text}");
+        assert_eq!(&text[4..5], "-");
+        assert_eq!(&text[10..11], " ");
+    }
 
     fn make_alert(level: AlertLevel, syscall: Syscall, args: Vec<SyscallArg>) -> Alert {
         Alert {
