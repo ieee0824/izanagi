@@ -745,6 +745,18 @@ mod tests {
     }
 
     #[test]
+    fn exec_result_with_both_streams_truncated_fits_in_one_frame() {
+        use crate::exec_output::{MAX_OUTPUT_SIZE, truncate_output};
+        let message = Message::ExecResult {
+            exit_code: i32::MIN,
+            stdout: truncate_output(vec![b'o'; MAX_OUTPUT_SIZE + 1]),
+            stderr: truncate_output(vec![b'e'; MAX_OUTPUT_SIZE + 1]),
+        };
+        let frame = encode_message(&message).unwrap();
+        assert_eq!(decode_message(&frame).unwrap(), message);
+    }
+
+    #[test]
     fn body_size_boundary_is_enforced_during_encoding() {
         // Error variant + three-byte string length prefix occupy four bytes.
         let message = Message::Error("x".repeat(MAX_BODY_SIZE as usize - 4));
