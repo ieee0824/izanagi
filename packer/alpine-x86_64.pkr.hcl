@@ -19,7 +19,7 @@ variable "iso_url" {
 
 variable "iso_checksum" {
   type    = string
-  default = "sha256:366285bfa4d25429e0a9d1c5cbe3c2e35e84e1ad5e0620e8b5a20b5e39e7e02b"
+  default = "sha256:d91fb5c7a73528c89e0a1aa9a7d959f9deb9ca3dc5211e39bd73fd7df0d9070e"
 }
 
 variable "agent_binary" {
