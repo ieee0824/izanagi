@@ -315,7 +315,7 @@ pub fn build_shell_args(container_name: &str, mount_point: &str) -> Vec<String> 
 
 /// コンテナ名を生成する。`izanagi-<timestamp>-<pid>` 形式。
 fn generate_container_name() -> String {
-    let ts = chrono::Utc::now().format("%Y%m%d%H%M%S%3f");
+    let ts = jiff::Timestamp::now().strftime("%Y%m%d%H%M%S%3f");
     let pid = std::process::id();
     format!("izanagi-{}-{}", ts, pid)
 }

@@ -10,7 +10,7 @@ landlock = ["dep:landlock"]
 
 [dependencies]
 anyhow = "1"
-chrono = "0.4"
+jiff = "1"
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 colored = "3"

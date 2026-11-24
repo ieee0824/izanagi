@@ -16,7 +16,7 @@ anyhow = "1"
 izanagi-telemetry = { path = "../izanagi-telemetry" }
 serde_json = "1"
 libc = "0.2"
-chrono = "0.4"
+jiff = "1"
 clap = { version = "4", features = ["derive"] }
 rcgen = { version = "0.14", features = ["pem"] }
 rustls = "0.23"
