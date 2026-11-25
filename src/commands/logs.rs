@@ -10,7 +10,7 @@ use super::default_log_dir;
 const MAX_LINE_LEN: usize = 1024 * 1024;
 
 pub fn cmd_logs(suspicious: bool) -> anyhow::Result<u8> {
-    let log_storage = LogStorage::new(&default_log_dir())?;
+    let log_storage = LogStorage::new(&default_log_dir()?)?;
     if suspicious {
         let alerts = log_storage.read_alerts_filtered(AlertLevel::Warn)?;
         for line in &alerts {
@@ -42,7 +42,7 @@ pub async fn cmd_logs_follow(suspicious: bool) -> anyhow::Result<u8> {
     // まず既存ログを表示
     cmd_logs(suspicious)?;
 
-    let log_dir = default_log_dir();
+    let log_dir = default_log_dir()?;
     let events_path = log_dir.join("events.log");
     let alerts_path = log_dir.join("alerts.log");
 

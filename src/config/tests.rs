@@ -1117,3 +1117,19 @@ fn dangling_share_alias_and_missing_children_fail_closed() {
         assert!(resolve_existing_prefix(&share).is_err());
     }
 }
+
+#[test]
+fn relative_share_paths_are_anchored_to_project_dir() {
+    let mut config = Config::default();
+    config.share.paths = vec![
+        ".".into(),
+        "./sub".into(),
+        "~/data".into(),
+        "/abs/path".into(),
+    ];
+    config.anchor_relative_share_paths(Path::new("/project/root"));
+    assert_eq!(
+        config.share.paths,
+        vec!["/project/root", "/project/root/sub", "~/data", "/abs/path"]
+    );
+}

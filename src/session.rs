@@ -1,6 +1,6 @@
 //! セッション情報の永続化。
 //!
-//! `izanagi up` で起動したサンドボックスの接続情報を `~/.izanagi/session.json` に保存し、
+//! `izanagi up` で起動したサンドボックスの接続情報を `~/.izanagi/instances/<sha256(プロジェクトディレクトリ)>/session.json` に保存し、
 //! `izanagi exec` / `izanagi shell` から起動中のサンドボックスに接続するために使用する。
 
 use std::path::{Path, PathBuf};

@@ -9,7 +9,7 @@ mod tests;
 mod tools;
 
 // サブモジュールから super::super:: を避けるための re-export
-use super::{build_sandbox_env, izanagi_dir};
+use super::{build_sandbox_env, izanagi_dir, project_dir};
 
 use izanagi::mcp::{
     self, INVALID_PARAMS, INVALID_REQUEST, InitializeResult, JSONRPC_VERSION, JsonRpcRequest,

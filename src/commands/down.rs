@@ -5,6 +5,21 @@ use super::{
     remove_lock_file, remove_pid_file, try_instance_lock,
 };
 
+/// 現在のプロジェクトのセッションを読む。読めない場合は `None`。
+fn load_current_session() -> Option<session::Session> {
+    let dir = izanagi_dir().ok()?;
+    session::load_session(&dir).ok().flatten()
+}
+
+/// セッション・PID・ロックの各ファイルを削除する。
+fn remove_instance_files() {
+    if let Ok(dir) = izanagi_dir() {
+        session::remove_session(&dir);
+    }
+    remove_pid_file();
+    remove_lock_file();
+}
+
 /// ロックファイルで up プロセスの有無を確認する。
 /// up プロセスが存在しない場合は stale ファイルを削除して Ok(exit_code) を返す。
 /// up プロセスが存在する場合は Err を返す（呼び出し元で停止フローに進む）。
@@ -12,15 +27,10 @@ fn check_no_running_instance() -> Result<u8, anyhow::Error> {
     match try_instance_lock() {
         Ok(Some(_guard)) => {
             // ロック取得成功 = up プロセスなし。stale ファイルがあればクリーンアップ
-            let has_pid = std::fs::read_to_string(pid_file_path()).is_ok();
-            let has_session = session::load_session(&izanagi_dir())
-                .ok()
-                .flatten()
-                .is_some();
+            let has_pid = pid_file_path().is_ok_and(|path| std::fs::read_to_string(path).is_ok());
+            let has_session = load_current_session().is_some();
             let has_stale = has_pid || has_session;
-            session::remove_session(&izanagi_dir());
-            remove_pid_file();
-            remove_lock_file();
+            remove_instance_files();
             if has_stale {
                 eprintln!("izanagi は起動していません（stale ファイルを削除しました）");
             } else {
@@ -54,12 +64,10 @@ fn validate_target_pid() -> anyhow::Result<u32> {
     validate_pid_timestamp(pid, saved_timestamp)?;
 
     // セッション情報との整合性チェック
-    if let Ok(Some(sess)) = session::load_session(&izanagi_dir())
+    if let Some(sess) = load_current_session()
         && sess.pid != pid
     {
-        session::remove_session(&izanagi_dir());
-        remove_pid_file();
-        remove_lock_file();
+        remove_instance_files();
         anyhow::bail!(
             "PID ファイル ({}) とセッション情報 ({}) の PID が一致しません。stale ファイルを削除しました。",
             pid,
@@ -70,9 +78,7 @@ fn validate_target_pid() -> anyhow::Result<u32> {
     // プロセスが存在するか確認
     match check_process_alive(pid) {
         ProcessStatus::NotRunning => {
-            session::remove_session(&izanagi_dir());
-            remove_pid_file();
-            remove_lock_file();
+            remove_instance_files();
             anyhow::bail!(
                 "PID {} のプロセスは既に停止しています。stale ファイルを削除しました。",
                 pid
@@ -90,7 +96,7 @@ fn validate_target_pid() -> anyhow::Result<u32> {
 fn validate_pid_timestamp(pid: u32, saved_timestamp: u64) -> anyhow::Result<()> {
     // PID 再利用対策: PID ファイルの mtime を確認
     if saved_timestamp > 0
-        && let Ok(meta) = std::fs::metadata(pid_file_path())
+        && let Ok(meta) = std::fs::metadata(pid_file_path()?)
         && let Ok(mtime) = meta.modified()
     {
         let mtime_secs = mtime
@@ -98,9 +104,7 @@ fn validate_pid_timestamp(pid: u32, saved_timestamp: u64) -> anyhow::Result<()> 
             .unwrap_or_default()
             .as_secs();
         if mtime_secs < saved_timestamp.saturating_sub(1) {
-            session::remove_session(&izanagi_dir());
-            remove_pid_file();
-            remove_lock_file();
+            remove_instance_files();
             anyhow::bail!(
                 "PID ファイルのタイムスタンプが不整合です。PID {} は再利用されている可能性があります。stale ファイルを削除しました。",
                 pid
@@ -131,9 +135,7 @@ pub async fn cmd_down() -> anyhow::Result<u8> {
     for _ in 0..20 {
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
         if target_has_stopped(pid) {
-            session::remove_session(&izanagi_dir());
-            remove_pid_file();
-            remove_lock_file();
+            remove_instance_files();
             println!("サンドボックスを停止しました。");
             return Ok(0);
         }

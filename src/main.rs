@@ -5,10 +5,13 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use clap::{CommandFactory, Parser, Subcommand};
-use izanagi::config::{Config, SandboxBackend, TracerBackend, izanagi_home, resolve_config_path};
+use izanagi::config::{
+    Config, SandboxBackend, TracerBackend, izanagi_home, resolve_config_path, settings_path_for_dir,
+};
 use izanagi::engine::{AlertHandler, Engine, build_engine};
 use izanagi::log_formatter;
 use izanagi::log_storage::LogStorage;
+use izanagi::project;
 
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
@@ -24,6 +27,10 @@ pub(crate) struct Cli {
     /// 設定ファイルパス (init 時は出力先、それ以外は読み込み元。未指定時は自動決定)
     #[arg(short, long, global = true)]
     config: Option<PathBuf>,
+
+    /// プロジェクトディレクトリ (未指定時は IZANAGI_PROJECT_DIR、設定のある祖先、カレントディレクトリの順)
+    #[arg(long, global = true, value_name = "DIR")]
+    project_dir: Option<PathBuf>,
 
     /// サンドボックスバックエンド (qemu | native)
     #[arg(long, global = true)]
@@ -107,36 +114,72 @@ enum ConfigAction {
 // パス・PID・ロック関連のユーティリティ
 // ---------------------------------------------------------------------------
 
+/// 起動時に一度だけ解決したプロジェクトディレクトリ。
+static PROJECT_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// `--project-dir` か `IZANAGI_PROJECT_DIR` で明示されたディレクトリ。
+fn explicit_project_dir(flag: Option<&Path>) -> Option<PathBuf> {
+    flag.map(Path::to_path_buf).or_else(|| {
+        std::env::var_os(project::PROJECT_DIR_ENV)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    })
+}
+
+fn settings_exist_for(dir: &Path) -> bool {
+    settings_path_for_dir(dir).is_ok_and(|path| path.is_file())
+}
+
+/// 明示指定 → 設定のある祖先 → cwd の順でプロジェクトディレクトリを解決する。
+fn resolve_project_dir(flag: Option<&Path>) -> anyhow::Result<PathBuf> {
+    let explicit = explicit_project_dir(flag);
+    let cwd = std::env::current_dir().context("カレントディレクトリを取得できません")?;
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    project::resolve_project_dir(
+        explicit.as_deref(),
+        &cwd,
+        home.as_deref(),
+        settings_exist_for,
+    )
+}
+
+/// プロジェクトディレクトリを返す。起動時に解決していなければ、ここで解決する。
+fn project_dir() -> anyhow::Result<PathBuf> {
+    if let Some(dir) = PROJECT_DIR.get() {
+        return Ok(dir.clone());
+    }
+    let dir = resolve_project_dir(None)?;
+    Ok(PROJECT_DIR.get_or_init(|| dir).clone())
+}
+
 /// プロジェクトごとのインスタンスディレクトリを返す。
-/// カレントディレクトリの SHA256 ハッシュで分離し、複数プロジェクトの同時起動を可能にする。
-/// パス: `~/.izanagi/instances/<sha256(cwd)>/`
-fn izanagi_dir() -> PathBuf {
-    let home = izanagi_home().expect("HOME 環境変数が未設定です");
-    let cwd = std::env::current_dir().expect("カレントディレクトリを取得できません");
-    // canonicalize して symlink を解決。config/mod.rs の settings_path_for_pwd と同じ方式。
-    let canonical = cwd
-        .canonicalize()
-        .expect("カレントディレクトリの canonicalize に失敗しました");
-    use sha2::{Digest, Sha256};
-    let hash = hex::encode(Sha256::digest(canonical.as_os_str().as_encoded_bytes()));
-    home.join("instances").join(hash)
+/// プロジェクトディレクトリの SHA256 ハッシュで分離し、複数プロジェクトの同時起動を可能にする。
+/// パス: `~/.izanagi/instances/<sha256(project_dir)>/`
+fn izanagi_dir() -> anyhow::Result<PathBuf> {
+    instance_dir_for(&project_dir()?)
+}
+
+fn instance_dir_for(project_dir: &Path) -> anyhow::Result<PathBuf> {
+    Ok(izanagi_home()?
+        .join("instances")
+        .join(project::path_hash(project_dir)))
 }
 
 /// ログディレクトリのデフォルトパス (`~/.izanagi/instances/<hash>/logs`)。
-fn default_log_dir() -> PathBuf {
-    izanagi_dir().join("logs")
+fn default_log_dir() -> anyhow::Result<PathBuf> {
+    Ok(izanagi_dir()?.join("logs"))
 }
 
-/// PID ファイルのパス (`~/.izanagi/izanagi.pid`)。
-fn pid_file_path() -> PathBuf {
-    izanagi_dir().join("izanagi.pid")
+/// PID ファイルのパス (`~/.izanagi/instances/<hash>/izanagi.pid`)。
+fn pid_file_path() -> anyhow::Result<PathBuf> {
+    Ok(izanagi_dir()?.join("izanagi.pid"))
 }
 
 /// PID ファイルを書き込む。
 /// 既存の PID ファイルがある場合はプロセスの生存を確認し、
 /// 生存中ならエラーを返す。
 fn write_pid_file() -> anyhow::Result<()> {
-    let path = pid_file_path();
+    let path = pid_file_path()?;
 
     // 既存 PID ファイルがあればプロセスの生存確認
     if path.exists()
@@ -208,12 +251,17 @@ fn check_process_alive(pid: u32) -> ProcessStatus {
 
 /// PID ファイルを削除する。
 fn remove_pid_file() {
-    let _ = std::fs::remove_file(pid_file_path());
+    if let Ok(path) = pid_file_path() {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 /// ロックファイルを削除する。
 fn remove_lock_file() {
-    if let Err(e) = std::fs::remove_file(lock_file_path())
+    let Ok(path) = lock_file_path() else {
+        return;
+    };
+    if let Err(e) = std::fs::remove_file(path)
         && e.kind() != std::io::ErrorKind::NotFound
     {
         eprintln!("警告: ロックファイルの削除に失敗: {}", e);
@@ -226,7 +274,7 @@ fn remove_lock_file() {
 /// ロックファイルが存在しない場合は `Ok(None)` を返す。
 #[cfg(unix)]
 fn try_instance_lock() -> anyhow::Result<Option<std::fs::File>> {
-    let path = lock_file_path();
+    let path = lock_file_path()?;
     // exists() を使わず open() の結果で判定し TOCTOU を排除する
     let file = match std::fs::OpenOptions::new().write(true).open(&path) {
         Ok(f) => f,
@@ -249,9 +297,9 @@ fn try_instance_lock() -> anyhow::Result<Option<std::fs::File>> {
     Ok(None)
 }
 
-/// ロックファイルのパス (`~/.izanagi/izanagi.lock`)。
-fn lock_file_path() -> PathBuf {
-    izanagi_dir().join("izanagi.lock")
+/// ロックファイルのパス (`~/.izanagi/instances/<hash>/izanagi.lock`)。
+fn lock_file_path() -> anyhow::Result<PathBuf> {
+    Ok(izanagi_dir()?.join("izanagi.lock"))
 }
 
 /// flock による排他ロックを取得する。
@@ -261,7 +309,7 @@ fn lock_file_path() -> PathBuf {
 /// ロックを取得して続行する（エラーにしない）。
 #[cfg(unix)]
 fn acquire_instance_lock() -> anyhow::Result<std::fs::File> {
-    let path = lock_file_path();
+    let path = lock_file_path()?;
     if let Some(parent) = path.parent() {
         #[cfg(unix)]
         {
@@ -328,7 +376,7 @@ fn acquire_instance_lock() -> anyhow::Result<()> {
 
 /// PID ファイルからプロセス ID とタイムスタンプを読み取る。
 fn read_pid_file() -> anyhow::Result<(u32, u64)> {
-    let path = pid_file_path();
+    let path = pid_file_path()?;
     let content = std::fs::read_to_string(&path)
         .context("PID ファイルが見つかりません。izanagi up で起動してください")?;
     let mut lines = content.lines();
@@ -366,7 +414,8 @@ async fn start_engine(
     let sandbox_config = config.to_sandbox_config()?;
     let trace_filter = config.to_trace_filter();
 
-    let log_storage = Arc::new(LogStorage::new(&default_log_dir())?);
+    let log_dir = default_log_dir()?;
+    let log_storage = Arc::new(LogStorage::new(&log_dir)?);
     let on_alert = create_alert_handler(&log_storage);
 
     // up 中の全 syscall イベントを LogStorage に記録 (#216)
@@ -379,7 +428,7 @@ async fn start_engine(
         engine.attach_behavior(
             &config.behavior,
             config.detect.allowed_hosts.clone(),
-            default_log_dir().join("behavior"),
+            log_dir.join("behavior"),
         )?;
     }
     engine.set_event_handler(Box::new(move |event: &izanagi::event::SyscallEvent| {
@@ -456,15 +505,20 @@ async fn run() -> anyhow::Result<u8> {
 
 /// テスト可能なエントリポイント。`Cli::try_parse_from()` でテスト用引数を渡せる。
 pub(crate) async fn run_with(cli: Cli) -> anyhow::Result<u8> {
-    if let Commands::Behavior { action } = cli.command {
-        return izanagi::behavior_cli::run(*action, &default_log_dir().join("behavior")).await;
-    }
-    // init / mcp は設定ファイルを必要としないため、ロード・バリデーションをスキップ
+    // init は祖先を探さず、明示指定かカレントディレクトリに設定を作る
     if matches!(cli.command, Commands::Init) {
-        return commands::cmd_init(cli.config.as_ref());
+        return run_init(&cli);
     }
     if matches!(cli.command, Commands::Mcp) {
+        init_mcp_project_dir(&cli)?;
         return commands::cmd_mcp().await;
+    }
+    if !matches!(cli.command, Commands::Completions { .. }) {
+        let dir = resolve_project_dir(cli.project_dir.as_deref())?;
+        let _ = PROJECT_DIR.set(dir);
+    }
+    if let Commands::Behavior { action } = cli.command {
+        return izanagi::behavior_cli::run(*action, &default_log_dir()?.join("behavior")).await;
     }
     if let Commands::Completions { shell } = cli.command {
         clap_complete::generate(
@@ -484,7 +538,7 @@ pub(crate) async fn run_with(cli: Cli) -> anyhow::Result<u8> {
     ) {
         let path = match &cli.config {
             Some(p) => p.clone(),
-            None => resolve_config_path()?,
+            None => resolve_config_path(&project_dir()?)?,
         };
         println!("{}", path.display());
         return Ok(0);
@@ -499,6 +553,50 @@ pub(crate) async fn run_with(cli: Cli) -> anyhow::Result<u8> {
     }
 
     run_configured(cli).await
+}
+
+/// `izanagi init` の出力先を決めて実行する。
+fn run_init(cli: &Cli) -> anyhow::Result<u8> {
+    if let Some(path) = cli.config.as_ref() {
+        return commands::cmd_init(Some(path), path);
+    }
+    let dir = match explicit_project_dir(cli.project_dir.as_deref()) {
+        Some(explicit) => project::canonical_project_dir(&explicit)?,
+        None => std::env::current_dir()
+            .context("カレントディレクトリを取得できません")?
+            .canonicalize()
+            .context("カレントディレクトリを解決できません")?,
+    };
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    if let Some(parent) = dir.parent()
+        && let Some(ancestor) =
+            project::find_configured_ancestor(parent, home.as_deref(), settings_exist_for)
+    {
+        eprintln!(
+            "情報: 親ディレクトリ {} に設定があります。このディレクトリから実行する izanagi は、ここに作る設定を優先します。",
+            ancestor.display()
+        );
+    }
+    let output = settings_path_for_dir(&dir)?;
+    commands::cmd_init(None, &output)
+}
+
+/// MCP サーバーのプロジェクトディレクトリを起動時に解決する。
+///
+/// 明示指定が不正なら起動を止める。カレントディレクトリを解決できないだけなら、
+/// サーバーは起動し、ツールの呼び出しでエラーを返す。
+fn init_mcp_project_dir(cli: &Cli) -> anyhow::Result<()> {
+    match resolve_project_dir(cli.project_dir.as_deref()) {
+        Ok(dir) => {
+            let _ = PROJECT_DIR.set(dir);
+            Ok(())
+        }
+        Err(error) if explicit_project_dir(cli.project_dir.as_deref()).is_none() => {
+            eprintln!("警告: プロジェクトディレクトリを解決できません: {error:#}");
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
 }
 
 async fn run_configured(cli: Cli) -> anyhow::Result<u8> {
@@ -525,9 +623,10 @@ async fn run_configured(cli: Cli) -> anyhow::Result<u8> {
 
 fn load_cli_config(cli: &Cli) -> anyhow::Result<(PathBuf, Config)> {
     // -c 未指定時は自動解決
+    let project_dir = project_dir()?;
     let config_path = match &cli.config {
         Some(p) => p.clone(),
-        None => resolve_config_path()?,
+        None => resolve_config_path(&project_dir)?,
     };
 
     // 設定ファイル読み込み
@@ -539,7 +638,7 @@ fn load_cli_config(cli: &Cli) -> anyhow::Result<(PathBuf, Config)> {
             config_path.display()
         );
     }
-    let mut config = Config::load(&config_path)?;
+    let mut config = Config::load_for_project(&config_path, &project_dir)?;
 
     // グローバルオプションで設定を上書き
     if let Some(backend) = cli.sandbox {
@@ -796,14 +895,14 @@ mod tests {
 
     #[test]
     fn izanagi_dir_is_deterministic() {
-        let dir1 = izanagi_dir();
-        let dir2 = izanagi_dir();
+        let dir1 = izanagi_dir().unwrap();
+        let dir2 = izanagi_dir().unwrap();
         assert_eq!(dir1, dir2);
     }
 
     #[test]
     fn izanagi_dir_contains_instances_and_hash() {
-        let dir = izanagi_dir();
+        let dir = izanagi_dir().unwrap();
         let components: Vec<_> = dir.components().collect();
         // パスに "instances" を含み、その後に 64 文字の hex ハッシュが続く
         let has_instances = components.iter().any(|c| c.as_os_str() == "instances");
