@@ -39,6 +39,8 @@ impl Fixture {
         config.share.paths = vec![".".into()];
         config.share.mount_point = "/workspace".into();
         config.sandbox.tracer = izanagi::config::TracerBackend::None;
+        // config show はバックエンドの認証を確かめる。ここでは共有パスの解決だけを見る
+        config.sandbox.require_auth = Some(false);
         std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
     }
 
