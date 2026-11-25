@@ -5,7 +5,7 @@ use super::{acquire_instance_lock, build_sandbox_env, izanagi_dir, start_engine,
 
 pub async fn cmd_shell(config: &Config) -> anyhow::Result<u8> {
     // up 中のセッションがあればそこに接続
-    if let Some(sess) = session::load_session(&izanagi_dir())?
+    if let Some(sess) = session::load_session(&izanagi_dir()?)?
         && session::is_session_alive(&sess)
     {
         return shell_on_session(config, &sess).await;

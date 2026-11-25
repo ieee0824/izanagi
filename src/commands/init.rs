@@ -2,7 +2,6 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use dialoguer::{Confirm, Input, MultiSelect, Select};
-use izanagi::config::settings_path_for_pwd;
 
 /// 出力パスを正規化する。
 ///
@@ -22,11 +21,11 @@ fn normalize_output_path(p: &Path) -> PathBuf {
 /// `izanagi init` — 対話形式で izanagi.toml を生成する。
 ///
 /// `explicit_path` が `Some` の場合はそのパスに出力する（`-c` 指定時）。
-/// `None` の場合は `settings_path_for_pwd()` で自動決定する。
-pub fn cmd_init(explicit_path: Option<&PathBuf>) -> Result<u8> {
+/// `None` の場合は `default_output`（プロジェクトディレクトリの settings パス）に出力する。
+pub fn cmd_init(explicit_path: Option<&PathBuf>, default_output: &Path) -> Result<u8> {
     let output = match explicit_path {
         Some(p) => normalize_output_path(p),
-        None => settings_path_for_pwd()?,
+        None => default_output.to_path_buf(),
     };
 
     println!("izanagi.toml を対話形式で生成します。");

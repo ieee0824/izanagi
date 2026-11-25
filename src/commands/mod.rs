@@ -19,6 +19,6 @@ pub use up::cmd_up;
 // 親モジュール (main.rs) のユーティリティをサブモジュール向けにインポート
 use super::{
     ConfigAction, ProcessStatus, acquire_instance_lock, build_sandbox_env, check_process_alive,
-    default_log_dir, izanagi_dir, pid_file_path, read_pid_file, remove_lock_file, remove_pid_file,
-    start_engine, stop_engine, try_instance_lock, write_pid_file,
+    default_log_dir, izanagi_dir, pid_file_path, project_dir, read_pid_file, remove_lock_file,
+    remove_pid_file, start_engine, stop_engine, try_instance_lock, write_pid_file,
 };

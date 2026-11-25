@@ -19,6 +19,7 @@ pub mod log_formatter;
 pub mod log_storage;
 pub mod mcp;
 pub mod pcap_writer;
+pub mod project;
 pub mod protocol;
 pub mod protocol_client;
 pub mod proxy_manager;

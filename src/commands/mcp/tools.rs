@@ -8,8 +8,26 @@ use super::exec_capture::{ExecOutput, exec_on_session_capture};
 ///
 /// セッション情報を読み込み、プロセスが生存しているか確認して結果を返す。
 pub(super) fn handle_sandbox_status(id: Value) -> JsonRpcResponse {
-    let izanagi_dir = super::izanagi_dir();
-    handle_sandbox_status_with_dir(id, &izanagi_dir)
+    match super::izanagi_dir() {
+        Ok(izanagi_dir) => handle_sandbox_status_with_dir(id, &izanagi_dir),
+        Err(error) => project_error_response(id, &error),
+    }
+}
+
+/// 解決済みのプロジェクトディレクトリ。エージェントがどのプロジェクトを見ているか確認できるようにする。
+fn project_dir_display() -> Option<String> {
+    super::project_dir()
+        .ok()
+        .map(|dir| dir.display().to_string())
+}
+
+/// プロジェクトディレクトリを解決できないときのツールのエラー応答。
+fn project_error_response(id: Value, error: &anyhow::Error) -> JsonRpcResponse {
+    let result = ToolCallResult::error(format!(
+        "failed to resolve project directory: {error:#}. \
+         Start the MCP server with --project-dir or IZANAGI_PROJECT_DIR."
+    ));
+    tool_response(id, result)
 }
 
 /// sandbox_status の内部実装。テストから izanagi_dir を差し替えるために分離。
@@ -27,10 +45,11 @@ pub(super) fn handle_sandbox_status_with_dir(
                 "running": true,
                 "backend": backend,
                 "pid": s.pid,
+                "project_dir": project_dir_display(),
             })
         }
         _ => {
-            serde_json::json!({ "running": false })
+            serde_json::json!({ "running": false, "project_dir": project_dir_display() })
         }
     };
 
@@ -80,8 +99,10 @@ fn extract_exec_args(params: &ToolCallParams) -> Result<(String, Vec<String>), S
 
 /// sandbox_exec ツールの実装。
 pub(super) async fn handle_sandbox_exec(id: Value, params: &ToolCallParams) -> JsonRpcResponse {
-    let izanagi_dir = super::izanagi_dir();
-    handle_sandbox_exec_with_dir(id, params, &izanagi_dir).await
+    match super::izanagi_dir() {
+        Ok(izanagi_dir) => handle_sandbox_exec_with_dir(id, params, &izanagi_dir).await,
+        Err(error) => project_error_response(id, &error),
+    }
 }
 
 /// sandbox_exec の内部実装。テストから izanagi_dir を差し替えるために分離。
@@ -102,7 +123,10 @@ pub(super) async fn handle_sandbox_exec_with_dir(
     let sess = match session::load_session(izanagi_dir) {
         Ok(Some(s)) if session::is_session_alive(&s) => s,
         Ok(_) => {
-            let result = ToolCallResult::error("sandbox is not running");
+            let result = ToolCallResult::error(format!(
+                "sandbox is not running (project: {}). Run `izanagi up` in the project directory.",
+                project_dir_display().unwrap_or_else(|| "unknown".into())
+            ));
             return tool_response(id, result);
         }
         Err(e) => {
@@ -134,8 +158,10 @@ pub(super) async fn handle_sandbox_exec_with_dir(
 
 /// sandbox_shell ツールの実装。command を /bin/sh -c で実行する。
 pub(super) async fn handle_sandbox_shell(id: Value, params: &ToolCallParams) -> JsonRpcResponse {
-    let izanagi_dir = super::izanagi_dir();
-    handle_sandbox_shell_with_dir(id, params, &izanagi_dir).await
+    match super::izanagi_dir() {
+        Ok(izanagi_dir) => handle_sandbox_shell_with_dir(id, params, &izanagi_dir).await,
+        Err(error) => project_error_response(id, &error),
+    }
 }
 
 /// sandbox_shell の内部実装。テストから izanagi_dir を差し替えるために分離。

@@ -40,7 +40,7 @@ pub async fn cmd_up(
         install_ca_cert(&engine, ca_path).await;
     }
 
-    let iza_dir = izanagi_dir();
+    let iza_dir = izanagi_dir()?;
     persist_or_cleanup(&iza_dir, &mut proxy_manager, &mut engine, &log_storage).await?;
 
     println!(

@@ -11,7 +11,7 @@ pub async fn cmd_exec(config: &Config, cmd: &[String]) -> anyhow::Result<u8> {
     }
 
     // up 中のセッションがあればそこに接続
-    if let Some(sess) = session::load_session(&izanagi_dir())?
+    if let Some(sess) = session::load_session(&izanagi_dir()?)?
         && session::is_session_alive(&sess)
     {
         return exec_on_session(config, &sess, cmd).await;

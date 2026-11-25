@@ -305,7 +305,13 @@ AI コーディングエージェント（Claude Code, Codex 等）からサン�
 ```bash
 # stdio transport で MCP Server を起動（設定ファイル不要）
 izanagi mcp
+
+# 起動ディレクトリとプロジェクトが異なる場合は明示する
+izanagi mcp --project-dir /path/to/project
 ```
+
+MCP Server は起動時に一度だけプロジェクトディレクトリを決める（決め方は「設定」の節と同じ）。
+`sandbox_status` の結果と「起動していない」エラーには、対象の `project_dir` が含まれる。
 
 提供ツール:
 
@@ -330,8 +336,20 @@ Claude Desktop の設定例:
 ## 設定
 
 `izanagi init` で対話形式で設定ファイルを生成できる。
-設定ファイルは `~/.izanagi/settings/{pwd の SHA256 ハッシュ}/izanagi.toml` に保存され、
-プロジェクトディレクトリごとに独立した設定を持てる。
+設定ファイルは `~/.izanagi/settings/{プロジェクトディレクトリの SHA256 ハッシュ}/izanagi.toml` に保存され、
+プロジェクトディレクトリごとに独立した設定を持てる。起動中のサンドボックスの状態（セッション・PID・ログ）も、
+同じハッシュで `~/.izanagi/instances/` の下に分かれる。
+
+プロジェクトディレクトリは次の順で決まる。
+
+1. `--project-dir <DIR>`
+2. 環境変数 `IZANAGI_PROJECT_DIR`
+3. カレントディレクトリから親へ遡り、設定ファイルがある最も近いディレクトリ。カレントディレクトリがホームディレクトリの配下にある場合、ホームディレクトリとその親は探さない
+4. カレントディレクトリ
+
+このため、プロジェクトのサブディレクトリから `izanagi exec` や `izanagi down` を実行しても、ルートと同じ設定とサンドボックスを使う。
+`share.paths` の相対パス（`.` など）は、カレントディレクトリではなくプロジェクトディレクトリを基準に解決する。
+`izanagi init` は親ディレクトリを探さず、`--project-dir` かカレントディレクトリに設定を作る。
 
 `./izanagi.toml` は自動読み込みしない。既存の設定は内容を確認して `izanagi config path` が示す場所へ移すか、
 `izanagi init` で再作成する。`-c /path/to/izanagi.toml` による明示指定は引き続き利用できるが、

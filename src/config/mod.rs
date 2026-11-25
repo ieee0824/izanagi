@@ -383,15 +383,49 @@ impl Config {
     }
 
     /// 設定ファイルを読み込む。ファイルが存在しない場合はデフォルト値を返す。
+    ///
+    /// 相対の `share.paths` はカレントディレクトリを基準にする。
     pub fn load(path: &Path) -> anyhow::Result<Self> {
+        Self::load_with_share_base(path, None)
+    }
+
+    /// プロジェクトディレクトリの設定ファイルを読み込む。
+    ///
+    /// 相対の `share.paths` は `project_dir` を基準にした絶対パスへ直す。
+    /// サブディレクトリから起動しても、プロジェクトのルートを共有するため。
+    pub fn load_for_project(path: &Path, project_dir: &Path) -> anyhow::Result<Self> {
+        Self::load_with_share_base(path, Some(project_dir))
+    }
+
+    fn load_with_share_base(path: &Path, share_base: Option<&Path>) -> anyhow::Result<Self> {
         match std::fs::read_to_string(path) {
             Ok(content) => {
-                let config = Self::from_toml(&content)?;
+                let mut config = Self::from_toml(&content)?;
+                if let Some(base) = share_base {
+                    config.anchor_relative_share_paths(base);
+                }
                 config.validate_config_location(path)?;
                 Ok(config)
             }
             Err(e) if e.kind() == ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(anyhow::Error::new(e).context(format!("failed to read {:?}", path))),
+        }
+    }
+
+    /// 相対の `share.paths` を `base` を基準にした絶対パスへ直す。
+    /// `~` で始まるパスと絶対パスは変えない。
+    pub fn anchor_relative_share_paths(&mut self, base: &Path) {
+        for share in &mut self.share.paths {
+            let path = Path::new(share.as_str());
+            if share.starts_with('~') || path.is_absolute() {
+                continue;
+            }
+            let anchored: PathBuf = base
+                .join(path)
+                .components()
+                .filter(|component| !matches!(component, std::path::Component::CurDir))
+                .collect();
+            *share = anchored.to_string_lossy().into_owned();
         }
     }
 
@@ -856,34 +890,20 @@ pub fn izanagi_home() -> anyhow::Result<PathBuf> {
     Ok(PathBuf::from(home).join(".izanagi"))
 }
 
-/// カレントディレクトリに基づく設定ファイルのパスを返す。
-///
-/// パス: `~/.izanagi/settings/{sha256(canonical_pwd)}/izanagi.toml`
-///
-/// pwd の正規化に失敗した場合は `None` を返す。
-pub fn settings_path_for_pwd() -> anyhow::Result<PathBuf> {
-    let pwd = std::env::current_dir()
-        .map_err(|e| anyhow::anyhow!("カレントディレクトリの取得に失敗: {e}"))?;
-    let canonical = pwd
-        .canonicalize()
-        .map_err(|e| anyhow::anyhow!("パスの正規化に失敗: {e}"))?;
-    settings_path_for_dir(&canonical)
-}
-
 /// 指定ディレクトリに基づく設定ファイルのパスを返す。
+///
+/// パス: `~/.izanagi/settings/{sha256(canonical_dir)}/izanagi.toml`
 pub fn settings_path_for_dir(dir: &Path) -> anyhow::Result<PathBuf> {
-    use sha2::{Digest, Sha256};
-    let hash = hex::encode(Sha256::digest(dir.as_os_str().as_encoded_bytes()));
     Ok(izanagi_home()?
         .join("settings")
-        .join(hash)
+        .join(crate::project::path_hash(dir))
         .join("izanagi.toml"))
 }
 
-/// 設定ファイルを自動解決する。
+/// プロジェクトディレクトリの設定ファイルのパスを返す。
 /// プロジェクト内の設定にはフォールバックせず、settings パスを返す。
-pub fn resolve_config_path() -> anyhow::Result<PathBuf> {
-    settings_path_for_pwd()
+pub fn resolve_config_path(project_dir: &Path) -> anyhow::Result<PathBuf> {
+    settings_path_for_dir(project_dir)
 }
 
 fn absolute_path(path: &Path) -> anyhow::Result<PathBuf> {
